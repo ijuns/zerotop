@@ -95,7 +95,14 @@ export function normalizeRegistration(value: unknown): RegistrationInput {
   const email = optionalTrimmedString(body.email)?.toLowerCase();
   const handle = optionalTrimmedString(body.handle);
   const displayName = optionalTrimmedString(body.displayName ?? body.display_name);
+  const affiliation = optionalTrimmedString(body.affiliation);
   const password = optionalTrimmedString(body.password);
+  const consent: Record<string, unknown> =
+    typeof body.consent === "object" && body.consent !== null
+      ? (body.consent as Record<string, unknown>)
+      : {};
+  const consentTerms = consent.terms ?? body.termsAgreed;
+  const consentPrivacy = consent.privacy ?? body.privacyAgreed;
   const organizationId = optionalTrimmedString(
     body.organizationId ?? body.organization_id,
   );
@@ -110,7 +117,9 @@ export function normalizeRegistration(value: unknown): RegistrationInput {
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     throw new ApiError(400, "INVALID_EMAIL", "A valid email address is required.");
   }
-  if (!handle || !/^[A-Za-z0-9_-]{3,24}$/.test(handle)) {
+  // Supplying a handle stays supported for API clients; the signup form no
+  // longer collects one and the server derives it from the email instead.
+  if (handle !== undefined && !/^[A-Za-z0-9_-]{3,24}$/.test(handle)) {
     throw new ApiError(
       400,
       "INVALID_HANDLE",
@@ -122,6 +131,24 @@ export function normalizeRegistration(value: unknown): RegistrationInput {
       400,
       "INVALID_DISPLAY_NAME",
       "Display name is required and must not exceed 80 characters.",
+    );
+  }
+  if (
+    !affiliation ||
+    affiliation.length > 80 ||
+    /[\u0000-\u001f\u007f]/.test(affiliation)
+  ) {
+    throw new ApiError(
+      400,
+      "INVALID_AFFILIATION",
+      "Affiliation is required and must not exceed 80 characters.",
+    );
+  }
+  if (consentTerms !== true || consentPrivacy !== true) {
+    throw new ApiError(
+      400,
+      "CONSENT_REQUIRED",
+      "Agreement to the terms of service and the privacy notice is required.",
     );
   }
   if (password && password.length < 8) {
@@ -150,10 +177,12 @@ export function normalizeRegistration(value: unknown): RegistrationInput {
     email,
     handle,
     displayName,
+    affiliation,
     password,
     accountType: rawAccountType,
     organizationId,
     organizationJoinCode,
+    consent: { terms: true, privacy: true },
   };
 }
 

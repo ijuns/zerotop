@@ -56,3 +56,6 @@ desktop.ini
 .~lock.*#
 *.swp
 *.swo
+
+# Claude Code machine-local settings
+.claude/settings.local.json

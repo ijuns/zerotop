@@ -34,7 +34,10 @@ import {
   validateTrustedGradeEvidence,
 } from "./evidence-grader.ts";
 import {
+  AUDIT_RESOURCE_TYPES,
   DEV_USER_ID,
+  PRIVACY_POLICY_VERSION,
+  TERMS_VERSION,
   type AdminPageQuery,
   type AdminPageResult,
   type RuntimeRunStatusInput,
@@ -58,8 +61,12 @@ import {
   type EnvironmentBuilder,
 } from "./environment-builder.ts";
 import {
+  createSessionToken,
   generateOrganizationJoinCode,
   hashOrganizationJoinCode,
+  needsPasswordRehash,
+  verifyPassword,
+  verifySessionToken,
 } from "./security.ts";
 import { parseTargetRuntimeContract } from "./target-runtime-contract.ts";
 import {
@@ -69,6 +76,11 @@ import {
   ranking,
   type ReportingDataset,
 } from "@codegate/reporting";
+import {
+  RANKING_DOMAINS,
+  type RankingDomain,
+  type RankingSeason,
+} from "@codegate/contracts";
 import {
   gradeRun,
   type ServerQuestion,
@@ -107,6 +119,12 @@ interface ApplicationOptions {
   desktopTicketTtlSeconds?: number;
   openVpnDownloadInternalToken?: string;
   openVpnDownloadPublicUrl?: string;
+  /** Expiry sweep period in ms. 0 disables the timer (tests drive it manually). */
+  runSweepIntervalMs?: number;
+  /** Honour X-Forwarded-For for audit source addresses. Only behind a trusted proxy. */
+  trustProxyHeaders?: boolean;
+  /** HMAC secret for password-session tokens (AUTH_MODE=local). */
+  sessionSecret?: string;
 }
 
 interface HandlerContext {
@@ -119,11 +137,13 @@ interface HandlerContext {
   environmentBuilder: EnvironmentBuilder;
   authMode: string;
   oidcVerifier?: OidcVerifier;
+  sessionSecret: string;
   desktopGatewayInternalToken: string;
   desktopGatewayPublicUrl: string;
   desktopTicketTtlSeconds: number;
   openVpnDownloadInternalToken: string;
   openVpnDownloadPublicUrl: string;
+  trustProxyHeaders: boolean;
   ready: Promise<void>;
 }
 
@@ -381,7 +401,14 @@ function requireOrganizationAdmin(actor: RequestActor): string {
   return organizationId;
 }
 
-type AdminListKind = "users" | "organizations" | "labs" | "runs" | "members";
+type AdminListKind =
+  | "users"
+  | "organizations"
+  | "labs"
+  | "runs"
+  | "members"
+  | "auditLogs"
+  | "organizationAuditLogs";
 
 const ADMIN_FILTERS: Record<AdminListKind, ReadonlySet<string>> = {
   users: new Set(["search", "organizationId", "platformRole"]),
@@ -389,6 +416,8 @@ const ADMIN_FILTERS: Record<AdminListKind, ReadonlySet<string>> = {
   labs: new Set(["search", "organizationId", "team", "status"]),
   runs: new Set(["search", "organizationId", "status", "accessMethod"]),
   members: new Set(["search", "role"]),
+  auditLogs: new Set(["search", "action", "resourceType"]),
+  organizationAuditLogs: new Set(["search", "action"]),
 };
 
 function boundedQueryInteger(
@@ -502,6 +531,27 @@ function parseAdminPageQuery(url: URL, kind: AdminListKind): AdminPageQuery {
     );
     if (accessMethod) query.accessMethod = accessMethod;
   }
+  if (kind === "auditLogs" || kind === "organizationAuditLogs") {
+    // Actions are matched as an opaque namespaced token rather than an enum, so
+    // filtering keeps working as new audited actions are introduced.
+    const action = optionalAdminFilter(url, "action", 64);
+    if (action !== undefined) {
+      if (!/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(action)) {
+        throw new ApiError(
+          400,
+          "INVALID_ADMIN_FILTER",
+          "action must look like namespace.event.",
+        );
+      }
+      query.auditAction = action;
+    }
+    const resourceType = enumAdminFilter(
+      url,
+      "resourceType",
+      AUDIT_RESOURCE_TYPES,
+    );
+    if (resourceType) query.auditResourceType = resourceType;
+  }
   return query;
 }
 
@@ -606,6 +656,92 @@ function normalizeAdminReason(value: unknown, fallback: string): string {
     );
   }
   return reason;
+}
+
+function enumBodyField<T extends string>(
+  value: unknown,
+  name: string,
+  allowed: readonly T[],
+  code: string,
+): T {
+  if (!isObject(value)) {
+    throw new ApiError(400, "INVALID_ADMIN_MUTATION", "A JSON object is required.");
+  }
+  const supplied = value[name];
+  if (
+    typeof supplied !== "string" ||
+    !(allowed as readonly string[]).includes(supplied)
+  ) {
+    throw new ApiError(
+      400,
+      code,
+      `${name} must be one of: ${allowed.join(", ")}.`,
+    );
+  }
+  return supplied as T;
+}
+
+function booleanBodyField(value: unknown, name: string, code: string): boolean {
+  if (!isObject(value)) {
+    throw new ApiError(400, "INVALID_ADMIN_MUTATION", "A JSON object is required.");
+  }
+  if (typeof value[name] !== "boolean") {
+    throw new ApiError(400, code, `${name} must be a boolean.`);
+  }
+  return value[name] as boolean;
+}
+
+function normalizeSeasonBody(value: unknown): {
+  name: string;
+  slug: string;
+  startsAt: string;
+  endsAt: string;
+} {
+  if (!isObject(value)) {
+    throw new ApiError(400, "INVALID_SEASON", "A JSON object is required.");
+  }
+  const name = typeof value.name === "string" ? value.name.trim() : "";
+  const slug = typeof value.slug === "string" ? value.slug.trim().toLowerCase() : "";
+  const startsAt = typeof value.startsAt === "string" ? value.startsAt : "";
+  const endsAt = typeof value.endsAt === "string" ? value.endsAt : "";
+  if (name.length < 2 || name.length > 80) {
+    throw new ApiError(400, "INVALID_SEASON", "name must be 2-80 characters.");
+  }
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug) || slug.length > 63) {
+    throw new ApiError(400, "INVALID_SEASON", "slug must be lowercase kebab-case.");
+  }
+  const start = Date.parse(startsAt);
+  const end = Date.parse(endsAt);
+  if (Number.isNaN(start) || Number.isNaN(end)) {
+    throw new ApiError(400, "INVALID_SEASON", "startsAt and endsAt must be ISO timestamps.");
+  }
+  if (end <= start) {
+    throw new ApiError(400, "INVALID_SEASON", "endsAt must be after startsAt.");
+  }
+  return {
+    name,
+    slug,
+    startsAt: new Date(start).toISOString(),
+    endsAt: new Date(end).toISOString(),
+  };
+}
+
+function actorOrganizationRole(actor: RequestActor): string {
+  const organization = actorOrganization(actor.user);
+  return (organization ? stringField(organization, "role") : null) ?? "";
+}
+
+/**
+ * Reads a self-reported hint count from a submission. Absent or invalid values
+ * are 0, so no penalty is applied rather than an assumed one; the cap keeps a
+ * single submission from erasing more than the policy's maximum.
+ */
+function hintsUsedOf(value: unknown): number {
+  if (!isObject(value)) return 0;
+  const raw = value.hintsUsed ?? value.hints_used;
+  const parsed = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(20, Math.floor(parsed));
 }
 
 function submittedAnswers(value: unknown): SubmittedAnswer[] {
@@ -850,6 +986,192 @@ async function oidcPrincipal(
   );
 }
 
+/**
+ * A suspended account keeps its rows but loses every session. This runs before
+ * any route handler, so suspension revokes access without a token round-trip.
+ */
+function rejectSuspendedAccount(user: unknown): void {
+  if (field(user, "disabledAt")) {
+    throw new ApiError(
+      403,
+      "ACCOUNT_SUSPENDED",
+      "This account has been suspended by a platform administrator.",
+    );
+  }
+}
+
+/**
+ * True when the account has not agreed to the documents currently in force.
+ * A version bump therefore re-gates everyone, which is the point of storing
+ * the version alongside the agreement time.
+ */
+function consentOutstanding(user: unknown): boolean {
+  const consent = field(user, "consent");
+  if (!isObject(consent)) return true;
+  return (
+    !consent.termsAgreedAt ||
+    consent.termsVersion !== TERMS_VERSION ||
+    !consent.privacyAgreedAt ||
+    consent.privacyVersion !== PRIVACY_POLICY_VERSION
+  );
+}
+
+/** Routes an account may still reach while its consent is outstanding. */
+const CONSENT_EXEMPT_PATHS = new Set(["/v1/me", "/v1/me/consent"]);
+
+/**
+ * Source address for audit records.
+ *
+ * `X-Forwarded-For` is attacker-controlled unless a trusted proxy rewrites it,
+ * and a forged address in an audit trail is worse than no address at all. The
+ * header is therefore only honoured when TRUST_PROXY_HEADERS is enabled, which
+ * deployments behind the ingress must set to record real client addresses.
+ */
+function clientIpOf(request: IncomingMessage, trustProxyHeaders: boolean): string | null {
+  if (trustProxyHeaders) {
+    const header = request.headers["x-forwarded-for"];
+    const raw = Array.isArray(header) ? header[0] : header;
+    const first = raw?.split(",")[0]?.trim();
+    if (first && first.length <= 45 && !/[\u0000-\u001f\u007f,]/.test(first)) {
+      return first;
+    }
+  }
+  return request.socket.remoteAddress ?? null;
+}
+
+/**
+ * Builds a handle seed from an email local part. The handle is the public
+ * identifier (`@handle`) and must satisfy the same charset the API accepts, so
+ * anything outside [A-Za-z0-9_-] is dropped and short results are padded.
+ */
+function handleSeedFromEmail(email: string): string {
+  const local = email.split("@")[0] ?? "";
+  const cleaned = local.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24);
+  if (cleaned.length >= 3) return cleaned;
+  return `user_${cleaned}`.slice(0, 24).padEnd(3, "0");
+}
+
+/** Fills in a server-derived handle when the client did not supply one. */
+async function withResolvedHandle<T extends { email: string; handle?: string }>(
+  context: HandlerContext,
+  input: T,
+): Promise<T & { handle: string }> {
+  if (input.handle) return input as T & { handle: string };
+  const handle = await context.repository.findAvailableHandle(
+    handleSeedFromEmail(input.email),
+  );
+  return { ...input, handle };
+}
+
+/**
+ * Tears a run down at both the runtime and telemetry planes. Adapter failures
+ * are logged and swallowed: the platform record must still leave the active
+ * set, otherwise a runtime that is already gone would keep the run "ready"
+ * forever and re-tried on every sweep.
+ */
+async function releaseRunResources(
+  context: Pick<HandlerContext, "runtime" | "telemetryGateway">,
+  runId: string,
+): Promise<void> {
+  try {
+    await context.runtime.destroyRun(runId);
+  } catch (error) {
+    console.error(`runtime destroy failed for ${runId}`, error);
+  }
+  try {
+    await context.telemetryGateway.destroy(runId);
+  } catch (error) {
+    console.error(`telemetry destroy failed for ${runId}`, error);
+  }
+}
+
+/**
+ * Stops every still-active run belonging to a user. Suspension revokes API
+ * access, but an already-downloaded OpenVPN profile reaches the environment
+ * over the network without touching the API, so the environment itself has to
+ * go for the suspension to mean anything.
+ */
+async function terminateRunsForUser(
+  context: HandlerContext,
+  userId: string,
+  actorUserId: string,
+  reason: string,
+): Promise<string[]> {
+  const runIds = await context.repository.listActiveRunIdsForUser(userId);
+  const stopped: string[] = [];
+  const stoppedAt = new Date().toISOString();
+  for (const runId of runIds) {
+    await releaseRunResources(context, runId);
+    if (await context.repository.markRunStopped(runId, stoppedAt, actorUserId, reason)) {
+      stopped.push(runId);
+    }
+  }
+  return stopped;
+}
+
+/** Expires runs whose TTL has passed and releases their resources. */
+async function sweepExpiredRuns(
+  context: HandlerContext,
+  now = new Date().toISOString(),
+  limit = 50,
+): Promise<string[]> {
+  const runIds = await context.repository.listExpiredRunIds(now, limit);
+  const expired: string[] = [];
+  for (const runId of runIds) {
+    await releaseRunResources(context, runId);
+    if (await context.repository.markRunExpired(runId, now)) {
+      expired.push(runId);
+      await context.repository.recordAudit({
+        actorUserId: null,
+        action: "runtime.expired",
+        resourceType: "runtime_run",
+        resourceId: runId,
+        metadata: { expiredAt: now },
+      });
+    }
+  }
+  return expired;
+}
+
+/**
+ * Resolves a member the actor is allowed to act on. The lookup is scoped to the
+ * actor's own organization, so a member ID from another tenant reads as absent
+ * rather than leaking its existence.
+ */
+async function requireManageableMember(
+  context: HandlerContext,
+  actor: RequestActor,
+  organizationId: string,
+  userId: string,
+): Promise<unknown> {
+  if (userId === actor.id) {
+    throw new ApiError(
+      409,
+      "CANNOT_MODIFY_SELF",
+      "Organization administrators cannot change their own membership.",
+    );
+  }
+  const member = await context.repository.getOrganizationMember(
+    organizationId,
+    userId,
+  );
+  if (!member) {
+    throw new ApiError(
+      404,
+      "MEMBER_NOT_FOUND",
+      "The organization member was not found.",
+    );
+  }
+  if (stringField(member, "organizationRole") === "owner") {
+    throw new ApiError(
+      409,
+      "OWNER_IMMUTABLE",
+      "The organization owner cannot be modified or removed.",
+    );
+  }
+  return member;
+}
+
 async function resolveActor(
   request: IncomingMessage,
   context: HandlerContext,
@@ -867,6 +1189,7 @@ async function resolveActor(
         "The authenticated identity must complete /v1/auth/onboarding.",
       );
     }
+    rejectSuspendedAccount(user);
     const organization = actorOrganization(user);
     if (
       principal.organizationId &&
@@ -886,11 +1209,36 @@ async function resolveActor(
     };
   }
 
+  // Password sessions: a signed Bearer token names the user. Roles come from
+  // the stored record, exactly as in dev mode, so authorization is identical.
+  if (context.authMode === "local") {
+    const userId = verifySessionToken(bearerToken(request), context.sessionSecret);
+    if (!userId) {
+      throw new ApiError(
+        401,
+        "AUTHENTICATION_REQUIRED",
+        "A valid session is required. Sign in to continue.",
+      );
+    }
+    const user = await context.repository.getUser(userId);
+    if (!user) {
+      throw new ApiError(401, "SESSION_USER_MISSING", "The session user no longer exists.");
+    }
+    rejectSuspendedAccount(user);
+    return actorFromDatabaseUser(user);
+  }
+
   const id = requestedUserId?.trim() || DEV_USER_ID;
   const user = await context.repository.getUser(id);
   if (!user) {
     throw new ApiError(401, "UNKNOWN_DEV_USER", "The development user does not exist.");
   }
+  rejectSuspendedAccount(user);
+  return actorFromDatabaseUser(user);
+}
+
+/** Builds an actor with roles derived from the stored user (dev and local modes). */
+function actorFromDatabaseUser(user: unknown): RequestActor {
   const organization = actorOrganization(user);
   const roles = [
     ...(organization ? ["org_member"] : ["individual"]),
@@ -899,7 +1247,15 @@ async function resolveActor(
       : []),
     ...(field(user, "platformRole") === "platform_admin" ? ["platform_admin"] : []),
   ];
-  return { id, user, roles };
+  return { id: stringField(user, "id") as string, user, roles };
+}
+
+function bearerToken(request: IncomingMessage): string | undefined {
+  const header = request.headers["authorization"];
+  const value = Array.isArray(header) ? header[0] : header;
+  if (!value) return undefined;
+  const match = value.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : undefined;
 }
 
 async function route(
@@ -909,6 +1265,7 @@ async function route(
 ): Promise<void> {
   await context.ready;
   const method = request.method ?? "GET";
+  const actorIp = clientIpOf(request, context.trustProxyHeaders);
   const url = new URL(request.url ?? "/", "http://api.local");
   const ingressPath = url.pathname.replace(/\/+$/, "") || "/";
   const path =
@@ -935,30 +1292,113 @@ async function route(
   }
 
   if (method === "POST" && path === "/v1/auth/register") {
-    if (context.authMode !== "dev") {
+    // Password registration serves both local development (X-User-Id) and the
+    // password-session deployment; OIDC uses /v1/auth/onboarding instead.
+    if (context.authMode !== "dev" && context.authMode !== "local") {
       throw new ApiError(
         403,
         "PASSWORD_REGISTRATION_DISABLED",
         "Password registration is disabled; authenticate with OIDC and use /v1/auth/onboarding.",
       );
     }
-    const input = normalizeRegistration(await readJson(request));
+    if (context.authMode === "local") {
+      const preview = await readJson(request);
+      if (!isObject(preview) || typeof preview.password !== "string" || preview.password.length < 8) {
+        throw new ApiError(
+          400,
+          "PASSWORD_REQUIRED",
+          "A password of at least 8 characters is required to register.",
+        );
+      }
+      const input = await withResolvedHandle(context, normalizeRegistration(preview));
+      const user = await context.repository.register(input);
+      const userId = stringField(user, "id") as string;
+      await context.repository.recordAudit({
+        actorIp,
+        actorUserId: userId,
+        action: "auth.user_registered",
+        resourceType: "user",
+        resourceId: userId,
+        metadata: {
+          accountType: input.accountType,
+          termsVersion: TERMS_VERSION,
+          privacyVersion: PRIVACY_POLICY_VERSION,
+        },
+      });
+      // Registration signs the visitor straight in, so the required flow is
+      // register → session → use, with an explicit login available on return.
+      sendJson(response, 201, {
+        data: { user, session: { token: createSessionToken(userId, context.sessionSecret) } },
+      });
+      return;
+    }
+    const input = await withResolvedHandle(
+      context,
+      normalizeRegistration(await readJson(request)),
+    );
     const user = await context.repository.register(input);
     const userId = stringField(user, "id") as string;
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: userId,
       action: "auth.user_registered",
       resourceType: "user",
       resourceId: userId,
-      metadata: { accountType: input.accountType },
+      metadata: {
+        accountType: input.accountType,
+        termsVersion: TERMS_VERSION,
+        privacyVersion: PRIVACY_POLICY_VERSION,
+      },
     });
     sendJson(response, 201, {
       data: {
         user,
-        developmentAuth:
-          context.authMode === "dev"
-            ? { header: "X-User-Id", value: userId }
-            : null,
+        developmentAuth: { header: "X-User-Id", value: userId },
+      },
+    });
+    return;
+  }
+
+  if (method === "POST" && path === "/v1/auth/login") {
+    if (context.authMode !== "local") {
+      throw new ApiError(
+        404,
+        "ROUTE_NOT_FOUND",
+        "Password login is only available when AUTH_MODE=local.",
+      );
+    }
+    const body = await readJson(request);
+    const email = isObject(body) && typeof body.email === "string"
+      ? body.email.trim().toLowerCase()
+      : "";
+    const password = isObject(body) && typeof body.password === "string" ? body.password : "";
+    // A single generic error for a missing account or a wrong password avoids
+    // revealing which emails are registered.
+    const invalid = () =>
+      new ApiError(401, "INVALID_CREDENTIALS", "The email or password is incorrect.");
+    if (!email || !password) throw invalid();
+    const credentials = await context.repository.getLoginCredentials(email);
+    if (!credentials || !verifyPassword(password, credentials.passwordHash)) {
+      throw invalid();
+    }
+    rejectSuspendedAccount(credentials.user);
+    const userId = stringField(credentials.user, "id") as string;
+    // The stored hash is transparently upgraded to the current scrypt cost once
+    // the plaintext is in hand, which is the only time it is available.
+    if (needsPasswordRehash(credentials.passwordHash)) {
+      await context.repository.setPasswordHash(userId, password);
+    }
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: userId,
+      action: "auth.login",
+      resourceType: "user",
+      resourceId: userId,
+    });
+    sendJson(response, 200, {
+      data: {
+        user: credentials.user,
+        session: { token: createSessionToken(userId, context.sessionSecret) },
       },
     });
     return;
@@ -1001,14 +1441,17 @@ async function route(
         "OIDC onboarding never accepts a password.",
       );
     }
-    const input = normalizeRegistration({
-      ...onboardingBody,
-      email: principal.email,
-      displayName: onboardingBody.displayName ?? principal.displayName,
-      ...(principal.organizationId
-        ? { accountType: "organization", organizationId: principal.organizationId }
-        : {}),
-    });
+    const input = await withResolvedHandle(
+      context,
+      normalizeRegistration({
+        ...onboardingBody,
+        email: principal.email,
+        displayName: onboardingBody.displayName ?? principal.displayName,
+        ...(principal.organizationId
+          ? { accountType: "organization", organizationId: principal.organizationId }
+          : {}),
+      }),
+    );
     const hasOrganizationRole = principal.roles.some(
       (role) => role === "org_member" || role === "org_admin",
     );
@@ -1039,6 +1482,7 @@ async function route(
     });
     const userId = stringField(user, "id") as string;
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: userId,
       action: "auth.identity_onboarded",
       resourceType: "user",
@@ -1160,6 +1604,31 @@ async function route(
     return;
   }
 
+  if (method === "GET" && path === "/v1/admin/audit-logs") {
+    requirePlatformAdmin(actor);
+    const query = parseAdminPageQuery(url, "auditLogs");
+    sendJson(
+      response,
+      200,
+      adminPagePayload(await context.repository.listAdminAuditLogs(query), query),
+    );
+    return;
+  }
+
+  if (method === "GET" && path === "/v1/admin/organization/audit-logs") {
+    const organizationId = requireOrganizationAdmin(actor);
+    const query = parseAdminPageQuery(url, "organizationAuditLogs");
+    sendJson(
+      response,
+      200,
+      adminPagePayload(
+        await context.repository.listOrganizationAuditLogs(organizationId, query),
+        query,
+      ),
+    );
+    return;
+  }
+
   if (method === "GET" && path === "/v1/admin/organization/members") {
     const organizationId = requireOrganizationAdmin(actor);
     const query = parseAdminPageQuery(url, "members");
@@ -1220,6 +1689,7 @@ async function route(
       storedPayload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "admin.organization_created",
       resourceType: "organization",
@@ -1300,6 +1770,7 @@ async function route(
       storedPayload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "admin.organization_join_code_rotated",
       resourceType: "organization",
@@ -1357,11 +1828,66 @@ async function route(
       payload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "admin.lab_quarantined",
       resourceType: "lab",
       resourceId: labId,
       metadata: { reason },
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  const releaseLabMatch = path.match(/^\/v1\/admin\/labs\/([^/]+)\/release$/);
+  if (method === "POST" && releaseLabMatch) {
+    requirePlatformAdmin(actor);
+    const labId = decodeAdminIdentifier(releaseLabMatch[1], "lab");
+    const body = await readJson(request);
+    const reason = normalizeAdminReason(body, "Administrative release");
+    const key = idempotencyKey(request);
+    const digest = requestDigest({ labId, body });
+    const operation = `admin.lab.release:${labId}`;
+    if (
+      await replayIfPresent(
+        context.repository,
+        response,
+        actor.id,
+        operation,
+        key,
+        digest,
+        200,
+      )
+    ) {
+      return;
+    }
+    const lab = await context.repository.releaseLabQuarantine(
+      labId,
+      new Date().toISOString(),
+    );
+    if (!lab) {
+      throw new ApiError(
+        409,
+        "LAB_NOT_QUARANTINED",
+        "The lab was not found or is not quarantined.",
+      );
+    }
+    const payload = { data: { lab } };
+    await context.repository.saveIdempotencyRecord(
+      actor.id,
+      operation,
+      key,
+      digest,
+      labId,
+      payload,
+    );
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.lab_quarantine_released",
+      resourceType: "lab",
+      resourceId: labId,
+      metadata: { reason, restoredStatus: "draft" },
     });
     sendJson(response, 200, payload);
     return;
@@ -1418,6 +1944,7 @@ async function route(
       payload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "admin.runtime_terminated",
       resourceType: "runtime_run",
@@ -1428,8 +1955,369 @@ async function route(
     return;
   }
 
+  const platformRoleMatch = path.match(
+    /^\/v1\/admin\/users\/([^/]+)\/platform-role$/,
+  );
+  if (method === "POST" && platformRoleMatch) {
+    requirePlatformAdmin(actor);
+    const userId = decodeAdminIdentifier(platformRoleMatch[1], "user");
+    const body = await readJson(request);
+    const platformRole = enumBodyField(
+      body,
+      "platformRole",
+      ["user", "platform_admin"] as const,
+      "INVALID_PLATFORM_ROLE",
+    );
+    const reason = normalizeAdminReason(body, "Administrative role change");
+    // Blocking self-demotion keeps at least one platform admin reachable; an
+    // admin who locked themselves out cannot be recovered through the console.
+    if (userId === actor.id) {
+      throw new ApiError(
+        409,
+        "CANNOT_MODIFY_SELF",
+        "Platform administrators cannot change their own platform role.",
+      );
+    }
+    const key = idempotencyKey(request);
+    const digest = requestDigest({ userId, body });
+    const operation = `admin.user.platform_role:${userId}`;
+    if (
+      await replayIfPresent(
+        context.repository,
+        response,
+        actor.id,
+        operation,
+        key,
+        digest,
+        200,
+      )
+    ) {
+      return;
+    }
+    const current = await context.repository.getAdminUser(userId);
+    if (!current) {
+      throw new ApiError(404, "USER_NOT_FOUND", "The user was not found.");
+    }
+    const previousRole = stringField(current, "platformRole");
+    const user = await context.repository.setUserPlatformRole(userId, platformRole);
+    if (!user) {
+      throw new ApiError(404, "USER_NOT_FOUND", "The user was not found.");
+    }
+    const payload = { data: { user } };
+    await context.repository.saveIdempotencyRecord(
+      actor.id,
+      operation,
+      key,
+      digest,
+      userId,
+      payload,
+    );
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.user_platform_role_changed",
+      resourceType: "user",
+      resourceId: userId,
+      metadata: { previousRole, platformRole, reason },
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  const suspensionMatch = path.match(/^\/v1\/admin\/users\/([^/]+)\/suspension$/);
+  if (method === "POST" && suspensionMatch) {
+    requirePlatformAdmin(actor);
+    const userId = decodeAdminIdentifier(suspensionMatch[1], "user");
+    const body = await readJson(request);
+    const suspended = booleanBodyField(body, "suspended", "INVALID_SUSPENSION");
+    const reason = normalizeAdminReason(
+      body,
+      suspended ? "Administrative suspension" : "Administrative reinstatement",
+    );
+    if (userId === actor.id) {
+      throw new ApiError(
+        409,
+        "CANNOT_MODIFY_SELF",
+        "Platform administrators cannot suspend their own account.",
+      );
+    }
+    const key = idempotencyKey(request);
+    const digest = requestDigest({ userId, body });
+    const operation = `admin.user.suspension:${userId}`;
+    if (
+      await replayIfPresent(
+        context.repository,
+        response,
+        actor.id,
+        operation,
+        key,
+        digest,
+        200,
+      )
+    ) {
+      return;
+    }
+    const changedAt = new Date().toISOString();
+    const user = await context.repository.setUserDisabled(
+      userId,
+      suspended,
+      actor.id,
+      reason,
+      changedAt,
+    );
+    if (!user) {
+      throw new ApiError(404, "USER_NOT_FOUND", "The user was not found.");
+    }
+    // Suspension only blocks the API; an issued OpenVPN profile bypasses it, so
+    // the environments themselves have to be torn down.
+    const terminatedRuns = suspended
+      ? await terminateRunsForUser(
+          context,
+          userId,
+          actor.id,
+          "account_suspended",
+        )
+      : [];
+    const payload = { data: { user, terminatedRuns } };
+    await context.repository.saveIdempotencyRecord(
+      actor.id,
+      operation,
+      key,
+      digest,
+      userId,
+      payload,
+    );
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: suspended ? "admin.user_suspended" : "admin.user_reinstated",
+      resourceType: "user",
+      resourceId: userId,
+      metadata: { reason, terminatedRuns: terminatedRuns.length },
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  const memberRoleMatch = path.match(
+    /^\/v1\/admin\/organization\/members\/([^/]+)\/role$/,
+  );
+  if (method === "POST" && memberRoleMatch) {
+    const organizationId = requireOrganizationAdmin(actor);
+    const userId = decodeAdminIdentifier(memberRoleMatch[1], "member");
+    const body = await readJson(request);
+    const role = enumBodyField(
+      body,
+      "role",
+      ["org_admin", "member"] as const,
+      "INVALID_MEMBERSHIP_ROLE",
+    );
+    const reason = normalizeAdminReason(body, "Organization role change");
+    const member = await requireManageableMember(
+      context,
+      actor,
+      organizationId,
+      userId,
+    );
+    // Granting org_admin is symmetric, but revoking it is owner-only so two
+    // organization admins cannot strip each other's access.
+    if (
+      stringField(member, "organizationRole") === "org_admin" &&
+      role === "member" &&
+      actorOrganizationRole(actor) !== "owner"
+    ) {
+      throw new ApiError(
+        403,
+        "ORGANIZATION_OWNER_REQUIRED",
+        "Only the organization owner can demote an organization administrator.",
+      );
+    }
+    const key = idempotencyKey(request);
+    const digest = requestDigest({ organizationId, userId, body });
+    const operation = `admin.organization.member_role:${organizationId}:${userId}`;
+    if (
+      await replayIfPresent(
+        context.repository,
+        response,
+        actor.id,
+        operation,
+        key,
+        digest,
+        200,
+      )
+    ) {
+      return;
+    }
+    const previousRole = stringField(member, "organizationRole");
+    const updated = await context.repository.setOrganizationMemberRole(
+      organizationId,
+      userId,
+      role,
+    );
+    if (!updated) {
+      throw new ApiError(
+        404,
+        "MEMBER_NOT_FOUND",
+        "The organization member was not found.",
+      );
+    }
+    const payload = { data: { member: updated } };
+    await context.repository.saveIdempotencyRecord(
+      actor.id,
+      operation,
+      key,
+      digest,
+      userId,
+      payload,
+    );
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.organization_member_role_changed",
+      resourceType: "organization_membership",
+      resourceId: userId,
+      metadata: { organizationId, previousRole, role, reason },
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  const memberRemoveMatch = path.match(
+    /^\/v1\/admin\/organization\/members\/([^/]+)\/remove$/,
+  );
+  if (method === "POST" && memberRemoveMatch) {
+    const organizationId = requireOrganizationAdmin(actor);
+    const userId = decodeAdminIdentifier(memberRemoveMatch[1], "member");
+    const body = await readJson(request);
+    const reason = normalizeAdminReason(body, "Organization membership removed");
+    const member = await requireManageableMember(
+      context,
+      actor,
+      organizationId,
+      userId,
+    );
+    const previousRole = stringField(member, "organizationRole");
+    if (previousRole === "org_admin" && actorOrganizationRole(actor) !== "owner") {
+      throw new ApiError(
+        403,
+        "ORGANIZATION_OWNER_REQUIRED",
+        "Only the organization owner can remove an organization administrator.",
+      );
+    }
+    const key = idempotencyKey(request);
+    const digest = requestDigest({ organizationId, userId, body });
+    const operation = `admin.organization.member_remove:${organizationId}:${userId}`;
+    if (
+      await replayIfPresent(
+        context.repository,
+        response,
+        actor.id,
+        operation,
+        key,
+        digest,
+        200,
+      )
+    ) {
+      return;
+    }
+    const removed = await context.repository.removeOrganizationMember(
+      organizationId,
+      userId,
+    );
+    if (!removed) {
+      throw new ApiError(
+        404,
+        "MEMBER_NOT_FOUND",
+        "The organization member was not found.",
+      );
+    }
+    const payload = { data: { removed: true, userId } };
+    await context.repository.saveIdempotencyRecord(
+      actor.id,
+      operation,
+      key,
+      digest,
+      userId,
+      payload,
+    );
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.organization_member_removed",
+      resourceType: "organization_membership",
+      resourceId: userId,
+      metadata: { organizationId, previousRole, reason },
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  // Accounts created before the consent requirement, or whose agreement predates
+  // the current document versions, must re-consent before using the service.
+  const consentRequired = consentOutstanding(actor.user);
+  if (consentRequired && !CONSENT_EXEMPT_PATHS.has(path)) {
+    throw new ApiError(
+      403,
+      "CONSENT_REQUIRED",
+      "Agreement to the current terms of service and privacy notice is required.",
+      {
+        termsVersion: TERMS_VERSION,
+        privacyVersion: PRIVACY_POLICY_VERSION,
+      },
+    );
+  }
+
   if (method === "GET" && path === "/v1/me") {
-    sendJson(response, 200, { data: { user: actor.user } });
+    sendJson(response, 200, {
+      data: {
+        user: actor.user,
+        consentRequired,
+        termsVersion: TERMS_VERSION,
+        privacyVersion: PRIVACY_POLICY_VERSION,
+      },
+    });
+    return;
+  }
+
+  if (method === "POST" && path === "/v1/me/consent") {
+    const body = await readJson(request);
+    const consent: Record<string, unknown> =
+      typeof body === "object" && body !== null && "consent" in body &&
+      typeof (body as Record<string, unknown>).consent === "object" &&
+      (body as Record<string, unknown>).consent !== null
+        ? ((body as Record<string, unknown>).consent as Record<string, unknown>)
+        : (isObject(body) ? body : {});
+    if (consent.terms !== true || consent.privacy !== true) {
+      throw new ApiError(
+        400,
+        "CONSENT_REQUIRED",
+        "Agreement to the terms of service and the privacy notice is required.",
+      );
+    }
+    const agreedAt = new Date().toISOString();
+    const user = await context.repository.recordUserConsent(
+      actor.id,
+      agreedAt,
+      TERMS_VERSION,
+      PRIVACY_POLICY_VERSION,
+    );
+    if (!user) {
+      throw new ApiError(404, "USER_NOT_FOUND", "The user was not found.");
+    }
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "auth.consent_recorded",
+      resourceType: "user",
+      resourceId: actor.id,
+      metadata: {
+        termsVersion: TERMS_VERSION,
+        privacyVersion: PRIVACY_POLICY_VERSION,
+      },
+    });
+    sendJson(response, 200, {
+      data: { user, consentRequired: false },
+    });
     return;
   }
 
@@ -1461,6 +2349,7 @@ async function route(
     })) as ReportingDataset;
     const report = organizationReport(dataset, organizationId);
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "report.organization_viewed",
       resourceType: "organization",
@@ -1484,6 +2373,7 @@ async function route(
     const dataset = (await context.repository.getReportingDataset()) as ReportingDataset;
     const report = platformReport(dataset);
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "report.platform_viewed",
       resourceType: "platform",
@@ -1520,14 +2410,109 @@ async function route(
         "Organization ranking is available only to members of that organization.",
       );
     }
+    const rawDomain = url.searchParams.get("domain");
+    if (
+      rawDomain !== null &&
+      !RANKING_DOMAINS.some((item) => item.key === rawDomain)
+    ) {
+      throw new ApiError(
+        400,
+        "INVALID_RANKING_DOMAIN",
+        `domain must be one of: ${RANKING_DOMAINS.map((item) => item.key).join(", ")}.`,
+      );
+    }
+    // Cross-organization standings compare every opted-in tenant, so the board
+    // is always computed from the full dataset even when the viewer is scoped
+    // to their own organization.
     const dataset = (await context.repository.getReportingDataset(
-      rawScope === "organization" ? { organizationId: organizationId as string } : {},
+      {},
     )) as ReportingDataset;
+    const season = (await context.repository.getActiveSeason(
+      new Date().toISOString(),
+    )) as RankingSeason | null;
     const result = ranking(dataset, rawScope, rawPeriod, {
       organizationId: organizationId ?? undefined,
       currentUserId: actor.id,
+      season,
+      domain: (rawDomain as RankingDomain | null) ?? null,
     });
     sendJson(response, 200, { data: { ranking: result } });
+    return;
+  }
+
+  if (method === "GET" && path === "/v1/admin/seasons") {
+    requirePlatformAdmin(actor);
+    sendJson(response, 200, {
+      data: { seasons: await context.repository.listSeasons() },
+    });
+    return;
+  }
+
+  if (method === "POST" && path === "/v1/admin/seasons") {
+    requirePlatformAdmin(actor);
+    const body = await readJson(request);
+    const season = normalizeSeasonBody(body);
+    const created = await context.repository.createSeason({
+      id: `season_${randomUUID()}`,
+      ...season,
+      createdAt: new Date().toISOString(),
+    });
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.season_created",
+      resourceType: "platform",
+      resourceId: stringField(created, "id") as string,
+      metadata: { name: season.name, startsAt: season.startsAt, endsAt: season.endsAt },
+    });
+    sendJson(response, 201, { data: { season: created } });
+    return;
+  }
+
+  const deleteSeasonMatch = path.match(/^\/v1\/admin\/seasons\/([^/]+)$/);
+  if (method === "DELETE" && deleteSeasonMatch) {
+    requirePlatformAdmin(actor);
+    const seasonId = decodeAdminIdentifier(deleteSeasonMatch[1], "season");
+    if (!(await context.repository.deleteSeason(seasonId))) {
+      throw new ApiError(404, "SEASON_NOT_FOUND", "The season was not found.");
+    }
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.season_deleted",
+      resourceType: "platform",
+      resourceId: seasonId,
+    });
+    sendJson(response, 200, { data: { deleted: true, seasonId } });
+    return;
+  }
+
+  // The organization decides whether its own headcount and readiness appear in
+  // the public board, mirroring how individuals opt into the global ranking.
+  if (method === "POST" && path === "/v1/admin/organization/ranking-opt-in") {
+    const organizationId = requireOrganizationAdmin(actor);
+    const body = await readJson(request);
+    const optIn = booleanBodyField(body, "optIn", "INVALID_RANKING_OPT_IN");
+    const organization = await context.repository.setOrganizationRankingOptIn(
+      organizationId,
+      optIn,
+    );
+    if (!organization) {
+      throw new ApiError(
+        404,
+        "ORGANIZATION_NOT_FOUND",
+        "The organization was not found.",
+      );
+    }
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.organization_ranking_opt_in_changed",
+      resourceType: "organization",
+      resourceId: organizationId,
+      metadata: { optIn },
+    });
+    sendJson(response, 200, { data: { organization } });
     return;
   }
 
@@ -1597,6 +2582,7 @@ async function route(
       payload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "lab.generated",
       resourceType: "lab",
@@ -1658,6 +2644,7 @@ async function route(
     const payload = { data: { lab: updatedLab, build: operation } };
     await context.repository.saveIdempotencyRecord(actor.id, operationName, key, digest, operation.id, payload);
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "lab.environment_build_started",
       resourceType: "lab",
@@ -1687,6 +2674,7 @@ async function route(
     );
     const updatedLab = await context.repository.getLab(actor.id, labId);
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "lab.validation_completed",
       resourceType: "lab",
@@ -1798,6 +2786,7 @@ async function route(
       payload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "runtime.deployed",
       resourceType: "runtime_run",
@@ -1847,6 +2836,7 @@ async function route(
       createdAt: createdAt.toISOString(),
     });
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "desktop_ticket.issued",
       resourceType: "runtime_run",
@@ -1904,6 +2894,7 @@ async function route(
       createdAt: createdAt.toISOString(),
     });
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "openvpn_ticket.issued",
       resourceType: "runtime_run",
@@ -1951,6 +2942,7 @@ async function route(
     }
     const result = await context.telemetryGateway.search(runId, query, size);
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "elk.search_executed",
       resourceType: "runtime_run",
@@ -1985,6 +2977,7 @@ async function route(
     }
 
     const answers = submittedAnswers(body);
+    const hintsUsed = hintsUsedOf(body);
     const labId = stringField(run, "labId") as string;
     const lab = await context.repository.getLab(actor.id, labId);
     if (!lab) {
@@ -2030,6 +3023,7 @@ async function route(
         trustedEvidence,
       },
       skills: gradeSkills(grade.grades as unknown as JsonRecord[]),
+      hintsUsed,
       completedAt,
     });
     const payload = { data: { result, grade } };
@@ -2043,6 +3037,7 @@ async function route(
       payload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "challenge.submitted",
       resourceType: "challenge_result",
@@ -2082,18 +3077,38 @@ export function createApplication(options: ApplicationOptions = {}) {
   const configuredAuthMode = options.authMode ?? process.env.AUTH_MODE ?? "oidc";
   const authMode = configuredAuthMode === "production" ? "oidc" : configuredAuthMode;
   const productionMode = configuredAuthMode === "production" || (authMode === "oidc" && process.env.NODE_ENV === "production");
-  if (authMode !== "dev" && authMode !== "oidc") {
+  if (authMode !== "dev" && authMode !== "oidc" && authMode !== "local") {
     throw new RepositoryError(
       "INVALID_AUTH_MODE",
-      "AUTH_MODE must be 'dev' or 'oidc'.",
+      "AUTH_MODE must be 'dev', 'local' or 'oidc'.",
       500,
     );
   }
+  // Password sessions are signed with this secret. It must be provided in a
+  // deployment; a random per-process fallback keeps local runs working but
+  // invalidates every session on restart, which is fine for development.
+  const sessionSecret =
+    options.sessionSecret ??
+    process.env.SESSION_SIGNING_SECRET ??
+    (authMode === "local" && process.env.NODE_ENV === "production"
+      ? ""
+      : randomBytes(32).toString("hex"));
+  if (authMode === "local" && !sessionSecret) {
+    throw new RepositoryError(
+      "SESSION_SECRET_REQUIRED",
+      "SESSION_SIGNING_SECRET must be set when AUTH_MODE=local in production.",
+      500,
+    );
+  }
+  // Local password mode is a self-contained deployment: it uses the same
+  // in-process simulators as dev for the runtime, AI, grader and gateways, so
+  // no external services are required.
+  const devInfra = authMode === "dev" || authMode === "local";
   const repositoryMode =
     options.repositoryMode ??
     (process.env.REPOSITORY_MODE === "sqlite" || process.env.REPOSITORY_MODE === "postgres"
       ? process.env.REPOSITORY_MODE
-      : authMode === "dev"
+      : devInfra
         ? "sqlite"
         : "postgres");
   const repository =
@@ -2114,7 +3129,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       : process.env.RUNTIME_ADAPTER === "simulator" ||
           process.env.RUNTIME_MODE === "simulator"
         ? "simulator"
-        : authMode === "dev"
+        : devInfra
           ? "simulator"
           : "http");
   if (
@@ -2137,17 +3152,17 @@ export function createApplication(options: ApplicationOptions = {}) {
             process.env.RUNTIME_SERVICE_URL ?? "http://codegate-runtime:9000",
           internalToken:
             process.env.RUNTIME_INTERNAL_TOKEN ??
-            (authMode === "dev" ? "local-runtime-token" : ""),
+            (devInfra ? "local-runtime-token" : ""),
           targetImage:
             process.env.RUNTIME_TARGET_IMAGE ??
-            (authMode === "dev" ? "codegate/local-target:development" : ""),
+            (devInfra ? "codegate/local-target:development" : ""),
           allowedTargetRegistries: (
             process.env.TARGET_IMAGE_REGISTRIES ?? "registry.codegate.internal"
           )
             .split(",")
             .map((item) => item.trim())
             .filter(Boolean),
-          allowTemplateFallback: authMode === "dev",
+          allowTemplateFallback: devInfra,
           desktopPublicUrl: process.env.DESKTOP_GATEWAY_PUBLIC_URL,
         }));
   const configuredLabGeneratorMode =
@@ -2158,7 +3173,7 @@ export function createApplication(options: ApplicationOptions = {}) {
           process.env.AI_ADAPTER === "http" ||
           process.env.AI_ADAPTER === "service"
         ? "http"
-        : authMode === "dev"
+        : devInfra
           ? "local"
           : "http");
   if (
@@ -2180,7 +3195,7 @@ export function createApplication(options: ApplicationOptions = {}) {
           serviceUrl: process.env.AI_SERVICE_URL ?? "http://codegate-ai:8001",
           internalToken:
             process.env.AI_INTERNAL_TOKEN ??
-            (authMode === "dev" ? "ai-service-dev-token" : ""),
+            (devInfra ? "ai-service-dev-token" : ""),
           generationTimeoutMs: aiGenerationTimeoutFromEnvironment(),
           exposeDebugErrors: authMode === "dev",
         }));
@@ -2194,7 +3209,7 @@ export function createApplication(options: ApplicationOptions = {}) {
           process.env.GRADER_ADAPTER === "http" ||
           process.env.GRADER_ADAPTER === "service"
         ? "http"
-        : authMode === "dev"
+        : devInfra
           ? "mock"
           : "http");
   if (
@@ -2217,7 +3232,7 @@ export function createApplication(options: ApplicationOptions = {}) {
             process.env.GRADER_SERVICE_URL ?? "http://codegate-grader:9002",
           internalToken:
             process.env.GRADER_INTERNAL_TOKEN ??
-            (authMode === "dev" ? "grader-service-dev-token" : ""),
+            (devInfra ? "grader-service-dev-token" : ""),
         }));
   const configuredLabValidatorMode =
     options.labValidatorMode ??
@@ -2226,7 +3241,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       : process.env.LAB_VALIDATOR_ADAPTER === "http" ||
           process.env.LAB_VALIDATOR_ADAPTER === "service"
         ? "http"
-        : authMode === "dev"
+        : devInfra
           ? "development"
           : "http");
   if (
@@ -2255,7 +3270,7 @@ export function createApplication(options: ApplicationOptions = {}) {
             process.env.VALIDATOR_SERVICE_URL ?? "http://codegate-validator:9003",
           internalToken:
             process.env.VALIDATOR_INTERNAL_TOKEN ??
-            (authMode === "dev" ? "validator-service-dev-token" : ""),
+            (devInfra ? "validator-service-dev-token" : ""),
         }));
   const configuredTelemetryGatewayMode =
     options.telemetryGatewayMode ??
@@ -2263,7 +3278,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       ? "development"
       : process.env.TELEMETRY_ADAPTER === "http" || process.env.TELEMETRY_ADAPTER === "service"
         ? "http"
-        : authMode === "dev"
+        : devInfra
           ? "development"
           : "http");
   if (
@@ -2282,7 +3297,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       ? new DevelopmentTelemetryGateway()
       : new HttpTelemetryGateway({
           url: process.env.TELEMETRY_SERVICE_URL ?? "http://codegate-telemetry:9201",
-          token: process.env.TELEMETRY_INTERNAL_TOKEN ?? (authMode === "dev" ? "telemetry-service-dev-token" : ""),
+          token: process.env.TELEMETRY_INTERNAL_TOKEN ?? (devInfra ? "telemetry-service-dev-token" : ""),
         }));
   const configuredEnvironmentBuilderMode =
     options.environmentBuilderMode ??
@@ -2291,7 +3306,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       : process.env.ENVIRONMENT_BUILDER_ADAPTER === "http" ||
           process.env.ENVIRONMENT_BUILDER_ADAPTER === "service"
         ? "http"
-        : authMode === "dev"
+        : devInfra
           ? "development"
           : "http");
   if (
@@ -2311,7 +3326,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       ? new DevelopmentEnvironmentBuilder({ targetImage: process.env.RUNTIME_TARGET_IMAGE })
       : new HttpEnvironmentBuilder({
           url: process.env.BUILDER_SERVICE_URL ?? "http://codegate-builder:9004",
-          token: process.env.BUILDER_INTERNAL_TOKEN ?? (authMode === "dev" ? "builder-service-dev-token" : ""),
+          token: process.env.BUILDER_INTERNAL_TOKEN ?? (devInfra ? "builder-service-dev-token" : ""),
         }));
   const oidcVerifier =
     authMode === "oidc" ? options.oidcVerifier ?? environmentOidcVerifier() : undefined;
@@ -2319,18 +3334,18 @@ export function createApplication(options: ApplicationOptions = {}) {
     options.allowedOrigins ??
     (process.env.ALLOWED_ORIGINS
       ? process.env.ALLOWED_ORIGINS.split(",").map((item) => item.trim()).filter(Boolean)
-      : authMode === "dev"
+      : devInfra
         ? ["http://localhost:3000", "http://127.0.0.1:3000"]
         : []);
   const allowedOrigins = new Set(configuredOrigins);
   const desktopGatewayInternalToken =
     options.desktopGatewayInternalToken ??
     process.env.DESKTOP_GATEWAY_INTERNAL_TOKEN ??
-    (authMode === "dev" ? "desktop-gateway-dev-token" : "");
+    (devInfra ? "desktop-gateway-dev-token" : "");
   const desktopGatewayPublicUrl = (
     options.desktopGatewayPublicUrl ??
     process.env.DESKTOP_GATEWAY_PUBLIC_URL ??
-    (authMode === "dev" ? "http://localhost:9001" : "https://desktop.codegate.invalid")
+    (devInfra ? "http://localhost:9001" : "https://desktop.codegate.invalid")
   ).replace(/\/$/, "");
   const desktopTicketTtlSeconds = boundedInteger(
     options.desktopTicketTtlSeconds ?? process.env.DESKTOP_TICKET_TTL_SECONDS ?? 300,
@@ -2341,11 +3356,11 @@ export function createApplication(options: ApplicationOptions = {}) {
   const openVpnDownloadInternalToken =
     options.openVpnDownloadInternalToken ??
     process.env.OPENVPN_DOWNLOAD_INTERNAL_TOKEN ??
-    (authMode === "dev" ? "openvpn-download-dev-token" : "");
+    (devInfra ? "openvpn-download-dev-token" : "");
   const openVpnDownloadPublicUrl = (
     options.openVpnDownloadPublicUrl ??
     process.env.OPENVPN_DOWNLOAD_PUBLIC_URL ??
-    (authMode === "dev" ? "http://localhost:9100" : "https://vpn.codegate.invalid")
+    (devInfra ? "http://localhost:9100" : "https://vpn.codegate.invalid")
   ).replace(/\/$/, "");
   if (productionMode) {
     validateProductionEdgeConfiguration({
@@ -2356,7 +3371,48 @@ export function createApplication(options: ApplicationOptions = {}) {
       openVpnDownloadPublicUrl,
     });
   }
+  const trustProxyHeaders =
+    options.trustProxyHeaders ?? process.env.TRUST_PROXY_HEADERS === "true";
   const ready = Promise.resolve(repository.initialize());
+
+  const handlerContext: HandlerContext = {
+    repository,
+    runtime,
+    labGenerator,
+    evidenceGrader,
+    labValidator,
+    telemetryGateway,
+    environmentBuilder,
+    authMode,
+    oidcVerifier,
+    sessionSecret,
+    desktopGatewayInternalToken,
+    desktopGatewayPublicUrl,
+    desktopTicketTtlSeconds,
+    openVpnDownloadInternalToken,
+    openVpnDownloadPublicUrl,
+    trustProxyHeaders,
+    ready,
+  };
+
+  const runSweep = async (now?: string) => {
+    await ready;
+    return sweepExpiredRuns(handlerContext, now);
+  };
+
+  const sweepIntervalMs =
+    options.runSweepIntervalMs ??
+    Number.parseInt(process.env.RUN_SWEEP_INTERVAL_MS ?? "60000", 10);
+  let sweepTimer: ReturnType<typeof setInterval> | undefined;
+  if (Number.isFinite(sweepIntervalMs) && sweepIntervalMs > 0) {
+    sweepTimer = setInterval(() => {
+      void runSweep().catch((error: unknown) => {
+        console.error("expired run sweep failed", error);
+      });
+    }, sweepIntervalMs);
+    // Never hold the process open for the sweep alone.
+    sweepTimer.unref?.();
+  }
 
   const server = createServer((request, response) => {
     if (!applyCors(request, response, allowedOrigins)) {
@@ -2368,23 +3424,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       });
       return;
     }
-    route(request, response, {
-      repository,
-      runtime,
-      labGenerator,
-      evidenceGrader,
-      labValidator,
-      telemetryGateway,
-      environmentBuilder,
-      authMode,
-      oidcVerifier,
-      desktopGatewayInternalToken,
-      desktopGatewayPublicUrl,
-      desktopTicketTtlSeconds,
-      openVpnDownloadInternalToken,
-      openVpnDownloadPublicUrl,
-      ready,
-    }).catch((error: unknown) => {
+    route(request, response, handlerContext).catch((error: unknown) => {
       if (response.headersSent) {
         response.end();
         return;
@@ -2440,7 +3480,10 @@ export function createApplication(options: ApplicationOptions = {}) {
     authMode,
     repositoryMode,
     ready,
+    /** Runs the expiry sweep once. Exposed so tests can drive it deterministically. */
+    sweepExpiredRuns: runSweep,
     async close(): Promise<void> {
+      if (sweepTimer) clearInterval(sweepTimer);
       if (server.listening) {
         await new Promise<void>((resolve, reject) => {
           server.close((error) => (error ? reject(error) : resolve()));

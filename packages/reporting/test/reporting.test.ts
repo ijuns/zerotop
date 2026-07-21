@@ -67,3 +67,55 @@ test("global ranking honors privacy opt-in and organization ranking is tenant sc
 test("organization ranking requires the tenant id", () => {
   assert.throws(() => ranking(dataset, "organization", "weekly", { now }), /organizationId/);
 });
+
+test("season score applies difficulty, time and hints per the policy", () => {
+  const base = {
+    organizationId: null,
+    runId: "r",
+    labId: "l",
+    labTitle: "Lab",
+    team: "red" as const,
+    completedAt: "2026-07-20T12:00:00.000Z",
+    skills: {},
+    maxPoints: 100,
+  };
+  const build = (evidence: ReportingDataset["evidence"]): ReportingDataset => ({
+    organizations: [],
+    users: [
+      { id: "s", handle: "solo", displayName: "Solo", organizationId: null, globalRankingOptIn: true },
+    ],
+    evidence,
+  });
+  const scoreOf = (extra: Partial<ReportingDataset["evidence"][number]>) =>
+    ranking(build([{ ...base, userId: "s", points: 100, ...extra }]), "global", "all_time", {
+      now,
+    }).entries[0].points;
+
+  // Advanced base 500 × 100% accuracy, no timing/hints → 500.
+  assert.equal(scoreOf({ difficulty: "advanced" }), 500);
+  // Beginner base 100; intermediate default 250.
+  assert.equal(scoreOf({ difficulty: "beginner" }), 100);
+  assert.equal(scoreOf({}), 250);
+  // Half accuracy halves the score.
+  assert.equal(scoreOf({ difficulty: "advanced", points: 50 }), 250);
+
+  // Finishing within half the TTL earns the full +20%.
+  assert.equal(
+    scoreOf({ difficulty: "advanced", durationSeconds: 60, ttlSeconds: 600 }),
+    600,
+  );
+  // Using the whole TTL earns no bonus.
+  assert.equal(
+    scoreOf({ difficulty: "advanced", durationSeconds: 600, ttlSeconds: 600 }),
+    500,
+  );
+
+  // Each hint removes 4%, capped at 20%; five or more hits the floor.
+  assert.equal(scoreOf({ difficulty: "advanced", hintsUsed: 1 }), 480);
+  assert.equal(scoreOf({ difficulty: "advanced", hintsUsed: 5 }), 400);
+  assert.equal(scoreOf({ difficulty: "advanced", hintsUsed: 99 }), 400);
+
+  // The honest default: no hint data means no penalty, not an assumed one.
+  assert.equal(scoreOf({ difficulty: "advanced", hintsUsed: 0 }), 500);
+  assert.equal(scoreOf({ difficulty: "advanced" }), 500);
+});

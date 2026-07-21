@@ -1,4 +1,16 @@
+import {
+  DIFFICULTY_BASE_POINTS,
+  HINT_PENALTY_PER_USE,
+  MAX_HINT_PENALTY,
+  MAX_TIME_BONUS,
+  RANKING_DOMAINS,
+} from "@codegate/contracts";
 import type {
+  LabDifficulty,
+  OrganizationRankingEntry,
+  RankingDomain,
+  RankingSeason,
+  RankingViewerSummary,
   OrganizationCapabilityReport,
   PersonalCapabilityReport,
   PlatformCapabilityReport,
@@ -21,6 +33,9 @@ export interface CapabilityOrganization {
   id: string;
   name: string;
   slug: string;
+  /** Cross-organization ranking is opt-in; see migration 014. */
+  rankingOptIn?: boolean;
+  memberCount?: number;
 }
 
 export interface CapabilityEvidence {
@@ -34,6 +49,13 @@ export interface CapabilityEvidence {
   maxPoints: number;
   completedAt: string;
   skills: Record<string, { label: string; points: number; maxPoints: number }>;
+  /** Scoring-policy inputs. Absent fields fall back to neutral defaults. */
+  difficulty?: LabDifficulty;
+  /** Seconds spent in the run; used for the time bonus when the TTL is known. */
+  durationSeconds?: number | null;
+  /** Run lifetime in seconds; the time bonus is measured against it. */
+  ttlSeconds?: number | null;
+  hintsUsed?: number;
 }
 
 export interface ReportingDataset {
@@ -176,21 +198,36 @@ export function ranking(
   dataset: ReportingDataset,
   scope: "global" | "organization",
   period: RankingPeriod,
-  options: { now?: Date; organizationId?: string; currentUserId?: string } = {},
+  options: {
+    now?: Date;
+    organizationId?: string;
+    currentUserId?: string;
+    season?: RankingSeason | null;
+    domain?: RankingDomain | null;
+  } = {},
 ): RankingResponse {
   const now = options.now ?? new Date();
   if (scope === "organization" && !options.organizationId) {
     throw new Error("organizationId is required for organization ranking");
   }
-  const currentWindow = periodWindow(period, now, 0);
-  const previousWindow = periodWindow(period, now, 1);
+  const season = options.season ?? null;
+  const domain = options.domain ?? null;
+  // A season, when one is running, replaces the rolling period: the board is
+  // "this season" rather than "the last 7 days".
+  const currentWindow = season
+    ? { start: Date.parse(season.startsAt), end: Date.parse(season.endsAt) }
+    : periodWindow(period, now, 0);
+  const previousWindow = season
+    ? shiftWindow(currentWindow)
+    : periodWindow(period, now, 1);
+
   const eligibleUsers = dataset.users.filter((user) =>
     scope === "global"
       ? user.globalRankingOptIn
       : user.organizationId === options.organizationId,
   );
-  const current = rankWindow(dataset, eligibleUsers, currentWindow);
-  const previous = rankWindow(dataset, eligibleUsers, previousWindow);
+  const current = rankWindow(dataset, eligibleUsers, currentWindow, domain);
+  const previous = rankWindow(dataset, eligibleUsers, previousWindow, domain);
   const previousRank = new Map(previous.map((entry) => [entry.userId, entry.rank]));
   const entries = current.map((entry) => ({
     ...entry,
@@ -198,15 +235,309 @@ export function ranking(
       ? (previousRank.get(entry.userId) as number) - entry.rank
       : 0,
   }));
+
+  const organizations = rankOrganizations(
+    dataset,
+    currentWindow,
+    previousWindow,
+    domain,
+  );
+  const currentUser = options.currentUserId
+    ? entries.find((item) => item.userId === options.currentUserId)
+    : undefined;
+  const currentOrganization = options.organizationId
+    ? organizations.find((item) => item.organizationId === options.organizationId)
+    : undefined;
+
   return {
     scope,
     period,
     generatedAt: now.toISOString(),
+    season,
+    domain,
     entries,
-    ...(options.currentUserId
-      ? { currentUser: entries.find((item) => item.userId === options.currentUserId) }
-      : {}),
+    organizations,
+    viewer: viewerSummary(
+      dataset,
+      options.currentUserId,
+      currentWindow,
+      previousWindow,
+      domain,
+      entries,
+    ),
+    ...(currentUser ? { currentUser } : {}),
+    ...(currentOrganization ? { currentOrganization } : {}),
   };
+}
+
+/**
+ * Season score for one graded lab, per the published policy:
+ *   base(difficulty) × accuracy × (1 + timeBonus) × (1 − hintPenalty)
+ * With a domain filter, accuracy is measured over that domain's skills only.
+ * Missing inputs are neutral: no difficulty → intermediate base, no timing → no
+ * bonus, no hints → no penalty. Nothing is invented for absent data.
+ */
+function seasonScore(
+  item: CapabilityEvidence,
+  skills: Set<string> | null,
+): number {
+  const scored = evidencePoints(item, skills);
+  if (scored.maxPoints <= 0) return 0;
+  const base = DIFFICULTY_BASE_POINTS[item.difficulty ?? "intermediate"];
+  const accuracy = scored.points / scored.maxPoints;
+  return Math.round(base * accuracy * timeMultiplier(item) * hintMultiplier(item));
+}
+
+/** +MAX_TIME_BONUS for finishing within half the TTL, tapering to 0 at the TTL. */
+function timeMultiplier(item: CapabilityEvidence): number {
+  const ttl = item.ttlSeconds ?? 0;
+  const duration = item.durationSeconds ?? null;
+  if (ttl <= 0 || duration === null || duration < 0) return 1;
+  const fractionUsed = duration / ttl;
+  const bonus = MAX_TIME_BONUS * clamp((1 - fractionUsed) / 0.5, 0, 1);
+  return 1 + bonus;
+}
+
+/** −HINT_PENALTY_PER_USE per hint, floored at 1 − MAX_HINT_PENALTY. */
+function hintMultiplier(item: CapabilityEvidence): number {
+  const hints = item.hintsUsed ?? 0;
+  return 1 - Math.min(MAX_HINT_PENALTY, HINT_PENALTY_PER_USE * hints);
+}
+
+function clamp(value: number, low: number, high: number): number {
+  return Math.max(low, Math.min(high, value));
+}
+
+/** Skill keys that count towards a domain filter. */
+function domainSkills(domain: RankingDomain | null): Set<string> | null {
+  if (!domain) return null;
+  const found = RANKING_DOMAINS.find((item) => item.key === domain);
+  return found ? new Set<string>(found.skills) : null;
+}
+
+/** Points a piece of evidence contributes once a domain filter is applied. */
+function evidencePoints(
+  item: CapabilityEvidence,
+  skills: Set<string> | null,
+): { points: number; maxPoints: number } {
+  if (!skills) return { points: item.points, maxPoints: item.maxPoints };
+  let points = 0;
+  let maxPoints = 0;
+  for (const [key, skill] of Object.entries(item.skills)) {
+    if (!skills.has(key) || skill.maxPoints <= 0) continue;
+    points += skill.points;
+    maxPoints += skill.maxPoints;
+  }
+  return { points, maxPoints };
+}
+
+/** The domain a user scored highest in, used as their headline speciality. */
+function primaryDomainOf(
+  evidence: CapabilityEvidence[],
+): { key: RankingDomain; label: string } | null {
+  let best: { key: RankingDomain; label: string; points: number } | null = null;
+  for (const domain of RANKING_DOMAINS) {
+    const skills = new Set<string>(domain.skills);
+    let points = 0;
+    for (const item of evidence) {
+      points += evidencePoints(item, skills).points;
+    }
+    if (points > 0 && (!best || points > best.points)) {
+      best = { key: domain.key, label: domain.label, points };
+    }
+  }
+  return best ? { key: best.key, label: best.label } : null;
+}
+
+/** Longest run of consecutive UTC days present in the timestamps. */
+function longestStreak(timestamps: string[]): number {
+  const days = [
+    ...new Set(timestamps.map((value) => Math.floor(Date.parse(value) / DAY_MS))),
+  ].sort((a, b) => a - b);
+  let best = 0;
+  let run = 0;
+  let previous: number | null = null;
+  for (const day of days) {
+    run = previous !== null && day === previous + 1 ? run + 1 : 1;
+    previous = day;
+    if (run > best) best = run;
+  }
+  return best;
+}
+
+/** Streak counted backwards from today; 0 once a day is missed. */
+function currentStreak(timestamps: string[], now: Date): number {
+  const days = new Set(
+    timestamps.map((value) => Math.floor(Date.parse(value) / DAY_MS)),
+  );
+  let cursor = Math.floor(now.getTime() / DAY_MS);
+  // Today may not have activity yet, so an unbroken streak can end yesterday.
+  if (!days.has(cursor)) cursor -= 1;
+  let streak = 0;
+  while (days.has(cursor)) {
+    streak += 1;
+    cursor -= 1;
+  }
+  return streak;
+}
+
+function viewerSummary(
+  dataset: ReportingDataset,
+  userId: string | undefined,
+  current: { start: number; end: number },
+  previous: { start: number; end: number },
+  domain: RankingDomain | null,
+  entries: RankingEntry[],
+): RankingViewerSummary {
+  const totalParticipants = entries.length;
+  const empty: RankingViewerSummary = {
+    rank: null,
+    totalParticipants,
+    topPercent: null,
+    points: 0,
+    pointsDelta: 0,
+    completedLabs: 0,
+    accuracy: 0,
+    streakDays: 0,
+    bestStreakDays: 0,
+  };
+  if (!userId) return empty;
+
+  const skills = domainSkills(domain);
+  const mine = validEvidence(dataset.evidence).filter(
+    (item) => item.userId === userId,
+  );
+  const inWindow = (window: { start: number; end: number }) =>
+    mine.filter((item) => {
+      const timestamp = Date.parse(item.completedAt);
+      return timestamp >= window.start && timestamp < window.end;
+    });
+
+  const currentEvidence = inWindow(current);
+  let points = 0;
+  let rawPoints = 0;
+  let maxPoints = 0;
+  for (const item of currentEvidence) {
+    const scored = evidencePoints(item, skills);
+    points += seasonScore(item, skills);
+    rawPoints += scored.points;
+    maxPoints += scored.maxPoints;
+  }
+  const previousPoints = inWindow(previous).reduce(
+    (total, item) => total + seasonScore(item, skills),
+    0,
+  );
+  const rank = entries.find((item) => item.userId === userId)?.rank ?? null;
+
+  return {
+    rank,
+    totalParticipants,
+    topPercent:
+      rank !== null && totalParticipants > 0
+        ? Math.max(0.1, Math.round((rank / totalParticipants) * 1000) / 10)
+        : null,
+    points,
+    pointsDelta: points - previousPoints,
+    completedLabs: currentEvidence.length,
+    accuracy: percent(rawPoints, maxPoints),
+    streakDays: currentStreak(
+      mine.map((item) => item.completedAt),
+      new Date(Math.min(current.end, Date.now())),
+    ),
+    bestStreakDays: longestStreak(mine.map((item) => item.completedAt)),
+  };
+}
+
+/**
+ * Ranks organizations against each other. Only organizations that opted in are
+ * listed: headcount and readiness would otherwise be visible to competitors.
+ */
+function rankOrganizations(
+  dataset: ReportingDataset,
+  current: { start: number; end: number },
+  previous: { start: number; end: number },
+  domain: RankingDomain | null,
+): OrganizationRankingEntry[] {
+  const score = (window: { start: number; end: number }) => {
+    const skills = domainSkills(domain);
+    const evidence = validEvidence(dataset.evidence).filter((item) => {
+      const timestamp = Date.parse(item.completedAt);
+      return timestamp >= window.start && timestamp < window.end;
+    });
+    return dataset.organizations
+      .filter((organization) => organization.rankingOptIn)
+      .map((organization) => {
+        const members = dataset.users.filter(
+          (user) => user.organizationId === organization.id,
+        );
+        const memberCount = organization.memberCount ?? members.length;
+        const mine = evidence.filter(
+          (item) => item.organizationId === organization.id,
+        );
+        let points = 0;
+        let maxPoints = 0;
+        for (const item of mine) {
+          const scored = evidencePoints(item, skills);
+          points += scored.points;
+          maxPoints += scored.maxPoints;
+        }
+        const active = new Set(mine.map((item) => item.userId)).size;
+        const accuracy = percent(points, maxPoints);
+        const participationRate = percent(active, memberCount);
+        // Completion is the share of attempts that were graded as passing,
+        // which is the closest signal available to "finished the assignment".
+        const completionRate = percent(
+          mine.filter((item) => item.points > 0).length,
+          mine.length,
+        );
+        return {
+          organizationId: organization.id,
+          name: organization.name,
+          memberCount,
+          accuracy,
+          participationRate,
+          completionRate,
+          // Weighted so a small, highly engaged team is not beaten purely on
+          // headcount, and a large idle one cannot coast on a few experts.
+          readiness:
+            Math.round(
+              (accuracy * 0.5 + participationRate * 0.3 + completionRate * 0.2) * 10,
+            ) / 10,
+          attempts: mine.length,
+        };
+      })
+      .filter((item) => item.attempts > 0)
+      .sort(
+        (a, b) =>
+          b.readiness - a.readiness ||
+          b.participationRate - a.participationRate ||
+          a.name.localeCompare(b.name),
+      );
+  };
+
+  const previousRank = new Map(
+    score(previous).map((item, index) => [item.organizationId, index + 1]),
+  );
+  return score(current).map((item, index) => {
+    const rank = index + 1;
+    const before = previousRank.get(item.organizationId);
+    return {
+      rank,
+      organizationId: item.organizationId,
+      name: item.name,
+      memberCount: item.memberCount,
+      readiness: item.readiness,
+      participationRate: item.participationRate,
+      completionRate: item.completionRate,
+      change: before ? before - rank : 0,
+    };
+  });
+}
+
+/** The equally sized window immediately before the given one. */
+function shiftWindow(window: { start: number; end: number }) {
+  const span = window.end - window.start;
+  return { start: window.start - span, end: window.start };
 }
 
 function skillScores(
@@ -262,22 +593,37 @@ function rankWindow(
   dataset: ReportingDataset,
   users: CapabilityUser[],
   window: { start: number; end: number },
+  domain: RankingDomain | null = null,
 ): RankingEntry[] {
   const organizations = new Map(dataset.organizations.map((item) => [item.id, item]));
+  const skills = domainSkills(domain);
   const rows = users
     .map((user) => {
       const evidence = validEvidence(dataset.evidence).filter((item) => {
         const timestamp = Date.parse(item.completedAt);
         return item.userId === user.id && timestamp >= window.start && timestamp < window.end;
       });
+      let points = 0;
+      let rawPoints = 0;
+      let maxPoints = 0;
+      for (const item of evidence) {
+        const scored = evidencePoints(item, skills);
+        // Season points apply the difficulty/time/hint policy; accuracy stays
+        // the plain share of available points so it reads as a percentage.
+        points += seasonScore(item, skills);
+        rawPoints += scored.points;
+        maxPoints += scored.maxPoints;
+      }
       return {
         userId: user.id,
         handle: user.handle,
         organizationName: user.organizationId
           ? organizations.get(user.organizationId)?.name ?? null
           : null,
-        points: evidence.reduce((total, item) => total + item.points, 0),
+        points,
         completedLabs: evidence.length,
+        accuracy: percent(rawPoints, maxPoints),
+        primaryDomain: primaryDomainOf(evidence),
       };
     })
     .filter((item) => item.points > 0)

@@ -1,8 +1,30 @@
+import { hashPassword } from "./security.ts";
+
 import { DEV_USER_ID, SECURITY_LAB_ORG_ID } from "./types.ts";
 import { normalizeLabGeneration } from "./input.ts";
 
 export const DEVELOPMENT_FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
 export const DEVELOPMENT_FIXTURE_PASSWORD = "ZeroTOP!2026";
+
+/**
+ * Every seed account shares one password, and scrypt is deliberately slow, so
+ * the digest is computed once per process instead of once per fixture row.
+ * Sharing a hash across synthetic accounts reveals nothing a shared plaintext
+ * does not already reveal.
+ */
+let cachedFixturePasswordHash: string | null | undefined;
+export function developmentFixturePasswordHash(): string | null {
+  if (cachedFixturePasswordHash === undefined) {
+    cachedFixturePasswordHash = hashPassword(DEVELOPMENT_FIXTURE_PASSWORD);
+  }
+  return cachedFixturePasswordHash;
+}
+/**
+ * Seed accounts are synthetic, so recording their consent fabricates nothing
+ * about a real person. It keeps the sample data usable behind the consent gate
+ * that real pre-existing accounts have to pass.
+ */
+export const DEVELOPMENT_FIXTURE_AFFILIATION = "ZeroTOP 개발 샘플";
 
 export interface DevelopmentOrganizationFixture {
   id: string;
@@ -29,6 +51,7 @@ export interface DevelopmentCapabilityLabFixture {
   name: string;
   description: string;
   teamType: "blue" | "red";
+  difficulty: "beginner" | "intermediate" | "advanced" | "expert";
   questionTypes: readonly string[];
   environment: "ubuntu" | "kali";
   config: ReturnType<typeof normalizeLabGeneration>["config"];
@@ -267,6 +290,7 @@ const DEVELOPMENT_TRAINING_TEMPLATES = [
     title: "공개 CVE 웹 침투",
     description: "공개된 N-day 취약점을 분석하고 웹 서비스의 공격 경로를 검증합니다.",
     teamType: "red",
+    difficulty: "advanced",
     questionTypes: ["single_choice", "free_text", "mitre_attack"],
     environment: "kali",
     skills: [
@@ -279,6 +303,7 @@ const DEVELOPMENT_TRAINING_TEMPLATES = [
     title: "ELK 위협 헌팅",
     description: "ELK에서 공격 흔적을 추적하고 MITRE ATT&CK 전술과 연결합니다.",
     teamType: "blue",
+    difficulty: "intermediate",
     questionTypes: ["elk_search", "mitre_attack"],
     environment: "ubuntu",
     skills: [
@@ -291,6 +316,7 @@ const DEVELOPMENT_TRAINING_TEMPLATES = [
     title: "Linux 권한 상승 분석",
     description: "Linux 호스트의 권한 상승 경로를 식별하고 공격 흐름을 설명합니다.",
     teamType: "red",
+    difficulty: "expert",
     questionTypes: ["multiple_choice", "free_text", "mitre_attack"],
     environment: "kali",
     skills: [
@@ -345,6 +371,7 @@ export function buildDevelopmentCapabilityFixtures(
         team: template.teamType,
         desktopImage: template.environment,
         accessMethod: "browser_desktop",
+        difficulty: template.difficulty,
         questionTypes: [...template.questionTypes],
       });
       return {
@@ -354,6 +381,7 @@ export function buildDevelopmentCapabilityFixtures(
         name,
         description: template.description,
         teamType: template.teamType,
+        difficulty: template.difficulty,
         questionTypes: template.questionTypes,
         environment: template.environment,
         config: {

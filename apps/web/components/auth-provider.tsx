@@ -18,7 +18,7 @@ import {
 import type { WebRuntimeConfig } from "../lib/runtime-config";
 
 interface AuthContextValue {
-  mode: "dev" | "oidc";
+  mode: "dev" | "oidc" | "local";
   ready: boolean;
   authenticated: boolean;
   login(): Promise<void>;
@@ -70,12 +70,17 @@ export function AuthProvider({
 }) {
   configureClientRuntime(runtimeConfig);
   const development = isDevelopmentIdentityEnabled();
-  const [ready, setReady] = useState(development);
-  const [authenticated, setAuthenticated] = useState(development);
+  // Local password-session mode manages its own login screen in the page, so it
+  // is treated here like dev: no gate, no OIDC init. The session token itself
+  // (sent as a Bearer header) is what actually authorizes each request.
+  const local = runtimeConfig.authMode === "local";
+  const unauthenticatedOk = development || local;
+  const [ready, setReady] = useState(unauthenticatedOk);
+  const [authenticated, setAuthenticated] = useState(unauthenticatedOk);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (development) {
+    if (unauthenticatedOk) {
       setAccessTokenProvider(null);
       return;
     }
@@ -128,29 +133,29 @@ export function AuthProvider({
     return () => {
       active = false;
     };
-  }, [development, runtimeConfig]);
+  }, [unauthenticatedOk, runtimeConfig]);
 
   const value = useMemo<AuthContextValue>(() => ({
-    mode: development ? "dev" : "oidc",
+    mode: development ? "dev" : local ? "local" : "oidc",
     ready,
     authenticated,
     async login() {
-      if (development) return;
+      if (unauthenticatedOk) return;
       await oidcClient(runtimeConfig).login({ redirectUri: window.location.origin });
     },
     async register() {
-      if (development) return;
+      if (unauthenticatedOk) return;
       await oidcClient(runtimeConfig).register({ redirectUri: window.location.origin });
     },
     async logout() {
-      if (development) return;
+      if (unauthenticatedOk) return;
       setAccessTokenProvider(null);
       await oidcClient(runtimeConfig).logout({ redirectUri: window.location.origin });
     },
-  }), [authenticated, development, ready, runtimeConfig]);
+  }), [authenticated, development, local, ready, runtimeConfig, unauthenticatedOk]);
 
   if (!ready) return <AuthGate state="loading" />;
-  if (!development && !authenticated) {
+  if (!unauthenticatedOk && !authenticated) {
     return (
       <AuthGate
         state={error ? "error" : "anonymous"}

@@ -153,7 +153,7 @@ test("HTTP runtime adapter migrates a legacy Blue Lab to an ELK topology", async
     document: {
       "@timestamp": "2026-07-21T10:00:00.000Z",
       event: { category: "process" },
-      threat: { technique: { id: ["T1059.001"] } },
+      threat: { technique: { id: ["T1059.001", "T1041"] } },
       process: { name: "powershell.exe" },
     },
   }];
@@ -221,14 +221,19 @@ test("HTTP runtime adapter migrates a legacy Red Lab without defensive telemetry
     },
   }, "user-fixture", "openvpn");
 
-  assert.deepEqual(capturedBody.topology, {
+  const topology = capturedBody.topology as Record<string, unknown>;
+  const target = topology.target as Record<string, unknown>;
+  const exercise = target.exercise as Record<string, unknown>;
+  assert.deepEqual({ ...topology, target: { ...target, exercise: undefined } }, {
     schemaVersion: 1,
     team: "red",
     isolation: "per_run",
     workstation: { role: "attack_operator", desktopImage: "kali", entrypoint: "target" },
-    target: { role: "vulnerable_target", hostname: "target" },
+    target: { role: "vulnerable_target", hostname: "target", exercise: undefined },
   });
-  assert.equal("telemetry" in (capturedBody.topology as Record<string, unknown>), false);
+  assert.equal(exercise.schemaVersion, 1);
+  assert.equal(typeof exercise.profile, "string");
+  assert.equal("telemetry" in topology, false);
 });
 
 test("personal development fixture Labs include deployable runtime contracts", async () => {

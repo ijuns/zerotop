@@ -84,10 +84,51 @@ target images are permitted only as development template fallbacks.
   `GET /v1/admin/users|organizations|labs|runs`,
   `POST /v1/admin/organizations`,
   `POST /v1/admin/organizations/:id/rotate-join-code`,
-  `POST /v1/admin/labs/:id/quarantine`, and
-  `POST /v1/admin/runs/:id/terminate`.
+  `POST /v1/admin/labs/:id/quarantine`,
+  `POST /v1/admin/runs/:id/terminate`,
+  `POST /v1/admin/users/:id/platform-role`,
+  `POST /v1/admin/users/:id/suspension`, and
+  `GET /v1/admin/audit-logs` (newest first; filter by `action`, `resourceType`,
+  or a `search` over actor handle and resource ID),
+  `POST /v1/admin/labs/:id/release` (lifts a quarantine back to `draft`, never
+  straight to `validated`: the pre-quarantine status is not retained, so the lab
+  must pass validation again before it can be deployed).
+- Audit records carry the request source address. `X-Forwarded-For` is only
+  honoured when `TRUST_PROXY_HEADERS=true`, because a forged address in an audit
+  trail is worse than none; deployments behind the ingress must set it. Administrators cannot change their own
+  platform role or suspend themselves, so the last administrator stays reachable.
+  A suspended account is rejected during actor resolution, before any route runs.
 - Organization administration:
-  `GET /v1/admin/organization/members` (always scoped to the actor's tenant).
+  `GET /v1/admin/organization/members` (always scoped to the actor's tenant),
+  `GET /v1/admin/organization/audit-logs` (organization governance events only —
+  membership and organization records. Member workspace activity is excluded so
+  the personal-workspace guarantee shown at signup still holds),
+  `POST /v1/admin/organization/members/:userId/role`, and
+  `POST /v1/admin/organization/members/:userId/remove`. The owner can never be
+  targeted, and revoking `org_admin` is owner-only so two organization
+  administrators cannot strip each other's access.
+- Passwords are stored as salted scrypt (`scrypt$N$r$p$salt$hash`, parameters
+  encoded so the cost can be raised without invalidating existing rows).
+  `verifyPassword` still accepts the pre-scrypt unsalted SHA-256 digests, and
+  `needsPasswordRehash` marks them for replacement the next time the plaintext
+  is available — a legacy row cannot be upgraded without it.
+- Accounts whose agreement is missing or predates the current document versions
+  are refused on every route with `CONSENT_REQUIRED` (403). Only `GET /v1/me`
+  and `POST /v1/me/consent` stay reachable, so the client can show the notice
+  and record agreement. Bumping `TERMS_VERSION` or `PRIVACY_POLICY_VERSION`
+  therefore re-gates every account, which is the point of storing the version.
+- Registration (`POST /v1/auth/register`, `POST /v1/auth/onboarding`) requires
+  `affiliation` and explicit `consent: { terms, privacy }`. The agreement time
+  and document version are stored per user so consent can be demonstrated.
+  `handle` is optional: when omitted it is derived from the email local part and
+  de-duplicated, so the public `@handle` never has to be typed or shared.
+- Runs have a lifetime. A periodic sweep (`RUN_SWEEP_INTERVAL_MS`, default 60s)
+  expires runs past `expires_at`, and suspending an account stops that account's
+  running environments — API suspension alone would leave an already-issued
+  OpenVPN profile working.
+- Both role grants are DB-side. Under `AUTH_MODE=oidc` the guards intersect the
+  verified token roles with the stored role, so a grant additionally requires the
+  matching Keycloak realm role; a revocation takes effect immediately.
 - One-time access: `POST /v1/runs/:id/desktop-ticket`,
   `POST /v1/internal/desktop-tickets/exchange`,
   `POST /v1/runs/:id/openvpn-ticket`,

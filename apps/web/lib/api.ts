@@ -81,7 +81,7 @@ export interface UserContext {
   role?: string;
   roles?: PlatformRole[];
   platformRole?: string;
-  organization?: { id?: string; name?: string; slug?: string; role?: string } | null;
+  organization?: { id?: string; name?: string; slug?: string; role?: string; rankingOptIn?: boolean } | null;
   organizationName?: string | null;
   globalRankingOptIn?: boolean;
   [key: string]: unknown;
@@ -89,11 +89,14 @@ export interface UserContext {
 
 export interface RegistrationRequest {
   email: string;
-  handle: string;
+  /** Omitted by the signup form: the server derives it from the email. */
+  handle?: string;
   displayName: string;
+  affiliation: string;
   password?: string;
   accountType: AccountType;
   organizationJoinCode?: string;
+  consent: { terms: boolean; privacy: boolean };
 }
 
 export interface RegistrationResult {
@@ -169,6 +172,22 @@ export type CapabilityReport =
   | OrganizationCapabilityReport
   | PlatformCapabilityReport;
 
+export const RANKING_DOMAINS = [
+  { key: "vulnerability", label: "취약점 분석" },
+  { key: "detection", label: "탐지 · 조사" },
+  { key: "response", label: "완화 · 복구" },
+] as const;
+
+export type RankingDomain = (typeof RANKING_DOMAINS)[number]["key"];
+
+export interface RankingSeason {
+  id: string;
+  name: string;
+  slug: string;
+  startsAt: string;
+  endsAt: string;
+}
+
 export interface RankingEntry {
   rank: number;
   userId: string;
@@ -177,14 +196,44 @@ export interface RankingEntry {
   points: number;
   completedLabs: number;
   change: number;
+  accuracy: number;
+  primaryDomain: { key: RankingDomain; label: string } | null;
+}
+
+export interface OrganizationRankingEntry {
+  rank: number;
+  organizationId: string;
+  name: string;
+  memberCount: number;
+  readiness: number;
+  participationRate: number;
+  completionRate: number;
+  change: number;
+}
+
+export interface RankingViewerSummary {
+  rank: number | null;
+  totalParticipants: number;
+  topPercent: number | null;
+  points: number;
+  pointsDelta: number;
+  completedLabs: number;
+  accuracy: number;
+  streakDays: number;
+  bestStreakDays: number;
 }
 
 export interface RankingResponse {
   scope: RankingScope;
   period: RankingPeriod;
   generatedAt: string;
+  season: RankingSeason | null;
+  domain: RankingDomain | null;
   entries: RankingEntry[];
+  organizations: OrganizationRankingEntry[];
+  viewer: RankingViewerSummary;
   currentUser?: RankingEntry;
+  currentOrganization?: OrganizationRankingEntry;
 }
 
 export interface ValidationCheck {
@@ -363,6 +412,8 @@ export interface AdminPageQuery {
   team?: Team;
   status?: string;
   accessMethod?: AccessMethod;
+  action?: string;
+  resourceType?: string;
 }
 
 export interface AdminOverview {
@@ -383,6 +434,9 @@ export interface AdminUser {
   displayName: string;
   platformRole: "user" | "platform_admin" | string;
   globalRankingOptIn: boolean;
+  /** Non-null while the account is suspended and blocked from authenticating. */
+  disabledAt: string | null;
+  disabledReason: string | null;
   organization: {
     id: string;
     name: string;
@@ -427,6 +481,19 @@ export interface AdminRun {
   createdAt: string;
 }
 
+export interface AdminAuditLog {
+  id: string;
+  action: string;
+  resourceType: string;
+  resourceId: string;
+  /** handle/displayName are null when the actor account no longer exists. */
+  actor: { id: string; handle: string | null; displayName: string | null } | null;
+  metadata: Record<string, unknown>;
+  /** Null for system-initiated events, or when no source address was recorded. */
+  actorIp: string | null;
+  createdAt: string;
+}
+
 export interface OrganizationMember {
   id: string;
   handle: string;
@@ -466,6 +533,25 @@ export function setAccessTokenProvider(provider: AccessTokenProvider | null) {
   accessTokenProvider = provider;
 }
 
+// Password-session token (AUTH_MODE=local). Kept in localStorage so a returning
+// visitor stays signed in, and mirrored in memory for synchronous requests.
+const SESSION_STORAGE_KEY = "zerotop.sessionToken";
+let sessionToken: string | null =
+  typeof window !== "undefined"
+    ? window.localStorage.getItem(SESSION_STORAGE_KEY)
+    : null;
+
+export function getSessionToken() {
+  return sessionToken;
+}
+
+function storeSessionToken(token: string | null) {
+  sessionToken = token;
+  if (typeof window === "undefined") return;
+  if (token) window.localStorage.setItem(SESSION_STORAGE_KEY, token);
+  else window.localStorage.removeItem(SESSION_STORAGE_KEY);
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
@@ -474,7 +560,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers.set("Content-Type", "application/json");
   }
 
-  const token = await accessTokenProvider?.();
+  const token = (await accessTokenProvider?.()) ?? sessionToken;
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   } else if (developmentIdentityEnabled) {
@@ -672,6 +758,56 @@ function rankingEntryOf(value: unknown): RankingEntry {
     points: numberValue(item.points ?? item.score),
     completedLabs: numberValue(item.completedLabs ?? item.completed_labs),
     change: numberValue(item.change ?? item.rankChange ?? item.rank_change),
+    accuracy: numberValue(item.accuracy),
+    primaryDomain: isRecord(item.primaryDomain)
+      ? {
+          key: stringValue(item.primaryDomain.key) as RankingDomain,
+          label: stringValue(item.primaryDomain.label),
+        }
+      : null,
+  };
+}
+
+function adminSeasonOf(value: unknown): RankingSeason | null {
+  const item = isRecord(value) ? value : {};
+  if (typeof item.id !== "string") return null;
+  return {
+    id: item.id,
+    name: stringValue(item.name),
+    slug: stringValue(item.slug),
+    startsAt: stringValue(item.startsAt ?? item.starts_at),
+    endsAt: stringValue(item.endsAt ?? item.ends_at),
+  };
+}
+
+function organizationRankingEntryOf(value: unknown): OrganizationRankingEntry {
+  const item = isRecord(value) ? value : {};
+  return {
+    rank: numberValue(item.rank),
+    organizationId: stringValue(item.organizationId ?? item.organization_id),
+    name: stringValue(item.name, "이름 없는 조직"),
+    memberCount: numberValue(item.memberCount ?? item.member_count),
+    readiness: numberValue(item.readiness),
+    participationRate: numberValue(item.participationRate ?? item.participation_rate),
+    completionRate: numberValue(item.completionRate ?? item.completion_rate),
+    change: numberValue(item.change),
+  };
+}
+
+function rankingViewerOf(value: unknown): RankingViewerSummary {
+  const item = isRecord(value) ? value : {};
+  const rank = item.rank;
+  const topPercent = item.topPercent ?? item.top_percent;
+  return {
+    rank: typeof rank === "number" ? rank : null,
+    totalParticipants: numberValue(item.totalParticipants ?? item.total_participants),
+    topPercent: typeof topPercent === "number" ? topPercent : null,
+    points: numberValue(item.points),
+    pointsDelta: numberValue(item.pointsDelta ?? item.points_delta),
+    completedLabs: numberValue(item.completedLabs ?? item.completed_labs),
+    accuracy: numberValue(item.accuracy),
+    streakDays: numberValue(item.streakDays ?? item.streak_days),
+    bestStreakDays: numberValue(item.bestStreakDays ?? item.best_streak_days),
   };
 }
 
@@ -684,7 +820,22 @@ function rankingOf(value: unknown): RankingResponse {
         ? item.period
         : "weekly",
     generatedAt: stringValue(item.generatedAt ?? item.generated_at),
+    season: isRecord(item.season)
+      ? {
+          id: stringValue(item.season.id),
+          name: stringValue(item.season.name),
+          slug: stringValue(item.season.slug),
+          startsAt: stringValue(item.season.startsAt ?? item.season.starts_at),
+          endsAt: stringValue(item.season.endsAt ?? item.season.ends_at),
+        }
+      : null,
+    domain: typeof item.domain === "string" ? (item.domain as RankingDomain) : null,
     entries: arrayValue(item.entries ?? item.rankings).map(rankingEntryOf),
+    organizations: arrayValue(item.organizations).map(organizationRankingEntryOf),
+    viewer: rankingViewerOf(item.viewer),
+    ...(item.currentOrganization
+      ? { currentOrganization: organizationRankingEntryOf(item.currentOrganization) }
+      : {}),
     ...(item.currentUser || item.current_user
       ? { currentUser: rankingEntryOf(item.currentUser ?? item.current_user) }
       : {}),
@@ -922,6 +1073,8 @@ function adminUserOf(value: unknown): AdminUser | null {
     displayName: stringValue(item.displayName ?? item.display_name, item.handle),
     platformRole: stringValue(item.platformRole ?? item.platform_role, "user"),
     globalRankingOptIn: item.globalRankingOptIn === true || item.global_ranking_opt_in === true,
+    disabledAt: nullableString(item.disabledAt ?? item.disabled_at),
+    disabledReason: nullableString(item.disabledReason ?? item.disabled_reason),
     organization:
       rawOrganization && typeof rawOrganization.id === "string"
         ? {
@@ -1002,6 +1155,30 @@ function organizationMemberOf(value: unknown): OrganizationMember | null {
   };
 }
 
+function adminAuditLogOf(value: unknown): AdminAuditLog | null {
+  const item = isRecord(value) ? value : {};
+  if (typeof item.id !== "string") return null;
+  const actor = isRecord(item.actor) ? item.actor : null;
+  const metadata = isRecord(item.metadata) ? item.metadata : {};
+  return {
+    id: item.id,
+    action: stringValue(item.action, "unknown"),
+    resourceType: stringValue(item.resourceType ?? item.resource_type),
+    resourceId: stringValue(item.resourceId ?? item.resource_id),
+    actor:
+      actor && typeof actor.id === "string"
+        ? {
+            id: actor.id,
+            handle: nullableString(actor.handle),
+            displayName: nullableString(actor.displayName ?? actor.display_name),
+          }
+        : null,
+    metadata,
+    actorIp: nullableString(item.actorIp ?? item.actor_ip),
+    createdAt: stringValue(item.createdAt ?? item.created_at),
+  };
+}
+
 function adminQueryString(input: AdminPageQuery = {}) {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(input)) {
@@ -1031,12 +1208,13 @@ function organizationJoinCodeResultOf(value: unknown): OrganizationJoinCodeResul
 export const api = {
   health: () => request<HealthResponse>("/health"),
 
-  register: async (input: RegistrationRequest, authMode: "dev" | "oidc") => {
+  register: async (input: RegistrationRequest, authMode: "dev" | "oidc" | "local") => {
     const body =
       authMode === "oidc"
         ? {
-            handle: input.handle,
             displayName: input.displayName,
+            affiliation: input.affiliation,
+            consent: input.consent,
             accountType: input.accountType,
             ...(input.organizationJoinCode
               ? { organizationJoinCode: input.organizationJoinCode }
@@ -1050,6 +1228,11 @@ export const api = {
       ),
     );
     const data = isRecord(payload) ? payload : {};
+    // In local mode registration signs the visitor straight in.
+    const session = isRecord(data.session) ? data.session : null;
+    if (session && typeof session.token === "string") {
+      storeSessionToken(session.token);
+    }
     return {
       user: (data.user ?? data) as UserContext,
       developmentAuth: isRecord(data.developmentAuth)
@@ -1059,7 +1242,46 @@ export const api = {
     } satisfies RegistrationResult;
   },
 
-  me: async () => entityOf<UserContext>(await request("/v1/me"), "user"),
+  login: async (email: string, password: string): Promise<UserContext> => {
+    const payload = dataOf(
+      await request("/v1/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email, password }),
+      }),
+    );
+    const data = isRecord(payload) ? payload : {};
+    const session = isRecord(data.session) ? data.session : null;
+    if (!session || typeof session.token !== "string") {
+      throw new ApiError("로그인 응답에 세션 토큰이 없습니다.", 500);
+    }
+    storeSessionToken(session.token);
+    return (data.user ?? data) as UserContext;
+  },
+
+  logout: () => {
+    storeSessionToken(null);
+  },
+
+  me: async (): Promise<{ user: UserContext; consentRequired: boolean }> => {
+    const payload = dataOf(await request("/v1/me"));
+    const body = isRecord(payload) ? payload : {};
+    return {
+      user: (body.user ?? body) as UserContext,
+      consentRequired: body.consentRequired === true,
+    };
+  },
+
+  /** Records agreement for an account created before the consent requirement. */
+  recordConsent: async () => {
+    const payload = dataOf(
+      await request("/v1/me/consent", {
+        method: "POST",
+        body: JSON.stringify({ consent: { terms: true, privacy: true } }),
+      }),
+    );
+    const body = isRecord(payload) ? payload : {};
+    return (body.user ?? body) as UserContext;
+  },
 
   listLabs: async () => {
     const payload = dataOf(await request<unknown>("/v1/labs"));
@@ -1210,11 +1432,15 @@ export const api = {
       entityOf<unknown>(await request("/v1/admin/reports/platform"), "report"),
     ),
 
-  rankings: async (scope: RankingScope, period: RankingPeriod) =>
+  rankings: async (
+    scope: RankingScope,
+    period: RankingPeriod,
+    domain?: RankingDomain | null,
+  ) =>
     rankingOf(
       entityOf<unknown>(
         await request(
-          `/v1/rankings?scope=${encodeURIComponent(scope)}&period=${encodeURIComponent(period)}`,
+          `/v1/rankings?scope=${encodeURIComponent(scope)}&period=${encodeURIComponent(period)}${domain ? `&domain=${encodeURIComponent(domain)}` : ""}`,
         ),
         "ranking",
       ),
@@ -1249,6 +1475,57 @@ export const api = {
       adminRunOf,
     ),
 
+  adminAuditLogs: async (query: AdminPageQuery = {}) =>
+    adminPageOf(
+      await request(`/v1/admin/audit-logs${adminQueryString(query)}`),
+      adminAuditLogOf,
+    ),
+
+  adminSeasons: async () => {
+    const payload = dataOf(await request("/v1/admin/seasons"));
+    const seasons = isRecord(payload) ? payload.seasons : payload;
+    return arrayValue(seasons)
+      .map(adminSeasonOf)
+      .filter((item): item is RankingSeason => item !== null);
+  },
+
+  createSeason: async (input: {
+    name: string;
+    slug: string;
+    startsAt: string;
+    endsAt: string;
+  }) =>
+    adminSeasonOf(
+      entityOf<unknown>(
+        await request("/v1/admin/seasons", {
+          method: "POST",
+          body: JSON.stringify(input),
+        }),
+        "season",
+      ),
+    ),
+
+  deleteSeason: async (seasonId: string) => {
+    await request(`/v1/admin/seasons/${encodeURIComponent(seasonId)}`, {
+      method: "DELETE",
+    });
+  },
+
+  setOrganizationRankingOptIn: async (optIn: boolean) =>
+    entityOf<AdminOrganization>(
+      await request("/v1/admin/organization/ranking-opt-in", {
+        method: "POST",
+        body: JSON.stringify({ optIn }),
+      }),
+      "organization",
+    ),
+
+  organizationAuditLogs: async (query: AdminPageQuery = {}) =>
+    adminPageOf(
+      await request(`/v1/admin/organization/audit-logs${adminQueryString(query)}`),
+      adminAuditLogOf,
+    ),
+
   organizationMembers: async (query: AdminPageQuery = {}) =>
     adminPageOf(
       await request(`/v1/admin/organization/members${adminQueryString(query)}`),
@@ -1276,6 +1553,16 @@ export const api = {
       ),
     ),
 
+  releaseLab: async (labId: string, reason?: string) =>
+    entityOf<AdminLab>(
+      await request(`/v1/admin/labs/${encodeURIComponent(labId)}/release`, {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey("admin-lab-release") },
+        body: JSON.stringify(reason?.trim() ? { reason: reason.trim() } : {}),
+      }),
+      "lab",
+    ),
+
   quarantineLab: async (labId: string, reason?: string) =>
     entityOf<AdminLab>(
       await request(`/v1/admin/labs/${encodeURIComponent(labId)}/quarantine`, {
@@ -1294,6 +1581,72 @@ export const api = {
         body: JSON.stringify(reason?.trim() ? { reason: reason.trim() } : {}),
       }),
       "run",
+    ),
+
+  setUserPlatformRole: async (
+    userId: string,
+    platformRole: "user" | "platform_admin",
+    reason?: string,
+  ) =>
+    entityOf<AdminUser>(
+      await request(
+        `/v1/admin/users/${encodeURIComponent(userId)}/platform-role`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": idempotencyKey("admin-user-role") },
+          body: JSON.stringify({
+            platformRole,
+            ...(reason?.trim() ? { reason: reason.trim() } : {}),
+          }),
+        },
+      ),
+      "user",
+    ),
+
+  setUserSuspension: async (userId: string, suspended: boolean, reason?: string) =>
+    entityOf<AdminUser>(
+      await request(`/v1/admin/users/${encodeURIComponent(userId)}/suspension`, {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey("admin-user-suspension") },
+        body: JSON.stringify({
+          suspended,
+          ...(reason?.trim() ? { reason: reason.trim() } : {}),
+        }),
+      }),
+      "user",
+    ),
+
+  setOrganizationMemberRole: async (
+    userId: string,
+    role: "org_admin" | "member",
+    reason?: string,
+  ) =>
+    entityOf<OrganizationMember>(
+      await request(
+        `/v1/admin/organization/members/${encodeURIComponent(userId)}/role`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": idempotencyKey("admin-member-role") },
+          body: JSON.stringify({
+            role,
+            ...(reason?.trim() ? { reason: reason.trim() } : {}),
+          }),
+        },
+      ),
+      "member",
+    ),
+
+  removeOrganizationMember: async (userId: string, reason?: string) =>
+    entityOf<boolean>(
+      await request(
+        `/v1/admin/organization/members/${encodeURIComponent(userId)}/remove`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": idempotencyKey("admin-member-remove") },
+          body: JSON.stringify(reason?.trim() ? { reason: reason.trim() } : {}),
+        },
+      ),
+      "removed",
     ),
 };
 
