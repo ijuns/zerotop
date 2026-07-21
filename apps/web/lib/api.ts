@@ -81,7 +81,7 @@ export interface UserContext {
   role?: string;
   roles?: PlatformRole[];
   platformRole?: string;
-  organization?: { id?: string; name?: string; slug?: string; role?: string } | null;
+  organization?: { id?: string; name?: string; slug?: string; role?: string; rankingOptIn?: boolean } | null;
   organizationName?: string | null;
   globalRankingOptIn?: boolean;
   [key: string]: unknown;
@@ -749,6 +749,18 @@ function rankingEntryOf(value: unknown): RankingEntry {
   };
 }
 
+function adminSeasonOf(value: unknown): RankingSeason | null {
+  const item = isRecord(value) ? value : {};
+  if (typeof item.id !== "string") return null;
+  return {
+    id: item.id,
+    name: stringValue(item.name),
+    slug: stringValue(item.slug),
+    startsAt: stringValue(item.startsAt ?? item.starts_at),
+    endsAt: stringValue(item.endsAt ?? item.ends_at),
+  };
+}
+
 function organizationRankingEntryOf(value: unknown): OrganizationRankingEntry {
   const item = isRecord(value) ? value : {};
   return {
@@ -1408,6 +1420,36 @@ export const api = {
       await request(`/v1/admin/audit-logs${adminQueryString(query)}`),
       adminAuditLogOf,
     ),
+
+  adminSeasons: async () => {
+    const payload = dataOf(await request("/v1/admin/seasons"));
+    const seasons = isRecord(payload) ? payload.seasons : payload;
+    return arrayValue(seasons)
+      .map(adminSeasonOf)
+      .filter((item): item is RankingSeason => item !== null);
+  },
+
+  createSeason: async (input: {
+    name: string;
+    slug: string;
+    startsAt: string;
+    endsAt: string;
+  }) =>
+    adminSeasonOf(
+      entityOf<unknown>(
+        await request("/v1/admin/seasons", {
+          method: "POST",
+          body: JSON.stringify(input),
+        }),
+        "season",
+      ),
+    ),
+
+  deleteSeason: async (seasonId: string) => {
+    await request(`/v1/admin/seasons/${encodeURIComponent(seasonId)}`, {
+      method: "DELETE",
+    });
+  },
 
   setOrganizationRankingOptIn: async (optIn: boolean) =>
     entityOf<AdminOrganization>(

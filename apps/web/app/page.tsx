@@ -2056,7 +2056,7 @@ export default function HomePage() {
               {rankingData?.organizations.map((entry) => (
                 <tr key={entry.organizationId} className={rankingData.currentOrganization?.organizationId === entry.organizationId ? "is-current-user" : ""}>
                   <td><strong className="rank-number">{entry.rank}</strong></td>
-                  <td><strong>{entry.name}</strong>{rankingData.currentOrganization?.organizationId === entry.organizationId && <span className="rank-mine">MY</span>}</td>
+                  <td><span className="rank-name"><strong>{entry.name}</strong>{rankingData.currentOrganization?.organizationId === entry.organizationId && <span className="rank-mine">MY</span>}</span></td>
                   <td className="number-cell">{entry.memberCount}명</td>
                   <td className="number-cell">{entry.readiness}</td>
                   <td className="number-cell">{entry.participationRate}%</td>
@@ -2070,7 +2070,7 @@ export default function HomePage() {
               {rankingData?.entries.map((entry) => (
                 <tr key={entry.userId + "-" + entry.rank} className={rankingData.currentUser?.userId === entry.userId ? "is-current-user" : ""}>
                   <td><strong className="rank-number">{entry.rank}</strong></td>
-                  <td><strong>{entry.handle}</strong>{rankingData.currentUser?.userId === entry.userId && <span className="rank-mine">MY</span>}</td>
+                  <td><span className="rank-name"><strong>{entry.handle}</strong>{rankingData.currentUser?.userId === entry.userId && <span className="rank-mine">MY</span>}</span></td>
                   <td>{entry.primaryDomain?.label ?? "—"}</td>
                   <td className="number-cell">{entry.points.toLocaleString("ko-KR")} XP</td>
                   <td className="number-cell">{entry.completedLabs}</td>
@@ -2264,7 +2264,7 @@ export default function HomePage() {
       case "report-organization": return renderReport("organization");
       case "report-platform": return renderReport("platform");
       case "ranking": return renderRanking();
-      case "admin": return <AdminConsole roles={roles} organizationName={user?.organization?.name || user?.organizationName} currentUserId={user?.id} organizationRole={user?.organization?.role} authMode={authentication.mode} />;
+      case "admin": return <AdminConsole roles={roles} organizationName={user?.organization?.name || user?.organizationName} currentUserId={user?.id} organizationRole={user?.organization?.role} organizationRankingOptIn={user?.organization?.rankingOptIn} authMode={authentication.mode} />;
       case "signup": return renderSignup();
     }
   };

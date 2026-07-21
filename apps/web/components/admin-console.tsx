@@ -14,6 +14,7 @@ import {
   type AdminUser,
   type OrganizationMember,
   type PlatformRole,
+  type RankingSeason,
 } from "../lib/api";
 
 type AdminTab =
@@ -23,6 +24,7 @@ type AdminTab =
   | "labs"
   | "runs"
   | "audit"
+  | "seasons"
   | "members"
   | "orgAudit";
 type AdminListItem =
@@ -43,6 +45,7 @@ const TAB_LABELS: Record<AdminTab, string> = {
   labs: "Lab",
   runs: "실행 환경",
   audit: "감사 로그",
+  seasons: "시즌 관리",
   members: "내 조직 구성원",
   orgAudit: "조직 감사 로그",
 };
@@ -83,6 +86,18 @@ const AUDIT_RESOURCE_LABELS: Record<string, string> = {
   challenge_result: "채점 결과",
   platform: "플랫폼",
 };
+
+/** Season boundaries are UTC day edges; show the calendar date the admin picked. */
+function formatSeasonBoundary(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("ko-KR", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    timeZone: "UTC",
+  }).format(date);
+}
 
 function formatDate(value?: string | null) {
   if (!value) return "—";
@@ -130,6 +145,7 @@ export function AdminConsole({
   organizationName,
   currentUserId,
   organizationRole,
+  organizationRankingOptIn,
   authMode,
 }: {
   roles: PlatformRole[];
@@ -137,6 +153,8 @@ export function AdminConsole({
   /** Used to grey out actions the server rejects with CANNOT_MODIFY_SELF. */
   currentUserId?: string | null;
   organizationRole?: string | null;
+  /** Current cross-organization ranking opt-in for the actor's tenant. */
+  organizationRankingOptIn?: boolean;
   authMode?: "dev" | "oidc";
 }) {
   const platformAdmin = roles.includes("platform_admin");
@@ -144,7 +162,7 @@ export function AdminConsole({
   const organizationOwner = organizationRole === "owner";
   const tabs = useMemo<AdminTab[]>(() => {
     const available: AdminTab[] = platformAdmin
-      ? ["overview", "users", "organizations", "labs", "runs", "audit"]
+      ? ["overview", "users", "organizations", "labs", "runs", "audit", "seasons"]
       : [];
     if (organizationAdmin) available.push("members", "orgAudit");
     return available;
@@ -170,6 +188,17 @@ export function AdminConsole({
   const [organizationSlugInput, setOrganizationSlugInput] = useState("");
   const [oneTimeCode, setOneTimeCode] = useState<{ organization: string; code: string } | null>(null);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "error">("idle");
+  const [seasons, setSeasons] = useState<RankingSeason[]>([]);
+  const [seasonName, setSeasonName] = useState("");
+  const [seasonSlug, setSeasonSlug] = useState("");
+  const [seasonStart, setSeasonStart] = useState("");
+  const [seasonEnd, setSeasonEnd] = useState("");
+  const [rankingOptIn, setRankingOptIn] = useState(organizationRankingOptIn ?? false);
+  // The prop arrives with the async /v1/me load, so seed the toggle again once
+  // it resolves; the initializer above only runs on the first render.
+  useEffect(() => {
+    setRankingOptIn(organizationRankingOptIn ?? false);
+  }, [organizationRankingOptIn]);
 
   useEffect(() => {
     if (!tabs.includes(activeTab)) setActiveTab(tabs[0] || "members");
@@ -182,6 +211,9 @@ export function AdminConsole({
     try {
       if (activeTab === "overview") {
         setOverview(await api.adminOverview());
+        setPageData(null);
+      } else if (activeTab === "seasons") {
+        setSeasons(await api.adminSeasons());
         setPageData(null);
       } else {
         const query = { page, pageSize: PAGE_SIZE, ...(search ? { search } : {}) };
@@ -320,6 +352,46 @@ export function AdminConsole({
     await runMutation(`run-${run.id}`, async () => {
       await api.terminateRun(run.id, reason);
       setMutationNotice(`${run.id} 실행 환경을 종료했습니다.`);
+    });
+  };
+
+  const createSeason = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (busyResource) return;
+    await runMutation("season-create", async () => {
+      await api.createSeason({
+        name: seasonName.trim(),
+        slug: seasonSlug.trim(),
+        // The inputs are calendar dates; a season spans from the first day's
+        // start to the last day's end, both anchored to UTC.
+        startsAt: new Date(`${seasonStart}T00:00:00.000Z`).toISOString(),
+        endsAt: new Date(`${seasonEnd}T23:59:59.000Z`).toISOString(),
+      });
+      setSeasonName("");
+      setSeasonSlug("");
+      setSeasonStart("");
+      setSeasonEnd("");
+      setMutationNotice(`${seasonName.trim()} 시즌을 생성했습니다.`);
+    });
+  };
+
+  const removeSeason = async (season: RankingSeason) => {
+    if (!window.confirm(`${season.name} 시즌을 삭제할까요? 랭킹 집계 기준이 사라집니다.`)) return;
+    await runMutation(`season-${season.id}`, async () => {
+      await api.deleteSeason(season.id);
+      setMutationNotice(`${season.name} 시즌을 삭제했습니다.`);
+    });
+  };
+
+  const toggleRankingOptIn = async (next: boolean) => {
+    await runMutation("ranking-opt-in", async () => {
+      await api.setOrganizationRankingOptIn(next);
+      setRankingOptIn(next);
+      setMutationNotice(
+        next
+          ? "조직이 종합 랭킹에 공개됩니다. 규모와 준비도가 다른 조직에 표시됩니다."
+          : "조직을 종합 랭킹에서 비공개로 전환했습니다.",
+      );
     });
   };
 
@@ -476,7 +548,44 @@ export function AdminConsole({
         </section>
       )}
 
-      {activeTab === "overview" ? (
+      {activeTab === "members" && organizationAdmin && (
+        <section className="panel admin-create-panel ranking-optin-panel" aria-labelledby="ranking-optin-title">
+          <div><span className="panel-kicker">RANKING VISIBILITY</span><h2 id="ranking-optin-title">조직 종합 랭킹 공개</h2><p>공개하면 조직의 규모·준비도·참여율이 다른 조직과 함께 시즌 랭킹에 표시됩니다. 개인 워크스페이스 기록은 공개되지 않습니다.</p></div>
+          <label className="ranking-optin-toggle">
+            <input type="checkbox" checked={rankingOptIn} disabled={busyResource === "ranking-opt-in"} onChange={(event) => void toggleRankingOptIn(event.target.checked)} />
+            <span>{rankingOptIn ? "종합 랭킹에 공개 중" : "비공개 (기본값)"}</span>
+          </label>
+        </section>
+      )}
+
+      {activeTab === "seasons" ? (
+        state === "loading" || state === "idle" ? <section className="panel"><ListLoading /></section> : state === "error" ? (
+          <section className="panel"><div className="admin-state admin-state--empty"><span aria-hidden="true">!</span><div><strong>시즌을 불러오지 못했습니다</strong><small>{error}</small><button className="secondary-button" type="button" onClick={() => void load()}>다시 시도</button></div></div></section>
+        ) : (
+          <>
+            <section className="panel admin-create-panel" aria-labelledby="season-create-title">
+              <div><span className="panel-kicker">SEASON PROVISIONING</span><h2 id="season-create-title">새 시즌 생성</h2><p>시즌이 진행 중이면 랭킹은 해당 기간으로 집계됩니다. 기간이 겹치는 시즌은 만들 수 없습니다.</p></div>
+              <form onSubmit={(event) => void createSeason(event)} className="season-form">
+                <label><span>시즌 이름</span><input value={seasonName} onChange={(event) => setSeasonName(event.target.value)} minLength={2} maxLength={80} placeholder="2026 SUMMER" required /></label>
+                <label><span>Slug</span><input value={seasonSlug} onChange={(event) => setSeasonSlug(event.target.value.toLowerCase())} pattern="[a-z0-9]+(?:-[a-z0-9]+)*" maxLength={63} placeholder="2026-summer" required /></label>
+                <label><span>시작일</span><input type="date" value={seasonStart} onChange={(event) => setSeasonStart(event.target.value)} required /></label>
+                <label><span>종료일</span><input type="date" value={seasonEnd} onChange={(event) => setSeasonEnd(event.target.value)} min={seasonStart || undefined} required /></label>
+                <button className="primary-button" type="submit" disabled={seasonName.trim().length < 2 || !seasonSlug.trim() || !seasonStart || !seasonEnd || busyResource === "season-create"}>{busyResource === "season-create" ? "생성 중" : "시즌 생성"}</button>
+              </form>
+            </section>
+            <section className="panel admin-data-panel">
+              {seasons.length === 0 ? <ListEmpty label="시즌" /> : (
+                <div className="table-scroll"><table className="data-table"><thead><tr><th>시즌</th><th>기간</th><th>상태</th><th><span className="sr-only">작업</span></th></tr></thead><tbody>{seasons.map((season) => {
+                  const now = Date.now();
+                  const active = Date.parse(season.startsAt) <= now && Date.parse(season.endsAt) > now;
+                  const upcoming = Date.parse(season.startsAt) > now;
+                  return <tr key={season.id}><td><strong>{season.name}</strong><small>{season.slug}</small></td><td>{formatSeasonBoundary(season.startsAt)} ~ {formatSeasonBoundary(season.endsAt)}</td><td><span className={active ? "status-pill status-pill--pass" : upcoming ? "status-pill status-pill--neutral" : "status-pill"}>{active ? "진행 중" : upcoming ? "예정" : "종료"}</span></td><td><button className="table-action table-action--danger" type="button" disabled={busyResource === `season-${season.id}`} onClick={() => void removeSeason(season)}>{busyResource === `season-${season.id}` ? "삭제 중" : "삭제"}</button></td></tr>;
+                })}</tbody></table></div>
+              )}
+            </section>
+          </>
+        )
+      ) : activeTab === "overview" ? (
         state === "loading" || state === "idle" ? <section className="panel"><ListLoading /></section> : state === "error" ? (
           <section className="panel"><div className="admin-state admin-state--empty"><span aria-hidden="true">!</span><div><strong>운영 개요를 불러오지 못했습니다</strong><small>{error}</small><button className="secondary-button" type="button" onClick={() => void load()}>다시 시도</button></div></div></section>
         ) : overview ? (

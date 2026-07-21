@@ -111,6 +111,7 @@ function userFromRow(row: Row | undefined): JsonValue | null {
         name: row.organization_name,
         slug: row.organization_slug,
         role: row.organization_role,
+        rankingOptIn: row.organization_ranking_opt_in === 1,
       }
     : null;
 
@@ -943,7 +944,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       .prepare(
         `SELECT u.*, m.role AS organization_role,
                 o.id AS organization_id, o.name AS organization_name,
-                o.slug AS organization_slug
+                o.slug AS organization_slug, o.ranking_opt_in AS organization_ranking_opt_in
            FROM users u
            LEFT JOIN organization_memberships m ON m.user_id = u.id
            LEFT JOIN organizations o ON o.id = m.organization_id
@@ -959,7 +960,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       .prepare(
         `SELECT u.*, m.role AS organization_role,
                 o.id AS organization_id, o.name AS organization_name,
-                o.slug AS organization_slug
+                o.slug AS organization_slug, o.ranking_opt_in AS organization_ranking_opt_in
            FROM users u
            LEFT JOIN organization_memberships m ON m.user_id = u.id
            LEFT JOIN organizations o ON o.id = m.organization_id
