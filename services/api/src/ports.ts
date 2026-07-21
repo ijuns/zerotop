@@ -8,7 +8,7 @@ import type {
   LabAccessMethod,
   LabGenerationInput,
   OrganizationCreateInput,
-  RegistrationInput,
+  ResolvedRegistrationInput,
   RuntimeRunInput,
   RuntimeRunStatusInput,
   ValidationEvidenceInput,
@@ -32,6 +32,8 @@ export interface AuditEvent {
   resourceType: string;
   resourceId: string;
   metadata?: JsonObject;
+  /** Source address of the request, or null for system-initiated events. */
+  actorIp?: string | null;
 }
 
 export interface ReportingDatasetFilter {
@@ -46,7 +48,7 @@ export interface PlatformRepository {
   close(): MaybePromise<void>;
   getUser(userId: string): MaybePromise<unknown | null>;
   getUserByExternalSubject(subject: string): MaybePromise<unknown | null>;
-  register(input: RegistrationInput): MaybePromise<unknown>;
+  register(input: ResolvedRegistrationInput): MaybePromise<unknown>;
   onboardIdentity(input: IdentityOnboardingInput): MaybePromise<unknown>;
   createLab(userId: string, input: LabGenerationInput): MaybePromise<unknown>;
   listLabs(userId: string): MaybePromise<unknown[]>;
@@ -100,12 +102,70 @@ export interface PlatformRepository {
     actorUserId: string,
     reason: string,
   ): MaybePromise<unknown | null>;
+  /**
+   * Lifts a quarantine back to 'draft', never straight to 'validated': the
+   * pre-quarantine status is not retained, so the lab must pass validation
+   * again before it can be deployed.
+   */
+  releaseLabQuarantine(
+    labId: string,
+    releasedAt: string,
+  ): MaybePromise<unknown | null>;
+  /** Returns `base`, or the first free `base2`, `base3`, ... variant. */
+  findAvailableHandle(base: string): MaybePromise<string>;
+  /** Records agreement for an account that predates the consent requirement. */
+  recordUserConsent(
+    userId: string,
+    agreedAt: string,
+    termsVersion: string,
+    privacyVersion: string,
+  ): MaybePromise<unknown | null>;
+  listAdminAuditLogs(query: AdminPageQuery): MaybePromise<AdminPageResult>;
+  /**
+   * Governance events for one organization. Deliberately excludes member
+   * activity (labs, runs, submissions): the signup page promises organization
+   * admins only see organization-scope results, not personal workspaces.
+   */
+  listOrganizationAuditLogs(
+    organizationId: string,
+    query: AdminPageQuery,
+  ): MaybePromise<AdminPageResult>;
+  getAdminUser(userId: string): MaybePromise<unknown | null>;
+  setUserPlatformRole(
+    userId: string,
+    platformRole: "user" | "platform_admin",
+  ): MaybePromise<unknown | null>;
+  setUserDisabled(
+    userId: string,
+    disabled: boolean,
+    actorUserId: string,
+    reason: string,
+    changedAt: string,
+  ): MaybePromise<unknown | null>;
+  getOrganizationMember(
+    organizationId: string,
+    userId: string,
+  ): MaybePromise<unknown | null>;
+  setOrganizationMemberRole(
+    organizationId: string,
+    userId: string,
+    role: "org_admin" | "member",
+  ): MaybePromise<unknown | null>;
+  removeOrganizationMember(
+    organizationId: string,
+    userId: string,
+  ): MaybePromise<boolean>;
   getAdminRun(runId: string): MaybePromise<unknown | null>;
   markRunStopped(
     runId: string,
     stoppedAt: string,
     actorUserId: string,
+    reason?: string,
   ): MaybePromise<unknown | null>;
+  /** Active runs whose TTL has passed, oldest first, for the expiry sweep. */
+  listExpiredRunIds(now: string, limit: number): MaybePromise<string[]>;
+  listActiveRunIdsForUser(userId: string): MaybePromise<string[]>;
+  markRunExpired(runId: string, expiredAt: string): MaybePromise<unknown | null>;
   getIdempotencyRecord(
     userId: string,
     operation: string,

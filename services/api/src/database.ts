@@ -1,11 +1,13 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { RepositoryError } from "./errors.ts";
-import { hashOrganizationJoinCode } from "./security.ts";
+import { hashOrganizationJoinCode, hashPassword } from "./security.ts";
 import {
+  developmentFixturePasswordHash,
+  DEVELOPMENT_FIXTURE_AFFILIATION,
   buildDevelopmentCapabilityFixtures,
   DEVELOPMENT_FIXTURE_CREATED_AT,
   DEVELOPMENT_FIXTURE_PASSWORD,
@@ -15,8 +17,11 @@ import {
 
 import {
   DEV_USER_ID,
+  PRIVACY_POLICY_VERSION,
+  TERMS_VERSION,
   type LabGenerationInput,
   type RegistrationInput,
+  type ResolvedRegistrationInput,
   type RuntimeRunInput,
   type RuntimeRunStatusInput,
   type ValidationEvidenceInput,
@@ -51,14 +56,9 @@ function parseJson<T>(value: unknown, fallback: T): T {
   }
 }
 
-function passwordDigest(password: string | undefined): string | null {
-  if (!password) return null;
-  return createHash("sha256").update(password, "utf8").digest("hex");
-}
-
 function ensureColumn(
   database: DatabaseSync,
-  table: "users" | "organizations" | "labs" | "challenge_results",
+  table: "users" | "organizations" | "labs" | "challenge_results" | "audit_logs",
   column: string,
   definition: string,
 ): void {
@@ -120,8 +120,79 @@ function userFromRow(row: Row | undefined): JsonValue | null {
     displayName: row.display_name,
     platformRole: row.platform_role ?? "user",
     globalRankingOptIn: row.global_ranking_opt_in === 1,
+    affiliation: (row.affiliation as string | null) ?? null,
+    consent: {
+      termsAgreedAt: (row.terms_agreed_at as string | null) ?? null,
+      termsVersion: (row.terms_version as string | null) ?? null,
+      privacyAgreedAt: (row.privacy_agreed_at as string | null) ?? null,
+      privacyVersion: (row.privacy_version as string | null) ?? null,
+    },
     createdAt: row.created_at,
+    disabledAt: (row.disabled_at as string | null) ?? null,
     organization,
+  };
+}
+
+const ADMIN_USER_COLUMNS = `u.id, u.email, u.handle, u.display_name, u.platform_role,
+                u.global_ranking_opt_in, u.disabled_at, u.disabled_reason,
+                u.created_at, m.role AS membership_role,
+                o.id AS organization_id, o.name AS organization_name,
+                o.slug AS organization_slug`;
+
+const ADMIN_USER_FROM = `FROM users u
+      LEFT JOIN organization_memberships m ON m.user_id = u.id
+      LEFT JOIN organizations o ON o.id = m.organization_id`;
+
+function auditLogFromRow(row: Row, metadata: Record<string, unknown>): JsonValue {
+  return {
+    id: row.id,
+    action: row.action,
+    resourceType: row.resource_type,
+    resourceId: row.resource_id,
+    actor: row.actor_user_id
+      ? {
+          id: row.actor_user_id,
+          handle: row.actor_handle,
+          displayName: row.actor_display_name,
+        }
+      : null,
+    metadata: metadata as JsonValue,
+    actorIp: (row.actor_ip as string | null) ?? null,
+    createdAt: row.created_at,
+  };
+}
+
+function organizationMemberFromRow(row: Row): JsonValue {
+  return {
+    id: row.id,
+    email: row.email,
+    handle: row.handle,
+    displayName: row.display_name,
+    platformRole: row.platform_role,
+    organizationRole: row.role,
+    joinedAt: row.joined_at,
+  };
+}
+
+function adminUserFromRow(row: Row): JsonValue {
+  return {
+    id: row.id,
+    email: row.email,
+    handle: row.handle,
+    displayName: row.display_name,
+    platformRole: row.platform_role ?? "user",
+    globalRankingOptIn: row.global_ranking_opt_in === 1,
+    disabledAt: (row.disabled_at as string | null) ?? null,
+    disabledReason: (row.disabled_reason as string | null) ?? null,
+    organization: row.organization_id
+      ? {
+          id: row.organization_id,
+          name: row.organization_name,
+          slug: row.organization_slug,
+          role: row.membership_role,
+        }
+      : null,
+    createdAt: row.created_at,
   };
 }
 
@@ -520,6 +591,15 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       "grading_config_json",
       "TEXT NOT NULL DEFAULT '{\"questions\":[]}'",
     );
+    ensureColumn(this.database, "audit_logs", "actor_ip", "TEXT");
+    ensureColumn(this.database, "users", "affiliation", "TEXT");
+    ensureColumn(this.database, "users", "terms_agreed_at", "TEXT");
+    ensureColumn(this.database, "users", "terms_version", "TEXT");
+    ensureColumn(this.database, "users", "privacy_agreed_at", "TEXT");
+    ensureColumn(this.database, "users", "privacy_version", "TEXT");
+    ensureColumn(this.database, "users", "disabled_at", "TEXT");
+    ensureColumn(this.database, "users", "disabled_by", "TEXT");
+    ensureColumn(this.database, "users", "disabled_reason", "TEXT");
     ensureColumn(this.database, "labs", "admin_quarantined_at", "TEXT");
     ensureColumn(this.database, "labs", "admin_quarantined_by", "TEXT");
     ensureColumn(this.database, "labs", "admin_quarantine_reason", "TEXT");
@@ -569,9 +649,10 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
 
     const userInsert = this.database.prepare(
       `INSERT OR IGNORE INTO users
-        (id, email, handle, display_name, password_hash, platform_role,
-         global_ranking_opt_in, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, email, handle, display_name, affiliation, password_hash,
+         platform_role, global_ranking_opt_in, terms_agreed_at, terms_version,
+         privacy_agreed_at, privacy_version, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     const membershipInsert = this.database.prepare(
       `INSERT OR IGNORE INTO organization_memberships
@@ -584,9 +665,14 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         user.email,
         user.handle,
         user.displayName,
-        passwordDigest(DEVELOPMENT_FIXTURE_PASSWORD),
+        DEVELOPMENT_FIXTURE_AFFILIATION,
+        developmentFixturePasswordHash(),
         user.platformRole,
         user.globalRankingOptIn ? 1 : 0,
+        DEVELOPMENT_FIXTURE_CREATED_AT,
+        TERMS_VERSION,
+        DEVELOPMENT_FIXTURE_CREATED_AT,
+        PRIVACY_POLICY_VERSION,
         DEVELOPMENT_FIXTURE_CREATED_AT,
       );
       if (user.organizationId && user.organizationRole) {
@@ -618,9 +704,41 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         developmentActor.email,
         developmentActor.handle,
         developmentActor.displayName,
-        passwordDigest(DEVELOPMENT_FIXTURE_PASSWORD),
+        developmentFixturePasswordHash(),
         DEV_USER_ID,
       );
+
+    // Backfill consent for sample accounts created before the requirement, so
+    // an upgraded local database is not locked out by the consent gate. These
+    // are synthetic fixtures, so nothing is asserted about a real person.
+    const backfillConsent = this.database.prepare(
+      `UPDATE users
+          SET affiliation = COALESCE(affiliation, ?),
+              terms_agreed_at = COALESCE(terms_agreed_at, ?),
+              terms_version = COALESCE(terms_version, ?),
+              privacy_agreed_at = COALESCE(privacy_agreed_at, ?),
+              privacy_version = COALESCE(privacy_version, ?)
+        WHERE id = ?`,
+    );
+    // Sample accounts share a known password, so their pre-scrypt digests can
+    // be re-derived here. Real accounts cannot: without the plaintext they keep
+    // their legacy hash until the password is next set.
+    const upgradeFixturePassword = this.database.prepare(
+      `UPDATE users SET password_hash = ?
+        WHERE id = ? AND password_hash IS NOT NULL
+          AND password_hash NOT LIKE 'scrypt$%'`,
+    );
+    for (const user of DEVELOPMENT_USERS) {
+      backfillConsent.run(
+        DEVELOPMENT_FIXTURE_AFFILIATION,
+        DEVELOPMENT_FIXTURE_CREATED_AT,
+        TERMS_VERSION,
+        DEVELOPMENT_FIXTURE_CREATED_AT,
+        PRIVACY_POLICY_VERSION,
+        user.id,
+      );
+      upgradeFixturePassword.run(developmentFixturePasswordHash(), user.id);
+    }
   }
 
   /** Adds refreshable score/report fixtures only when explicitly requested. */
@@ -825,7 +943,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
     return userFromRow(row);
   }
 
-  register(input: RegistrationInput): JsonValue {
+  register(input: ResolvedRegistrationInput): JsonValue {
     const duplicate = this.database
       .prepare("SELECT id FROM users WHERE email = ? OR handle = ?")
       .get(input.email, input.handle) as Row | undefined;
@@ -867,15 +985,22 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       this.database
         .prepare(
           `INSERT INTO users
-            (id, email, handle, display_name, password_hash, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+            (id, email, handle, display_name, affiliation, password_hash,
+             terms_agreed_at, terms_version, privacy_agreed_at, privacy_version,
+             created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
           input.email,
           input.handle,
           input.displayName,
-          passwordDigest(input.password),
+          input.affiliation,
+          hashPassword(input.password),
+          createdAt,
+          TERMS_VERSION,
+          createdAt,
+          PRIVACY_POLICY_VERSION,
           createdAt,
         );
 
@@ -944,17 +1069,23 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       this.database
         .prepare(
           `INSERT INTO users
-            (id, email, handle, display_name, password_hash, external_subject,
-             platform_role, created_at)
-           VALUES (?, ?, ?, ?, NULL, ?, ?, ?)`,
+            (id, email, handle, display_name, affiliation, password_hash,
+             external_subject, platform_role, terms_agreed_at, terms_version,
+             privacy_agreed_at, privacy_version, created_at)
+           VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           id,
           input.email,
           input.handle,
           input.displayName,
+          input.affiliation,
           input.externalSubject,
           input.platformRole,
+          createdAt,
+          TERMS_VERSION,
+          createdAt,
+          PRIVACY_POLICY_VERSION,
           createdAt,
         );
       if (organization) {
@@ -1551,9 +1682,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       parameters.push(query.organizationId);
     }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-    const from = `FROM users u
-      LEFT JOIN organization_memberships m ON m.user_id = u.id
-      LEFT JOIN organizations o ON o.id = m.organization_id`;
+    const from = ADMIN_USER_FROM;
     const total = Number(
       (this.database
         .prepare(`SELECT count(*) AS total ${from} ${where}`)
@@ -1561,34 +1690,12 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
     );
     const rows = this.database
       .prepare(
-        `SELECT u.id, u.email, u.handle, u.display_name, u.platform_role,
-                u.global_ranking_opt_in, u.created_at, m.role AS membership_role,
-                o.id AS organization_id, o.name AS organization_name,
-                o.slug AS organization_slug
+        `SELECT ${ADMIN_USER_COLUMNS}
            ${from} ${where}
           ORDER BY u.created_at DESC, u.id DESC LIMIT ? OFFSET ?`,
       )
       .all(...parameters, query.limit, query.offset) as Row[];
-    return {
-      total,
-      items: rows.map((row) => ({
-        id: row.id,
-        email: row.email,
-        handle: row.handle,
-        displayName: row.display_name,
-        platformRole: row.platform_role,
-        globalRankingOptIn: row.global_ranking_opt_in === 1,
-        organization: row.organization_id
-          ? {
-              id: row.organization_id,
-              name: row.organization_name,
-              slug: row.organization_slug,
-              role: row.membership_role,
-            }
-          : null,
-        createdAt: row.created_at,
-      })),
-    };
+    return { total, items: rows.map(adminUserFromRow) };
   }
 
   listAdminOrganizations(query: AdminPageQuery): AdminPageResult {
@@ -1756,18 +1863,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
           ORDER BY m.created_at ASC, u.id ASC LIMIT ? OFFSET ?`,
       )
       .all(...parameters, query.limit, query.offset) as Row[];
-    return {
-      total,
-      items: rows.map((row) => ({
-        id: row.id,
-        email: row.email,
-        handle: row.handle,
-        displayName: row.display_name,
-        platformRole: row.platform_role,
-        organizationRole: row.role,
-        joinedAt: row.joined_at,
-      })),
-    };
+    return { total, items: rows.map(organizationMemberFromRow) };
   }
 
   createOrganization(input: OrganizationCreateInput): JsonValue {
@@ -1900,6 +1996,236 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
     return adminLabFromRow(row);
   }
 
+  listOrganizationAuditLogs(
+    organizationId: string,
+    query: AdminPageQuery,
+  ): AdminPageResult {
+    const conditions = [
+      `a.resource_type IN ('organization', 'organization_membership')`,
+      `(a.resource_id = ?
+        OR json_extract(a.metadata_json, '$.organizationId') = ?)`,
+    ];
+    const parameters: (string | number)[] = [organizationId, organizationId];
+    if (query.search) {
+      conditions.push(
+        `(a.resource_id LIKE ? ESCAPE '\' COLLATE NOCASE
+          OR u.handle LIKE ? ESCAPE '\' COLLATE NOCASE
+          OR u.display_name LIKE ? ESCAPE '\' COLLATE NOCASE)`,
+      );
+      const term = escapedLike(query.search);
+      parameters.push(term, term, term);
+    }
+    if (query.auditAction) {
+      conditions.push("a.action = ?");
+      parameters.push(query.auditAction);
+    }
+    const where = `WHERE ${conditions.join(" AND ")}`;
+    const from = `FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id`;
+    const total = Number(
+      (this.database
+        .prepare(`SELECT count(*) AS total ${from} ${where}`)
+        .get(...parameters) as Row).total,
+    );
+    const rows = this.database
+      .prepare(
+        `SELECT a.id, a.action, a.resource_type, a.resource_id,
+                a.metadata_json, a.actor_ip, a.created_at, a.actor_user_id,
+                u.handle AS actor_handle, u.display_name AS actor_display_name
+           ${from} ${where}
+          ORDER BY a.created_at DESC, a.id DESC LIMIT ? OFFSET ?`,
+      )
+      .all(...parameters, query.limit, query.offset) as Row[];
+    return {
+      total,
+      items: rows.map((row) =>
+        auditLogFromRow(row, parseJson<Record<string, unknown>>(row.metadata_json, {})),
+      ),
+    };
+  }
+
+  recordUserConsent(
+    userId: string,
+    agreedAt: string,
+    termsVersion: string,
+    privacyVersion: string,
+  ): JsonValue | null {
+    const result = this.database
+      .prepare(
+        `UPDATE users
+            SET terms_agreed_at = ?, terms_version = ?,
+                privacy_agreed_at = ?, privacy_version = ?
+          WHERE id = ?`,
+      )
+      .run(agreedAt, termsVersion, agreedAt, privacyVersion, userId);
+    if (result.changes !== 1) return null;
+    return this.getUser(userId);
+  }
+
+  findAvailableHandle(base: string): string {
+    const taken = this.database.prepare(
+      "SELECT 1 FROM users WHERE handle = ? COLLATE NOCASE",
+    );
+    if (!taken.get(base)) return base;
+    for (let suffix = 2; suffix < 1000; suffix += 1) {
+      const candidate = `${base.slice(0, 24 - String(suffix).length)}${suffix}`;
+      if (!taken.get(candidate)) return candidate;
+    }
+    return `${base.slice(0, 14)}${randomUUID().slice(0, 8)}`;
+  }
+
+  listAdminAuditLogs(query: AdminPageQuery): AdminPageResult {
+    const conditions: string[] = [];
+    const parameters: (string | number)[] = [];
+    if (query.search) {
+      conditions.push(
+        `(a.resource_id LIKE ? ESCAPE '\\' COLLATE NOCASE
+          OR u.handle LIKE ? ESCAPE '\\' COLLATE NOCASE
+          OR u.display_name LIKE ? ESCAPE '\\' COLLATE NOCASE)`,
+      );
+      const term = escapedLike(query.search);
+      parameters.push(term, term, term);
+    }
+    if (query.auditAction) {
+      conditions.push("a.action = ?");
+      parameters.push(query.auditAction);
+    }
+    if (query.auditResourceType) {
+      conditions.push("a.resource_type = ?");
+      parameters.push(query.auditResourceType);
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const from = `FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id`;
+    const total = Number(
+      (this.database
+        .prepare(`SELECT count(*) AS total ${from} ${where}`)
+        .get(...parameters) as Row).total,
+    );
+    const rows = this.database
+      .prepare(
+        `SELECT a.id, a.action, a.resource_type, a.resource_id,
+                a.metadata_json, a.actor_ip, a.created_at, a.actor_user_id,
+                u.handle AS actor_handle, u.display_name AS actor_display_name
+           ${from} ${where}
+          ORDER BY a.created_at DESC, a.id DESC LIMIT ? OFFSET ?`,
+      )
+      .all(...parameters, query.limit, query.offset) as Row[];
+    return {
+      total,
+      items: rows.map((row) =>
+        auditLogFromRow(row, parseJson<Record<string, unknown>>(row.metadata_json, {})),
+      ),
+    };
+  }
+
+  releaseLabQuarantine(labId: string, releasedAt: string): JsonValue | null {
+    const result = this.database
+      .prepare(
+        `UPDATE labs
+            SET validation_status = 'draft', updated_at = ?,
+                admin_quarantined_at = NULL, admin_quarantined_by = NULL,
+                admin_quarantine_reason = NULL
+          WHERE id = ? AND validation_status = 'quarantined'`,
+      )
+      .run(releasedAt, labId);
+    if (result.changes !== 1) return null;
+    const row = this.database
+      .prepare(
+        `SELECT l.id, l.name, l.description, l.team_type,
+                l.question_types_json, l.environment, l.access_modes_json,
+                l.validation_status, l.owner_user_id, u.handle AS owner_handle,
+                l.organization_id, o.name AS organization_name,
+                l.admin_quarantined_at, l.admin_quarantined_by,
+                l.admin_quarantine_reason, l.created_at, l.updated_at
+           FROM labs l JOIN users u ON u.id = l.owner_user_id
+           LEFT JOIN organizations o ON o.id = l.organization_id
+          WHERE l.id = ?`,
+      )
+      .get(labId) as Row;
+    return adminLabFromRow(row);
+  }
+
+  getAdminUser(userId: string): JsonValue | null {
+    const row = this.database
+      .prepare(`SELECT ${ADMIN_USER_COLUMNS} ${ADMIN_USER_FROM} WHERE u.id = ?`)
+      .get(userId) as Row | undefined;
+    return row ? adminUserFromRow(row) : null;
+  }
+
+  setUserPlatformRole(
+    userId: string,
+    platformRole: "user" | "platform_admin",
+  ): JsonValue | null {
+    const result = this.database
+      .prepare("UPDATE users SET platform_role = ? WHERE id = ?")
+      .run(platformRole, userId);
+    if (result.changes !== 1) return null;
+    return this.getAdminUser(userId);
+  }
+
+  setUserDisabled(
+    userId: string,
+    disabled: boolean,
+    actorUserId: string,
+    reason: string,
+    changedAt: string,
+  ): JsonValue | null {
+    const result = this.database
+      .prepare(
+        `UPDATE users
+            SET disabled_at = ?, disabled_by = ?, disabled_reason = ?
+          WHERE id = ?`,
+      )
+      .run(
+        disabled ? changedAt : null,
+        disabled ? actorUserId : null,
+        disabled ? reason : null,
+        userId,
+      );
+    if (result.changes !== 1) return null;
+    return this.getAdminUser(userId);
+  }
+
+  getOrganizationMember(
+    organizationId: string,
+    userId: string,
+  ): JsonValue | null {
+    const row = this.database
+      .prepare(
+        `SELECT u.id, u.email, u.handle, u.display_name, u.platform_role,
+                m.role, m.created_at AS joined_at
+           FROM organization_memberships m
+           JOIN users u ON u.id = m.user_id
+          WHERE m.organization_id = ? AND m.user_id = ?`,
+      )
+      .get(organizationId, userId) as Row | undefined;
+    return row ? organizationMemberFromRow(row) : null;
+  }
+
+  setOrganizationMemberRole(
+    organizationId: string,
+    userId: string,
+    role: "org_admin" | "member",
+  ): JsonValue | null {
+    const result = this.database
+      .prepare(
+        `UPDATE organization_memberships SET role = ?
+          WHERE organization_id = ? AND user_id = ? AND role <> 'owner'`,
+      )
+      .run(role, organizationId, userId);
+    if (result.changes !== 1) return null;
+    return this.getOrganizationMember(organizationId, userId);
+  }
+
+  removeOrganizationMember(organizationId: string, userId: string): boolean {
+    const result = this.database
+      .prepare(
+        `DELETE FROM organization_memberships
+          WHERE organization_id = ? AND user_id = ? AND role <> 'owner'`,
+      )
+      .run(organizationId, userId);
+    return result.changes === 1;
+  }
+
   getAdminRun(runId: string): JsonValue | null {
     const row = this.database
       .prepare(
@@ -1912,17 +2238,58 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
     return adminRunFromRow(row);
   }
 
+  listExpiredRunIds(now: string, limit: number): string[] {
+    const rows = this.database
+      .prepare(
+        `SELECT id FROM runtime_runs
+          WHERE status IN ('provisioning', 'ready') AND expires_at <= ?
+          ORDER BY expires_at ASC LIMIT ?`,
+      )
+      .all(now, limit) as Row[];
+    return rows.map((row) => String(row.id));
+  }
+
+  listActiveRunIdsForUser(userId: string): string[] {
+    const rows = this.database
+      .prepare(
+        `SELECT id FROM runtime_runs
+          WHERE user_id = ? AND status IN ('provisioning', 'ready')
+          ORDER BY created_at ASC`,
+      )
+      .all(userId) as Row[];
+    return rows.map((row) => String(row.id));
+  }
+
+  markRunExpired(runId: string, expiredAt: string): JsonValue | null {
+    const row = this.database
+      .prepare("SELECT metadata_json FROM runtime_runs WHERE id = ?")
+      .get(runId) as Row | undefined;
+    if (!row) return null;
+    const metadata = parseJson<Record<string, unknown>>(row.metadata_json, {});
+    metadata.termination = { actorUserId: null, stoppedAt: expiredAt, reason: "ttl_expired" };
+    this.database
+      .prepare(
+        `UPDATE runtime_runs
+            SET status = 'expired', browser_url = NULL,
+                openvpn_profile_json = NULL, metadata_json = ?
+          WHERE id = ? AND status NOT IN ('stopped', 'expired')`,
+      )
+      .run(JSON.stringify(metadata), runId);
+    return this.getAdminRun(runId);
+  }
+
   markRunStopped(
     runId: string,
     stoppedAt: string,
     actorUserId: string,
+    reason = "platform_admin",
   ): JsonValue | null {
     const row = this.database
       .prepare("SELECT metadata_json FROM runtime_runs WHERE id = ?")
       .get(runId) as Row | undefined;
     if (!row) return null;
     const metadata = parseJson<Record<string, unknown>>(row.metadata_json, {});
-    metadata.termination = { actorUserId, stoppedAt, reason: "platform_admin" };
+    metadata.termination = { actorUserId, stoppedAt, reason };
     this.database
       .prepare(
         `UPDATE runtime_runs
@@ -1986,8 +2353,9 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
     this.database
       .prepare(
         `INSERT INTO audit_logs
-          (id, actor_user_id, action, resource_type, resource_id, metadata_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          (id, actor_user_id, action, resource_type, resource_id, metadata_json,
+           actor_ip, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         `audit_${randomUUID()}`,
@@ -1996,6 +2364,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         event.resourceType,
         event.resourceId,
         JSON.stringify(event.metadata ?? {}),
+        event.actorIp ?? null,
         nowIso(),
       );
   }

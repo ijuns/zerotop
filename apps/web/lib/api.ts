@@ -89,11 +89,14 @@ export interface UserContext {
 
 export interface RegistrationRequest {
   email: string;
-  handle: string;
+  /** Omitted by the signup form: the server derives it from the email. */
+  handle?: string;
   displayName: string;
+  affiliation: string;
   password?: string;
   accountType: AccountType;
   organizationJoinCode?: string;
+  consent: { terms: boolean; privacy: boolean };
 }
 
 export interface RegistrationResult {
@@ -363,6 +366,8 @@ export interface AdminPageQuery {
   team?: Team;
   status?: string;
   accessMethod?: AccessMethod;
+  action?: string;
+  resourceType?: string;
 }
 
 export interface AdminOverview {
@@ -383,6 +388,9 @@ export interface AdminUser {
   displayName: string;
   platformRole: "user" | "platform_admin" | string;
   globalRankingOptIn: boolean;
+  /** Non-null while the account is suspended and blocked from authenticating. */
+  disabledAt: string | null;
+  disabledReason: string | null;
   organization: {
     id: string;
     name: string;
@@ -424,6 +432,19 @@ export interface AdminRun {
   environment: string;
   accessMethod: AccessMethod;
   expiresAt: string;
+  createdAt: string;
+}
+
+export interface AdminAuditLog {
+  id: string;
+  action: string;
+  resourceType: string;
+  resourceId: string;
+  /** handle/displayName are null when the actor account no longer exists. */
+  actor: { id: string; handle: string | null; displayName: string | null } | null;
+  metadata: Record<string, unknown>;
+  /** Null for system-initiated events, or when no source address was recorded. */
+  actorIp: string | null;
   createdAt: string;
 }
 
@@ -906,6 +927,8 @@ function adminUserOf(value: unknown): AdminUser | null {
     displayName: stringValue(item.displayName ?? item.display_name, item.handle),
     platformRole: stringValue(item.platformRole ?? item.platform_role, "user"),
     globalRankingOptIn: item.globalRankingOptIn === true || item.global_ranking_opt_in === true,
+    disabledAt: nullableString(item.disabledAt ?? item.disabled_at),
+    disabledReason: nullableString(item.disabledReason ?? item.disabled_reason),
     organization:
       rawOrganization && typeof rawOrganization.id === "string"
         ? {
@@ -986,6 +1009,30 @@ function organizationMemberOf(value: unknown): OrganizationMember | null {
   };
 }
 
+function adminAuditLogOf(value: unknown): AdminAuditLog | null {
+  const item = isRecord(value) ? value : {};
+  if (typeof item.id !== "string") return null;
+  const actor = isRecord(item.actor) ? item.actor : null;
+  const metadata = isRecord(item.metadata) ? item.metadata : {};
+  return {
+    id: item.id,
+    action: stringValue(item.action, "unknown"),
+    resourceType: stringValue(item.resourceType ?? item.resource_type),
+    resourceId: stringValue(item.resourceId ?? item.resource_id),
+    actor:
+      actor && typeof actor.id === "string"
+        ? {
+            id: actor.id,
+            handle: nullableString(actor.handle),
+            displayName: nullableString(actor.displayName ?? actor.display_name),
+          }
+        : null,
+    metadata,
+    actorIp: nullableString(item.actorIp ?? item.actor_ip),
+    createdAt: stringValue(item.createdAt ?? item.created_at),
+  };
+}
+
 function adminQueryString(input: AdminPageQuery = {}) {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(input)) {
@@ -1019,8 +1066,9 @@ export const api = {
     const body =
       authMode === "oidc"
         ? {
-            handle: input.handle,
             displayName: input.displayName,
+            affiliation: input.affiliation,
+            consent: input.consent,
             accountType: input.accountType,
             ...(input.organizationJoinCode
               ? { organizationJoinCode: input.organizationJoinCode }
@@ -1043,7 +1091,26 @@ export const api = {
     } satisfies RegistrationResult;
   },
 
-  me: async () => entityOf<UserContext>(await request("/v1/me"), "user"),
+  me: async (): Promise<{ user: UserContext; consentRequired: boolean }> => {
+    const payload = dataOf(await request("/v1/me"));
+    const body = isRecord(payload) ? payload : {};
+    return {
+      user: (body.user ?? body) as UserContext,
+      consentRequired: body.consentRequired === true,
+    };
+  },
+
+  /** Records agreement for an account created before the consent requirement. */
+  recordConsent: async () => {
+    const payload = dataOf(
+      await request("/v1/me/consent", {
+        method: "POST",
+        body: JSON.stringify({ consent: { terms: true, privacy: true } }),
+      }),
+    );
+    const body = isRecord(payload) ? payload : {};
+    return (body.user ?? body) as UserContext;
+  },
 
   listLabs: async () => {
     const payload = dataOf(await request<unknown>("/v1/labs"));
@@ -1233,6 +1300,18 @@ export const api = {
       adminRunOf,
     ),
 
+  adminAuditLogs: async (query: AdminPageQuery = {}) =>
+    adminPageOf(
+      await request(`/v1/admin/audit-logs${adminQueryString(query)}`),
+      adminAuditLogOf,
+    ),
+
+  organizationAuditLogs: async (query: AdminPageQuery = {}) =>
+    adminPageOf(
+      await request(`/v1/admin/organization/audit-logs${adminQueryString(query)}`),
+      adminAuditLogOf,
+    ),
+
   organizationMembers: async (query: AdminPageQuery = {}) =>
     adminPageOf(
       await request(`/v1/admin/organization/members${adminQueryString(query)}`),
@@ -1260,6 +1339,16 @@ export const api = {
       ),
     ),
 
+  releaseLab: async (labId: string, reason?: string) =>
+    entityOf<AdminLab>(
+      await request(`/v1/admin/labs/${encodeURIComponent(labId)}/release`, {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey("admin-lab-release") },
+        body: JSON.stringify(reason?.trim() ? { reason: reason.trim() } : {}),
+      }),
+      "lab",
+    ),
+
   quarantineLab: async (labId: string, reason?: string) =>
     entityOf<AdminLab>(
       await request(`/v1/admin/labs/${encodeURIComponent(labId)}/quarantine`, {
@@ -1278,6 +1367,72 @@ export const api = {
         body: JSON.stringify(reason?.trim() ? { reason: reason.trim() } : {}),
       }),
       "run",
+    ),
+
+  setUserPlatformRole: async (
+    userId: string,
+    platformRole: "user" | "platform_admin",
+    reason?: string,
+  ) =>
+    entityOf<AdminUser>(
+      await request(
+        `/v1/admin/users/${encodeURIComponent(userId)}/platform-role`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": idempotencyKey("admin-user-role") },
+          body: JSON.stringify({
+            platformRole,
+            ...(reason?.trim() ? { reason: reason.trim() } : {}),
+          }),
+        },
+      ),
+      "user",
+    ),
+
+  setUserSuspension: async (userId: string, suspended: boolean, reason?: string) =>
+    entityOf<AdminUser>(
+      await request(`/v1/admin/users/${encodeURIComponent(userId)}/suspension`, {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey("admin-user-suspension") },
+        body: JSON.stringify({
+          suspended,
+          ...(reason?.trim() ? { reason: reason.trim() } : {}),
+        }),
+      }),
+      "user",
+    ),
+
+  setOrganizationMemberRole: async (
+    userId: string,
+    role: "org_admin" | "member",
+    reason?: string,
+  ) =>
+    entityOf<OrganizationMember>(
+      await request(
+        `/v1/admin/organization/members/${encodeURIComponent(userId)}/role`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": idempotencyKey("admin-member-role") },
+          body: JSON.stringify({
+            role,
+            ...(reason?.trim() ? { reason: reason.trim() } : {}),
+          }),
+        },
+      ),
+      "member",
+    ),
+
+  removeOrganizationMember: async (userId: string, reason?: string) =>
+    entityOf<boolean>(
+      await request(
+        `/v1/admin/organization/members/${encodeURIComponent(userId)}/remove`,
+        {
+          method: "POST",
+          headers: { "Idempotency-Key": idempotencyKey("admin-member-remove") },
+          body: JSON.stringify(reason?.trim() ? { reason: reason.trim() } : {}),
+        },
+      ),
+      "removed",
     ),
 };
 

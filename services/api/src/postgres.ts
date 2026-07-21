@@ -1,9 +1,11 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 
 import { RepositoryError } from "./errors.ts";
-import { hashOrganizationJoinCode } from "./security.ts";
+import { hashOrganizationJoinCode, hashPassword } from "./security.ts";
 import {
+  developmentFixturePasswordHash,
+  DEVELOPMENT_FIXTURE_AFFILIATION,
   DEVELOPMENT_FIXTURE_CREATED_AT,
   DEVELOPMENT_FIXTURE_PASSWORD,
   DEVELOPMENT_ORGANIZATIONS,
@@ -17,6 +19,8 @@ import type {
 } from "./ports.ts";
 import {
   DEV_USER_ID,
+  PRIVACY_POLICY_VERSION,
+  TERMS_VERSION,
   type ChallengeResultInput,
   type IdentityOnboardingInput,
   type AccessTicketInput,
@@ -25,6 +29,7 @@ import {
   type LabGenerationInput,
   type OrganizationCreateInput,
   type RegistrationInput,
+  type ResolvedRegistrationInput,
   type RuntimeRunInput,
   type RuntimeRunStatusInput,
   type ValidationEvidenceInput,
@@ -79,6 +84,26 @@ const MIGRATIONS = [
     name: "admin_organizations",
     url: new URL("../migrations/009_admin_organizations.sql", import.meta.url),
   },
+  {
+    version: 10,
+    name: "admin_user_management",
+    url: new URL("../migrations/010_admin_user_management.sql", import.meta.url),
+  },
+  {
+    version: 11,
+    name: "audit_log_listing",
+    url: new URL("../migrations/011_audit_log_listing.sql", import.meta.url),
+  },
+  {
+    version: 12,
+    name: "registration_consent",
+    url: new URL("../migrations/012_registration_consent.sql", import.meta.url),
+  },
+  {
+    version: 13,
+    name: "audit_source_address",
+    url: new URL("../migrations/013_audit_source_address.sql", import.meta.url),
+  },
 ] as const;
 
 function nowIso(): string {
@@ -99,11 +124,6 @@ function jsonValue<T>(value: unknown, fallback: T): T {
   }
 }
 
-function passwordDigest(password: string | undefined): string | null {
-  if (!password) return null;
-  return createHash("sha256").update(password, "utf8").digest("hex");
-}
-
 function userFromRow(row: Row | undefined): unknown | null {
   if (!row) return null;
   return {
@@ -113,7 +133,17 @@ function userFromRow(row: Row | undefined): unknown | null {
     displayName: row.display_name,
     platformRole: row.platform_role ?? "user",
     globalRankingOptIn: row.global_ranking_opt_in === true,
+    affiliation: (row.affiliation as string | null) ?? null,
+    consent: {
+      termsAgreedAt: row.terms_agreed_at ? timestamp(row.terms_agreed_at) : null,
+      termsVersion: (row.terms_version as string | null) ?? null,
+      privacyAgreedAt: row.privacy_agreed_at
+        ? timestamp(row.privacy_agreed_at)
+        : null,
+      privacyVersion: (row.privacy_version as string | null) ?? null,
+    },
     createdAt: timestamp(row.created_at),
+    disabledAt: row.disabled_at ? timestamp(row.disabled_at) : null,
     organization: row.organization_id
       ? {
           id: row.organization_id,
@@ -122,6 +152,69 @@ function userFromRow(row: Row | undefined): unknown | null {
           role: row.organization_role,
         }
       : null,
+  };
+}
+
+const ADMIN_USER_COLUMNS = `u.id, u.email, u.handle, u.display_name, u.platform_role,
+              u.global_ranking_opt_in, u.disabled_at, u.disabled_reason,
+              u.created_at, m.role AS membership_role,
+              o.id AS organization_id, o.name AS organization_name,
+              o.slug AS organization_slug`;
+
+const ADMIN_USER_FROM = `FROM users u
+      LEFT JOIN organization_memberships m ON m.user_id = u.id
+      LEFT JOIN organizations o ON o.id = m.organization_id`;
+
+function adminUserFromRow(row: Row): unknown {
+  return {
+    id: row.id,
+    email: row.email,
+    handle: row.handle,
+    displayName: row.display_name,
+    platformRole: row.platform_role,
+    globalRankingOptIn: row.global_ranking_opt_in === true,
+    disabledAt: row.disabled_at ? timestamp(row.disabled_at) : null,
+    disabledReason: (row.disabled_reason as string | null) ?? null,
+    organization: row.organization_id
+      ? {
+          id: row.organization_id,
+          name: row.organization_name,
+          slug: row.organization_slug,
+          role: row.membership_role,
+        }
+      : null,
+    createdAt: timestamp(row.created_at),
+  };
+}
+
+function auditLogFromRow(row: Row): unknown {
+  return {
+    id: row.id,
+    action: row.action,
+    resourceType: row.resource_type,
+    resourceId: row.resource_id,
+    actor: row.actor_user_id
+      ? {
+          id: row.actor_user_id,
+          handle: row.actor_handle,
+          displayName: row.actor_display_name,
+        }
+      : null,
+    metadata: jsonValue<Record<string, unknown>>(row.metadata_json, {}),
+    actorIp: (row.actor_ip as string | null) ?? null,
+    createdAt: timestamp(row.created_at),
+  };
+}
+
+function organizationMemberFromRow(row: Row): unknown {
+  return {
+    id: row.id,
+    email: row.email,
+    handle: row.handle,
+    displayName: row.display_name,
+    platformRole: row.platform_role,
+    organizationRole: row.role,
+    joinedAt: timestamp(row.joined_at),
   };
 }
 
@@ -374,19 +467,23 @@ export class PostgresRepository implements PlatformRepository {
           for (const user of DEVELOPMENT_USERS) {
             await client.query(
               `INSERT INTO users
-                (id, email, handle, display_name, password_hash, platform_role,
-                 global_ranking_opt_in, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                (id, email, handle, display_name, affiliation, password_hash,
+                 platform_role, global_ranking_opt_in, terms_agreed_at,
+                 terms_version, privacy_agreed_at, privacy_version, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $9, $11, $9)
                ON CONFLICT (id) DO NOTHING`,
               [
                 user.id,
                 user.email,
                 user.handle,
                 user.displayName,
-                passwordDigest(DEVELOPMENT_FIXTURE_PASSWORD),
+                DEVELOPMENT_FIXTURE_AFFILIATION,
+                developmentFixturePasswordHash(),
                 user.platformRole,
                 user.globalRankingOptIn,
                 DEVELOPMENT_FIXTURE_CREATED_AT,
+                TERMS_VERSION,
+                PRIVACY_POLICY_VERSION,
               ],
             );
             if (user.organizationId && user.organizationRole) {
@@ -421,7 +518,7 @@ export class PostgresRepository implements PlatformRepository {
               developmentActor.email,
               developmentActor.handle,
               developmentActor.displayName,
-              passwordDigest(DEVELOPMENT_FIXTURE_PASSWORD),
+              developmentFixturePasswordHash(),
               DEV_USER_ID,
             ],
           );
@@ -464,7 +561,7 @@ export class PostgresRepository implements PlatformRepository {
     return userFromRow(result.rows[0]);
   }
 
-  async register(input: RegistrationInput): Promise<unknown> {
+  async register(input: ResolvedRegistrationInput): Promise<unknown> {
     const client = await this.pool.connect();
     const id = `user_${randomUUID()}`;
     const createdAt = nowIso();
@@ -504,15 +601,20 @@ export class PostgresRepository implements PlatformRepository {
 
       await client.query(
         `INSERT INTO users
-          (id, email, handle, display_name, password_hash, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
+          (id, email, handle, display_name, affiliation, password_hash,
+           terms_agreed_at, terms_version, privacy_agreed_at, privacy_version,
+           created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $7, $9, $7)`,
         [
           id,
           input.email,
           input.handle,
           input.displayName,
-          passwordDigest(input.password),
+          input.affiliation,
+          hashPassword(input.password),
           createdAt,
+          TERMS_VERSION,
+          PRIVACY_POLICY_VERSION,
         ],
       );
       if (organizationId) {
@@ -589,17 +691,21 @@ export class PostgresRepository implements PlatformRepository {
 
       await client.query(
         `INSERT INTO users
-          (id, email, handle, display_name, password_hash, external_subject,
-           platform_role, created_at)
-         VALUES ($1, $2, $3, $4, NULL, $5, $6, $7)`,
+          (id, email, handle, display_name, affiliation, password_hash,
+           external_subject, platform_role, terms_agreed_at, terms_version,
+           privacy_agreed_at, privacy_version, created_at)
+         VALUES ($1, $2, $3, $4, $5, NULL, $6, $7, $8, $9, $8, $10, $8)`,
         [
           id,
           input.email,
           input.handle,
           input.displayName,
+          input.affiliation,
           input.externalSubject,
           input.platformRole,
           createdAt,
+          TERMS_VERSION,
+          PRIVACY_POLICY_VERSION,
         ],
       );
       if (organizationId) {
@@ -1165,9 +1271,7 @@ export class PostgresRepository implements PlatformRepository {
       conditions.push(`m.organization_id = ${bind(parameters, query.organizationId)}`);
     }
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-    const from = `FROM users u
-      LEFT JOIN organization_memberships m ON m.user_id = u.id
-      LEFT JOIN organizations o ON o.id = m.organization_id`;
+    const from = ADMIN_USER_FROM;
     const totalResult = await this.pool.query(
       `SELECT count(*) AS total ${from} ${where}`,
       parameters,
@@ -1175,10 +1279,7 @@ export class PostgresRepository implements PlatformRepository {
     const limit = bind(parameters, query.limit);
     const offset = bind(parameters, query.offset);
     const result = await this.pool.query(
-      `SELECT u.id, u.email, u.handle, u.display_name, u.platform_role,
-              u.global_ranking_opt_in, u.created_at,
-              m.role AS membership_role, o.id AS organization_id,
-              o.name AS organization_name, o.slug AS organization_slug
+      `SELECT ${ADMIN_USER_COLUMNS}
          ${from} ${where}
         ORDER BY u.created_at DESC, u.id DESC
         LIMIT ${limit} OFFSET ${offset}`,
@@ -1186,23 +1287,7 @@ export class PostgresRepository implements PlatformRepository {
     );
     return {
       total: Number(totalResult.rows[0].total),
-      items: result.rows.map((row: Row) => ({
-        id: row.id,
-        email: row.email,
-        handle: row.handle,
-        displayName: row.display_name,
-        platformRole: row.platform_role,
-        globalRankingOptIn: row.global_ranking_opt_in === true,
-        organization: row.organization_id
-          ? {
-              id: row.organization_id,
-              name: row.organization_name,
-              slug: row.organization_slug,
-              role: row.membership_role,
-            }
-          : null,
-        createdAt: timestamp(row.created_at),
-      })),
+      items: result.rows.map(adminUserFromRow),
     };
   }
 
@@ -1367,15 +1452,7 @@ export class PostgresRepository implements PlatformRepository {
     );
     return {
       total: Number(totalResult.rows[0].total),
-      items: result.rows.map((row: Row) => ({
-        id: row.id,
-        email: row.email,
-        handle: row.handle,
-        displayName: row.display_name,
-        platformRole: row.platform_role,
-        organizationRole: row.role,
-        joinedAt: timestamp(row.joined_at),
-      })),
+      items: result.rows.map(organizationMemberFromRow),
     };
   }
 
@@ -1435,6 +1512,241 @@ export class PostgresRepository implements PlatformRepository {
     return adminOrganizationFromRow(result.rows[0]);
   }
 
+  async listOrganizationAuditLogs(
+    organizationId: string,
+    query: AdminPageQuery,
+  ): Promise<AdminPageResult> {
+    const parameters: unknown[] = [];
+    const org = bind(parameters, organizationId);
+    const conditions = [
+      `a.resource_type IN ('organization', 'organization_membership')`,
+      `(a.resource_id = ${org} OR a.metadata_json->>'organizationId' = ${org})`,
+    ];
+    if (query.search) {
+      const term = bind(parameters, escapedLike(query.search));
+      conditions.push(
+        `(a.resource_id ILIKE ${term} ESCAPE '\'
+          OR u.handle ILIKE ${term} ESCAPE '\'
+          OR u.display_name ILIKE ${term} ESCAPE '\')`,
+      );
+    }
+    if (query.auditAction) {
+      conditions.push(`a.action = ${bind(parameters, query.auditAction)}`);
+    }
+    const where = `WHERE ${conditions.join(" AND ")}`;
+    const from = "FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id";
+    const totalResult = await this.pool.query(
+      `SELECT count(*) AS total ${from} ${where}`,
+      parameters,
+    );
+    const limit = bind(parameters, query.limit);
+    const offset = bind(parameters, query.offset);
+    const result = await this.pool.query(
+      `SELECT a.id, a.action, a.resource_type, a.resource_id,
+              a.metadata_json, a.actor_ip, a.created_at, a.actor_user_id,
+              u.handle AS actor_handle, u.display_name AS actor_display_name
+         ${from} ${where}
+        ORDER BY a.created_at DESC, a.id DESC
+        LIMIT ${limit} OFFSET ${offset}`,
+      parameters,
+    );
+    return {
+      total: Number(totalResult.rows[0].total),
+      items: result.rows.map(auditLogFromRow),
+    };
+  }
+
+  async recordUserConsent(
+    userId: string,
+    agreedAt: string,
+    termsVersion: string,
+    privacyVersion: string,
+  ): Promise<unknown | null> {
+    const result = await this.pool.query(
+      `UPDATE users
+          SET terms_agreed_at = $1, terms_version = $2,
+              privacy_agreed_at = $1, privacy_version = $3
+        WHERE id = $4 RETURNING id`,
+      [agreedAt, termsVersion, privacyVersion, userId],
+    );
+    if (result.rowCount !== 1) return null;
+    return this.getUser(userId);
+  }
+
+  async findAvailableHandle(base: string): Promise<string> {
+    const taken = async (candidate: string) =>
+      (
+        await this.pool.query(
+          "SELECT 1 FROM users WHERE lower(handle) = lower($1)",
+          [candidate],
+        )
+      ).rowCount > 0;
+    if (!(await taken(base))) return base;
+    for (let suffix = 2; suffix < 1000; suffix += 1) {
+      const candidate = `${base.slice(0, 24 - String(suffix).length)}${suffix}`;
+      if (!(await taken(candidate))) return candidate;
+    }
+    return `${base.slice(0, 14)}${randomUUID().slice(0, 8)}`;
+  }
+
+  async listAdminAuditLogs(query: AdminPageQuery): Promise<AdminPageResult> {
+    const parameters: unknown[] = [];
+    const conditions: string[] = [];
+    if (query.search) {
+      const term = bind(parameters, escapedLike(query.search));
+      conditions.push(
+        `(a.resource_id ILIKE ${term} ESCAPE '\\'
+          OR u.handle ILIKE ${term} ESCAPE '\\'
+          OR u.display_name ILIKE ${term} ESCAPE '\\')`,
+      );
+    }
+    if (query.auditAction) {
+      conditions.push(`a.action = ${bind(parameters, query.auditAction)}`);
+    }
+    if (query.auditResourceType) {
+      conditions.push(
+        `a.resource_type = ${bind(parameters, query.auditResourceType)}`,
+      );
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    const from = "FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id";
+    const totalResult = await this.pool.query(
+      `SELECT count(*) AS total ${from} ${where}`,
+      parameters,
+    );
+    const limit = bind(parameters, query.limit);
+    const offset = bind(parameters, query.offset);
+    const result = await this.pool.query(
+      `SELECT a.id, a.action, a.resource_type, a.resource_id,
+              a.metadata_json, a.actor_ip, a.created_at, a.actor_user_id,
+              u.handle AS actor_handle, u.display_name AS actor_display_name
+         ${from} ${where}
+        ORDER BY a.created_at DESC, a.id DESC
+        LIMIT ${limit} OFFSET ${offset}`,
+      parameters,
+    );
+    return {
+      total: Number(totalResult.rows[0].total),
+      items: result.rows.map(auditLogFromRow),
+    };
+  }
+
+  async releaseLabQuarantine(
+    labId: string,
+    releasedAt: string,
+  ): Promise<unknown | null> {
+    const result = await this.pool.query(
+      `UPDATE labs
+          SET validation_status = 'draft', updated_at = $1,
+              admin_quarantined_at = NULL, admin_quarantined_by = NULL,
+              admin_quarantine_reason = NULL
+        WHERE id = $2 AND validation_status = 'quarantined'
+        RETURNING id`,
+      [releasedAt, labId],
+    );
+    if (result.rowCount !== 1) return null;
+    const selected = await this.pool.query(
+      `SELECT l.id, l.name, l.description, l.team_type,
+              l.question_types_json, l.environment, l.access_modes_json,
+              l.validation_status, l.owner_user_id, u.handle AS owner_handle,
+              l.organization_id, o.name AS organization_name,
+              l.admin_quarantined_at, l.admin_quarantined_by,
+              l.admin_quarantine_reason, l.created_at, l.updated_at
+         FROM labs l
+         JOIN users u ON u.id = l.owner_user_id
+         LEFT JOIN organizations o ON o.id = l.organization_id
+        WHERE l.id = $1`,
+      [labId],
+    );
+    return adminLabFromRow(selected.rows[0]);
+  }
+
+  async getAdminUser(userId: string): Promise<unknown | null> {
+    const result = await this.pool.query(
+      `SELECT ${ADMIN_USER_COLUMNS} ${ADMIN_USER_FROM} WHERE u.id = $1`,
+      [userId],
+    );
+    if (result.rowCount === 0) return null;
+    return adminUserFromRow(result.rows[0]);
+  }
+
+  async setUserPlatformRole(
+    userId: string,
+    platformRole: "user" | "platform_admin",
+  ): Promise<unknown | null> {
+    const result = await this.pool.query(
+      "UPDATE users SET platform_role = $1 WHERE id = $2 RETURNING id",
+      [platformRole, userId],
+    );
+    if (result.rowCount !== 1) return null;
+    return this.getAdminUser(userId);
+  }
+
+  async setUserDisabled(
+    userId: string,
+    disabled: boolean,
+    actorUserId: string,
+    reason: string,
+    changedAt: string,
+  ): Promise<unknown | null> {
+    const result = await this.pool.query(
+      `UPDATE users
+          SET disabled_at = $1, disabled_by = $2, disabled_reason = $3
+        WHERE id = $4 RETURNING id`,
+      [
+        disabled ? changedAt : null,
+        disabled ? actorUserId : null,
+        disabled ? reason : null,
+        userId,
+      ],
+    );
+    if (result.rowCount !== 1) return null;
+    return this.getAdminUser(userId);
+  }
+
+  async getOrganizationMember(
+    organizationId: string,
+    userId: string,
+  ): Promise<unknown | null> {
+    const result = await this.pool.query(
+      `SELECT u.id, u.email, u.handle, u.display_name, u.platform_role,
+              m.role, m.created_at AS joined_at
+         FROM organization_memberships m
+         JOIN users u ON u.id = m.user_id
+        WHERE m.organization_id = $1 AND m.user_id = $2`,
+      [organizationId, userId],
+    );
+    if (result.rowCount === 0) return null;
+    return organizationMemberFromRow(result.rows[0]);
+  }
+
+  async setOrganizationMemberRole(
+    organizationId: string,
+    userId: string,
+    role: "org_admin" | "member",
+  ): Promise<unknown | null> {
+    const result = await this.pool.query(
+      `UPDATE organization_memberships SET role = $1
+        WHERE organization_id = $2 AND user_id = $3 AND role <> 'owner'
+        RETURNING user_id`,
+      [role, organizationId, userId],
+    );
+    if (result.rowCount !== 1) return null;
+    return this.getOrganizationMember(organizationId, userId);
+  }
+
+  async removeOrganizationMember(
+    organizationId: string,
+    userId: string,
+  ): Promise<boolean> {
+    const result = await this.pool.query(
+      `DELETE FROM organization_memberships
+        WHERE organization_id = $1 AND user_id = $2 AND role <> 'owner'`,
+      [organizationId, userId],
+    );
+    return result.rowCount === 1;
+  }
+
   async quarantineLab(
     labId: string,
     quarantinedAt: string,
@@ -1482,10 +1794,50 @@ export class PostgresRepository implements PlatformRepository {
     return adminRunFromRow(result.rows[0]);
   }
 
+  async listExpiredRunIds(now: string, limit: number): Promise<string[]> {
+    const result = await this.pool.query(
+      `SELECT id FROM runtime_runs
+        WHERE status IN ('provisioning', 'ready') AND expires_at <= $1
+        ORDER BY expires_at ASC LIMIT $2`,
+      [now, limit],
+    );
+    return result.rows.map((row: Row) => String(row.id));
+  }
+
+  async listActiveRunIdsForUser(userId: string): Promise<string[]> {
+    const result = await this.pool.query(
+      `SELECT id FROM runtime_runs
+        WHERE user_id = $1 AND status IN ('provisioning', 'ready')
+        ORDER BY created_at ASC`,
+      [userId],
+    );
+    return result.rows.map((row: Row) => String(row.id));
+  }
+
+  async markRunExpired(runId: string, expiredAt: string): Promise<unknown | null> {
+    await this.pool.query(
+      `UPDATE runtime_runs
+          SET status = 'expired', browser_url = NULL,
+              openvpn_profile_json = NULL,
+              metadata_json = metadata_json || jsonb_build_object(
+                'termination',
+                jsonb_build_object(
+                  'actorUserId', NULL,
+                  'stoppedAt', $1::text,
+                  'reason', 'ttl_expired'
+                )
+              )
+        WHERE id = $2 AND status NOT IN ('stopped', 'expired')`,
+      [expiredAt, runId],
+    );
+    return this.getAdminRun(runId);
+  }
+
   async markRunStopped(
     runId: string,
     stoppedAt: string,
     actorUserId: string,
+    reason = "platform_admin",
   ): Promise<unknown | null> {
     const result = await this.pool.query(
       `UPDATE runtime_runs
@@ -1496,12 +1848,12 @@ export class PostgresRepository implements PlatformRepository {
                 jsonb_build_object(
                   'actorUserId', $1::text,
                   'stoppedAt', $2::text,
-                  'reason', 'platform_admin'
+                  'reason', $4::text
                 )
               )
         WHERE id = $3 AND status NOT IN ('stopped', 'expired')
         RETURNING id`,
-      [actorUserId, stoppedAt, runId],
+      [actorUserId, stoppedAt, runId, reason],
     );
     if (result.rowCount === 0) {
       const existing = await this.getAdminRun(runId);
@@ -1559,8 +1911,9 @@ export class PostgresRepository implements PlatformRepository {
   async recordAudit(event: AuditEvent): Promise<void> {
     await this.pool.query(
       `INSERT INTO audit_logs
-        (id, actor_user_id, action, resource_type, resource_id, metadata_json, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)`,
+        (id, actor_user_id, action, resource_type, resource_id, metadata_json,
+         actor_ip, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)`,
       [
         `audit_${randomUUID()}`,
         event.actorUserId,
@@ -1568,6 +1921,7 @@ export class PostgresRepository implements PlatformRepository {
         event.resourceType,
         event.resourceId,
         JSON.stringify(event.metadata ?? {}),
+        event.actorIp ?? null,
         nowIso(),
       ],
     );

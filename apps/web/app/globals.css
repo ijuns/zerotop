@@ -4337,6 +4337,153 @@ body {
   opacity: 0.55;
 }
 
+.table-action-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.consent-block {
+  margin: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-soft, #fafbfa);
+}
+
+.consent-block > legend {
+  padding: 0 6px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.consent-block__intro {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.consent-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 0;
+  border-top: 1px solid var(--line);
+}
+
+.consent-row--all {
+  border-top: 0;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 2px;
+}
+
+.consent-row label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.consent-row input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--green-dark);
+  cursor: pointer;
+}
+
+.consent-row em {
+  font-style: normal;
+  font-weight: 800;
+  color: var(--red);
+}
+
+.consent-row summary {
+  color: var(--muted);
+  font-size: 10px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.consent-document {
+  flex-basis: 100%;
+  max-height: 190px;
+  margin-top: 8px;
+  padding: 10px 12px;
+  overflow-y: auto;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.7;
+  background: var(--surface, #fff);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.consent-document ol,
+.consent-document dl {
+  margin: 0;
+  padding-left: 16px;
+}
+
+.consent-document dl {
+  padding-left: 0;
+}
+
+.consent-document dt {
+  margin-top: 8px;
+  font-weight: 800;
+}
+
+.consent-document dt:first-child {
+  margin-top: 0;
+}
+
+.consent-document dd {
+  margin: 2px 0 0;
+}
+
+.data-table--audit .audit-time {
+  white-space: nowrap;
+}
+
+.data-table--audit .audit-ip {
+  font-family: var(--mono, ui-monospace, "SFMono-Regular", Menlo, monospace);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.audit-metadata {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin: 0;
+}
+
+.audit-metadata > div {
+  display: flex;
+  gap: 4px;
+  align-items: baseline;
+  max-width: 100%;
+}
+
+.audit-metadata dt {
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 800;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.audit-metadata dd {
+  margin: 0;
+  font-size: 9px;
+  overflow-wrap: anywhere;
+}
+
 .status-pill--danger {
   color: var(--red);
   background: #fff1f1;

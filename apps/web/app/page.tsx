@@ -538,8 +538,13 @@ export default function HomePage() {
 
   const [signupAccountType, setSignupAccountType] = useState<AccountType>("personal");
   const [signupEmail, setSignupEmail] = useState("");
-  const [signupHandle, setSignupHandle] = useState("");
   const [signupDisplayName, setSignupDisplayName] = useState("");
+  const [signupAffiliation, setSignupAffiliation] = useState("");
+  const [consentRequired, setConsentRequired] = useState(false);
+  const [consentBusy, setConsentBusy] = useState(false);
+  const [consentError, setConsentError] = useState<string | null>(null);
+  const [signupTermsAgreed, setSignupTermsAgreed] = useState(false);
+  const [signupPrivacyAgreed, setSignupPrivacyAgreed] = useState(false);
   const [signupPassword, setSignupPassword] = useState("");
   const [signupJoinCode, setSignupJoinCode] = useState("");
   const [signupState, setSignupState] = useState<DataState>("idle");
@@ -599,7 +604,9 @@ export default function HomePage() {
     void api
       .me()
       .then((profile) => {
-        if (!cancelled) setUser(profile);
+        if (cancelled) return;
+        setUser(profile.user);
+        setConsentRequired(profile.consentRequired);
       })
       .catch((error) => {
         if (cancelled) return;
@@ -768,9 +775,11 @@ export default function HomePage() {
         : isDevelopmentIdentityEnabled()
           ? "dev"
           : "oidc";
+  const signupConsentComplete = signupTermsAgreed && signupPrivacyAgreed;
   const signupValid =
-    signupHandle.trim().length >= 3 &&
     signupDisplayName.trim().length > 0 &&
+    signupAffiliation.trim().length > 0 &&
+    signupConsentComplete &&
     (signupAccountType === "personal" || signupJoinCode.trim().length > 0) &&
     (authMode === "oidc" ||
       (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(signupEmail.trim()) &&
@@ -1147,8 +1156,9 @@ export default function HomePage() {
       const result = await api.register(
         {
           email: signupEmail.trim(),
-          handle: signupHandle.trim(),
           displayName: signupDisplayName.trim(),
+          affiliation: signupAffiliation.trim(),
+          consent: { terms: signupTermsAgreed, privacy: signupPrivacyAgreed },
           ...(authMode === "dev" ? { password: signupPassword } : {}),
           accountType: signupAccountType,
           ...(signupAccountType === "organization"
@@ -1166,7 +1176,13 @@ export default function HomePage() {
       setSignupState("ready");
       await refreshLabs(false);
     } catch (error) {
-      setSignupError(errorMessage(error));
+      // This form always sends consent, so CONSENT_REQUIRED means the browser
+      // is running a bundle cached from before the field existed.
+      setSignupError(
+        error instanceof ApiError && error.code === "CONSENT_REQUIRED"
+          ? "페이지가 오래된 버전입니다. 새로고침(Ctrl+Shift+R) 후 다시 시도해 주세요."
+          : errorMessage(error),
+      );
       setSignupState("error");
     }
   };
@@ -1945,15 +1961,126 @@ export default function HomePage() {
           <form className="signup-form" onSubmit={handleSignup}>
             {authMode === "dev" && <div className="form-group"><label htmlFor="signup-email">이메일</label><input id="signup-email" type="email" value={signupEmail} onChange={(event) => setSignupEmail(event.target.value)} autoComplete="email" placeholder="name@example.com" required /></div>}
             <div className="signup-form__columns">
-              <div className="form-group"><label htmlFor="signup-handle">공개 핸들</label><input id="signup-handle" type="text" value={signupHandle} onChange={(event) => setSignupHandle(event.target.value)} autoComplete="username" pattern="[A-Za-z0-9_-]{3,24}" minLength={3} maxLength={24} placeholder="security_analyst" required /><FieldHint>영문, 숫자, 밑줄, 하이픈 3~24자</FieldHint></div>
-              <div className="form-group"><label htmlFor="signup-display-name">표시 이름</label><input id="signup-display-name" type="text" value={signupDisplayName} onChange={(event) => setSignupDisplayName(event.target.value)} autoComplete="name" maxLength={80} placeholder="홍길동" required /></div>
+              <div className="form-group"><label htmlFor="signup-display-name">이름</label><input id="signup-display-name" type="text" value={signupDisplayName} onChange={(event) => setSignupDisplayName(event.target.value)} autoComplete="name" maxLength={80} placeholder="홍길동" required /></div>
+              <div className="form-group"><label htmlFor="signup-affiliation">소속</label><input id="signup-affiliation" type="text" value={signupAffiliation} onChange={(event) => setSignupAffiliation(event.target.value)} autoComplete="organization" maxLength={80} placeholder="한빛금융 보안관제팀" required /><FieldHint>학교, 회사 또는 소속 팀을 입력하세요.</FieldHint></div>
             </div>
             {authMode === "dev" && <div className="form-group"><label htmlFor="signup-password">비밀번호</label><input id="signup-password" type="password" value={signupPassword} onChange={(event) => setSignupPassword(event.target.value)} autoComplete="new-password" minLength={8} placeholder="8자 이상 입력" required /><FieldHint>로컬 개발 등록에서만 사용됩니다. 운영 환경은 OIDC 인증을 사용합니다.</FieldHint></div>}
             {signupAccountType === "organization" && <div className="form-group"><label htmlFor="signup-join-code">조직 가입 코드</label><input id="signup-join-code" type="text" value={signupJoinCode} onChange={(event) => setSignupJoinCode(event.target.value.toUpperCase())} autoCapitalize="characters" placeholder="SECURITY-LAB" required /><FieldHint>조직 관리자로부터 받은 단일 조직 가입 코드를 입력하세요.</FieldHint></div>}
+            <fieldset className="consent-block">
+              <legend>개인정보 수집 및 이용 동의</legend>
+              <p className="consent-block__intro">교육 플랫폼 서비스 이용을 위해 아래와 같이 개인정보를 수집·이용하고자 합니다. 내용을 확인하신 후 동의해 주시기 바랍니다.</p>
+
+              <label className="consent-row consent-row--all">
+                <input type="checkbox" checked={signupConsentComplete} onChange={(event) => { setSignupTermsAgreed(event.target.checked); setSignupPrivacyAgreed(event.target.checked); }} />
+                <span><strong>전체 동의하기</strong> (선택 사항 포함)</span>
+              </label>
+
+              <div className="consent-row">
+                <label>
+                  <input type="checkbox" checked={signupTermsAgreed} onChange={(event) => setSignupTermsAgreed(event.target.checked)} required />
+                  <span><em>(필수)</em> 서비스 이용약관 동의</span>
+                </label>
+                <details><summary>내용보기</summary><div className="consent-document">
+                  <p>본 약관은 ZeroTOP 교육 플랫폼(이하 &quot;서비스&quot;)의 이용 조건과 절차, 회원과 서비스 제공자의 권리·의무를 규정합니다.</p>
+                  <ol>
+                    <li>회원은 서비스가 제공하는 실습 환경을 교육 목적으로만 이용하며, 허가되지 않은 외부 시스템에 대한 공격 행위에 사용할 수 없습니다.</li>
+                    <li>회원은 계정 정보를 타인과 공유할 수 없으며, 계정을 통해 발생한 활동에 대한 책임을 집니다.</li>
+                    <li>서비스는 실습 환경을 실행별로 격리하여 제공하며, 정해진 이용 시간이 지나면 환경을 자동으로 회수합니다.</li>
+                    <li>회원이 본 약관을 위반한 경우 서비스 이용이 제한되거나 계정이 정지될 수 있습니다.</li>
+                  </ol>
+                </div></details>
+              </div>
+
+              <div className="consent-row">
+                <label>
+                  <input type="checkbox" checked={signupPrivacyAgreed} onChange={(event) => setSignupPrivacyAgreed(event.target.checked)} required />
+                  <span><em>(필수)</em> 개인정보 수집 및 이용 동의</span>
+                </label>
+                <details><summary>내용보기</summary><div className="consent-document">
+                  <dl>
+                    <dt>1. 개인정보 수집 및 이용 목적</dt>
+                    <dd>회원가입 및 식별, 교육 콘텐츠/서비스 제공, 수강 이력 관리, 회원 서비스 이용 안내</dd>
+                    <dt>2. 수집하는 개인정보 항목</dt>
+                    <dd>[필수] 이름, 이메일 주소, 소속, 비밀번호</dd>
+                    <dt>3. 개인정보의 보유 및 이용 기간</dt>
+                    <dd>회원 탈퇴 시까지 (단, 법령에서 정한 보존 기간이 있는 경우 해당 기간 동안 보관)</dd>
+                    <dt>4. 동의 거부 권리 및 동의 거부 시 불이익</dt>
+                    <dd>귀하는 개인정보 수집 및 이용에 대한 동의를 거부할 권리가 있습니다. 단, 필수 항목 동의 거부 시 회원가입 및 교육 서비스 이용이 불가능합니다.</dd>
+                  </dl>
+                </div></details>
+              </div>
+            </fieldset>
             {signupError && <div className="alert alert--error" role="alert"><strong>가입을 완료하지 못했습니다.</strong><span>{signupError}</span></div>}
             <button className="primary-button primary-button--wide" type="submit" disabled={!signupValid || signupState === "loading"}>{signupState === "loading" ? <><span className="spinner" aria-hidden="true" /> 처리 중</> : authMode === "oidc" ? "온보딩 완료" : "회원가입 완료"}</button>
           </form>
         )}
+      </section>
+    </>
+  );
+
+  const acceptConsent = async () => {
+    if (consentBusy) return;
+    setConsentBusy(true);
+    setConsentError(null);
+    try {
+      const profile = await api.recordConsent();
+      setUser(profile);
+      setConsentRequired(false);
+    } catch (error) {
+      setConsentError(errorMessage(error));
+    } finally {
+      setConsentBusy(false);
+    }
+  };
+
+  // Shown to accounts created before the consent requirement, or whose
+  // agreement predates the current document versions. The server refuses every
+  // other route until this is completed, so this replaces the whole view.
+  const renderConsentGate = () => (
+    <>
+      <section className="hero-row hero-row--compact">
+        <div>
+          <div className="eyebrow">CONSENT REQUIRED</div>
+          <h1>약관 동의가 필요합니다</h1>
+          <p>서비스 이용을 계속하려면 아래 필수 항목에 동의해 주세요. 동의 전에는 다른 기능을 사용할 수 없습니다.</p>
+        </div>
+      </section>
+      <section className="panel signup-form-panel">
+        <fieldset className="consent-block">
+          <legend>개인정보 수집 및 이용 동의</legend>
+          <p className="consent-block__intro">교육 플랫폼 서비스 이용을 위해 아래와 같이 개인정보를 수집·이용하고자 합니다. 내용을 확인하신 후 동의해 주시기 바랍니다.</p>
+          <div className="consent-row">
+            <span><em>(필수)</em> 서비스 이용약관</span>
+            <details><summary>내용보기</summary><div className="consent-document">
+              <p>본 약관은 ZeroTOP 교육 플랫폼(이하 &quot;서비스&quot;)의 이용 조건과 절차, 회원과 서비스 제공자의 권리·의무를 규정합니다.</p>
+              <ol>
+                <li>회원은 서비스가 제공하는 실습 환경을 교육 목적으로만 이용하며, 허가되지 않은 외부 시스템에 대한 공격 행위에 사용할 수 없습니다.</li>
+                <li>회원은 계정 정보를 타인과 공유할 수 없으며, 계정을 통해 발생한 활동에 대한 책임을 집니다.</li>
+                <li>서비스는 실습 환경을 실행별로 격리하여 제공하며, 정해진 이용 시간이 지나면 환경을 자동으로 회수합니다.</li>
+                <li>회원이 본 약관을 위반한 경우 서비스 이용이 제한되거나 계정이 정지될 수 있습니다.</li>
+              </ol>
+            </div></details>
+          </div>
+          <div className="consent-row">
+            <span><em>(필수)</em> 개인정보 수집 및 이용</span>
+            <details><summary>내용보기</summary><div className="consent-document">
+              <dl>
+                <dt>1. 개인정보 수집 및 이용 목적</dt>
+                <dd>회원가입 및 식별, 교육 콘텐츠/서비스 제공, 수강 이력 관리, 회원 서비스 이용 안내</dd>
+                <dt>2. 수집하는 개인정보 항목</dt>
+                <dd>[필수] 이름, 이메일 주소, 소속, 비밀번호</dd>
+                <dt>3. 개인정보의 보유 및 이용 기간</dt>
+                <dd>회원 탈퇴 시까지 (단, 법령에서 정한 보존 기간이 있는 경우 해당 기간 동안 보관)</dd>
+                <dt>4. 동의 거부 권리 및 동의 거부 시 불이익</dt>
+                <dd>귀하는 개인정보 수집 및 이용에 대한 동의를 거부할 권리가 있습니다. 단, 필수 항목 동의 거부 시 회원가입 및 교육 서비스 이용이 불가능합니다.</dd>
+              </dl>
+            </div></details>
+          </div>
+        </fieldset>
+        {consentError && <div className="alert alert--error" role="alert"><strong>동의를 저장하지 못했습니다.</strong><span>{consentError}</span></div>}
+        <button className="primary-button primary-button--wide" type="button" disabled={consentBusy} onClick={() => void acceptConsent()}>
+          {consentBusy ? <><span className="spinner" aria-hidden="true" /> 처리 중</> : "필수 항목에 모두 동의합니다"}
+        </button>
       </section>
     </>
   );
@@ -1968,7 +2095,7 @@ export default function HomePage() {
       case "report-organization": return renderReport("organization");
       case "report-platform": return renderReport("platform");
       case "ranking": return renderRanking();
-      case "admin": return <AdminConsole roles={roles} organizationName={user?.organization?.name || user?.organizationName} />;
+      case "admin": return <AdminConsole roles={roles} organizationName={user?.organization?.name || user?.organizationName} currentUserId={user?.id} organizationRole={user?.organization?.role} authMode={authentication.mode} />;
       case "signup": return renderSignup();
     }
   };
@@ -2058,7 +2185,7 @@ export default function HomePage() {
           })}
         </nav>
 
-        <main>{renderContent()}</main>
+        <main>{consentRequired ? renderConsentGate() : renderContent()}</main>
       </div>
     </div>
   );

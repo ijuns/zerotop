@@ -1,7 +1,29 @@
+import { hashPassword } from "./security.ts";
+
 import { DEV_USER_ID, SECURITY_LAB_ORG_ID } from "./types.ts";
 
 export const DEVELOPMENT_FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
 export const DEVELOPMENT_FIXTURE_PASSWORD = "ZeroTOP!2026";
+
+/**
+ * Every seed account shares one password, and scrypt is deliberately slow, so
+ * the digest is computed once per process instead of once per fixture row.
+ * Sharing a hash across synthetic accounts reveals nothing a shared plaintext
+ * does not already reveal.
+ */
+let cachedFixturePasswordHash: string | null | undefined;
+export function developmentFixturePasswordHash(): string | null {
+  if (cachedFixturePasswordHash === undefined) {
+    cachedFixturePasswordHash = hashPassword(DEVELOPMENT_FIXTURE_PASSWORD);
+  }
+  return cachedFixturePasswordHash;
+}
+/**
+ * Seed accounts are synthetic, so recording their consent fabricates nothing
+ * about a real person. It keeps the sample data usable behind the consent gate
+ * that real pre-existing accounts have to pass.
+ */
+export const DEVELOPMENT_FIXTURE_AFFILIATION = "ZeroTOP 개발 샘플";
 
 export interface DevelopmentOrganizationFixture {
   id: string;

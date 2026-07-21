@@ -34,7 +34,10 @@ import {
   validateTrustedGradeEvidence,
 } from "./evidence-grader.ts";
 import {
+  AUDIT_RESOURCE_TYPES,
   DEV_USER_ID,
+  PRIVACY_POLICY_VERSION,
+  TERMS_VERSION,
   type AdminPageQuery,
   type AdminPageResult,
   type RuntimeRunStatusInput,
@@ -101,6 +104,10 @@ interface ApplicationOptions {
   desktopGatewayPublicUrl?: string;
   openVpnDownloadInternalToken?: string;
   openVpnDownloadPublicUrl?: string;
+  /** Expiry sweep period in ms. 0 disables the timer (tests drive it manually). */
+  runSweepIntervalMs?: number;
+  /** Honour X-Forwarded-For for audit source addresses. Only behind a trusted proxy. */
+  trustProxyHeaders?: boolean;
 }
 
 interface HandlerContext {
@@ -117,6 +124,7 @@ interface HandlerContext {
   desktopGatewayPublicUrl: string;
   openVpnDownloadInternalToken: string;
   openVpnDownloadPublicUrl: string;
+  trustProxyHeaders: boolean;
   ready: Promise<void>;
 }
 
@@ -317,7 +325,14 @@ function requireOrganizationAdmin(actor: RequestActor): string {
   return organizationId;
 }
 
-type AdminListKind = "users" | "organizations" | "labs" | "runs" | "members";
+type AdminListKind =
+  | "users"
+  | "organizations"
+  | "labs"
+  | "runs"
+  | "members"
+  | "auditLogs"
+  | "organizationAuditLogs";
 
 const ADMIN_FILTERS: Record<AdminListKind, ReadonlySet<string>> = {
   users: new Set(["search", "organizationId", "platformRole"]),
@@ -325,6 +340,8 @@ const ADMIN_FILTERS: Record<AdminListKind, ReadonlySet<string>> = {
   labs: new Set(["search", "organizationId", "team", "status"]),
   runs: new Set(["search", "organizationId", "status", "accessMethod"]),
   members: new Set(["search", "role"]),
+  auditLogs: new Set(["search", "action", "resourceType"]),
+  organizationAuditLogs: new Set(["search", "action"]),
 };
 
 function boundedQueryInteger(
@@ -438,6 +455,27 @@ function parseAdminPageQuery(url: URL, kind: AdminListKind): AdminPageQuery {
     );
     if (accessMethod) query.accessMethod = accessMethod;
   }
+  if (kind === "auditLogs" || kind === "organizationAuditLogs") {
+    // Actions are matched as an opaque namespaced token rather than an enum, so
+    // filtering keeps working as new audited actions are introduced.
+    const action = optionalAdminFilter(url, "action", 64);
+    if (action !== undefined) {
+      if (!/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/.test(action)) {
+        throw new ApiError(
+          400,
+          "INVALID_ADMIN_FILTER",
+          "action must look like namespace.event.",
+        );
+      }
+      query.auditAction = action;
+    }
+    const resourceType = enumAdminFilter(
+      url,
+      "resourceType",
+      AUDIT_RESOURCE_TYPES,
+    );
+    if (resourceType) query.auditResourceType = resourceType;
+  }
   return query;
 }
 
@@ -542,6 +580,44 @@ function normalizeAdminReason(value: unknown, fallback: string): string {
     );
   }
   return reason;
+}
+
+function enumBodyField<T extends string>(
+  value: unknown,
+  name: string,
+  allowed: readonly T[],
+  code: string,
+): T {
+  if (!isObject(value)) {
+    throw new ApiError(400, "INVALID_ADMIN_MUTATION", "A JSON object is required.");
+  }
+  const supplied = value[name];
+  if (
+    typeof supplied !== "string" ||
+    !(allowed as readonly string[]).includes(supplied)
+  ) {
+    throw new ApiError(
+      400,
+      code,
+      `${name} must be one of: ${allowed.join(", ")}.`,
+    );
+  }
+  return supplied as T;
+}
+
+function booleanBodyField(value: unknown, name: string, code: string): boolean {
+  if (!isObject(value)) {
+    throw new ApiError(400, "INVALID_ADMIN_MUTATION", "A JSON object is required.");
+  }
+  if (typeof value[name] !== "boolean") {
+    throw new ApiError(400, code, `${name} must be a boolean.`);
+  }
+  return value[name] as boolean;
+}
+
+function actorOrganizationRole(actor: RequestActor): string {
+  const organization = actorOrganization(actor.user);
+  return (organization ? stringField(organization, "role") : null) ?? "";
 }
 
 function submittedAnswers(value: unknown): SubmittedAnswer[] {
@@ -786,6 +862,192 @@ async function oidcPrincipal(
   );
 }
 
+/**
+ * A suspended account keeps its rows but loses every session. This runs before
+ * any route handler, so suspension revokes access without a token round-trip.
+ */
+function rejectSuspendedAccount(user: unknown): void {
+  if (field(user, "disabledAt")) {
+    throw new ApiError(
+      403,
+      "ACCOUNT_SUSPENDED",
+      "This account has been suspended by a platform administrator.",
+    );
+  }
+}
+
+/**
+ * True when the account has not agreed to the documents currently in force.
+ * A version bump therefore re-gates everyone, which is the point of storing
+ * the version alongside the agreement time.
+ */
+function consentOutstanding(user: unknown): boolean {
+  const consent = field(user, "consent");
+  if (!isObject(consent)) return true;
+  return (
+    !consent.termsAgreedAt ||
+    consent.termsVersion !== TERMS_VERSION ||
+    !consent.privacyAgreedAt ||
+    consent.privacyVersion !== PRIVACY_POLICY_VERSION
+  );
+}
+
+/** Routes an account may still reach while its consent is outstanding. */
+const CONSENT_EXEMPT_PATHS = new Set(["/v1/me", "/v1/me/consent"]);
+
+/**
+ * Source address for audit records.
+ *
+ * `X-Forwarded-For` is attacker-controlled unless a trusted proxy rewrites it,
+ * and a forged address in an audit trail is worse than no address at all. The
+ * header is therefore only honoured when TRUST_PROXY_HEADERS is enabled, which
+ * deployments behind the ingress must set to record real client addresses.
+ */
+function clientIpOf(request: IncomingMessage, trustProxyHeaders: boolean): string | null {
+  if (trustProxyHeaders) {
+    const header = request.headers["x-forwarded-for"];
+    const raw = Array.isArray(header) ? header[0] : header;
+    const first = raw?.split(",")[0]?.trim();
+    if (first && first.length <= 45 && !/[\u0000-\u001f\u007f,]/.test(first)) {
+      return first;
+    }
+  }
+  return request.socket.remoteAddress ?? null;
+}
+
+/**
+ * Builds a handle seed from an email local part. The handle is the public
+ * identifier (`@handle`) and must satisfy the same charset the API accepts, so
+ * anything outside [A-Za-z0-9_-] is dropped and short results are padded.
+ */
+function handleSeedFromEmail(email: string): string {
+  const local = email.split("@")[0] ?? "";
+  const cleaned = local.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24);
+  if (cleaned.length >= 3) return cleaned;
+  return `user_${cleaned}`.slice(0, 24).padEnd(3, "0");
+}
+
+/** Fills in a server-derived handle when the client did not supply one. */
+async function withResolvedHandle<T extends { email: string; handle?: string }>(
+  context: HandlerContext,
+  input: T,
+): Promise<T & { handle: string }> {
+  if (input.handle) return input as T & { handle: string };
+  const handle = await context.repository.findAvailableHandle(
+    handleSeedFromEmail(input.email),
+  );
+  return { ...input, handle };
+}
+
+/**
+ * Tears a run down at both the runtime and telemetry planes. Adapter failures
+ * are logged and swallowed: the platform record must still leave the active
+ * set, otherwise a runtime that is already gone would keep the run "ready"
+ * forever and re-tried on every sweep.
+ */
+async function releaseRunResources(
+  context: Pick<HandlerContext, "runtime" | "telemetryGateway">,
+  runId: string,
+): Promise<void> {
+  try {
+    await context.runtime.destroyRun(runId);
+  } catch (error) {
+    console.error(`runtime destroy failed for ${runId}`, error);
+  }
+  try {
+    await context.telemetryGateway.destroy(runId);
+  } catch (error) {
+    console.error(`telemetry destroy failed for ${runId}`, error);
+  }
+}
+
+/**
+ * Stops every still-active run belonging to a user. Suspension revokes API
+ * access, but an already-downloaded OpenVPN profile reaches the environment
+ * over the network without touching the API, so the environment itself has to
+ * go for the suspension to mean anything.
+ */
+async function terminateRunsForUser(
+  context: HandlerContext,
+  userId: string,
+  actorUserId: string,
+  reason: string,
+): Promise<string[]> {
+  const runIds = await context.repository.listActiveRunIdsForUser(userId);
+  const stopped: string[] = [];
+  const stoppedAt = new Date().toISOString();
+  for (const runId of runIds) {
+    await releaseRunResources(context, runId);
+    if (await context.repository.markRunStopped(runId, stoppedAt, actorUserId, reason)) {
+      stopped.push(runId);
+    }
+  }
+  return stopped;
+}
+
+/** Expires runs whose TTL has passed and releases their resources. */
+async function sweepExpiredRuns(
+  context: HandlerContext,
+  now = new Date().toISOString(),
+  limit = 50,
+): Promise<string[]> {
+  const runIds = await context.repository.listExpiredRunIds(now, limit);
+  const expired: string[] = [];
+  for (const runId of runIds) {
+    await releaseRunResources(context, runId);
+    if (await context.repository.markRunExpired(runId, now)) {
+      expired.push(runId);
+      await context.repository.recordAudit({
+        actorUserId: null,
+        action: "runtime.expired",
+        resourceType: "runtime_run",
+        resourceId: runId,
+        metadata: { expiredAt: now },
+      });
+    }
+  }
+  return expired;
+}
+
+/**
+ * Resolves a member the actor is allowed to act on. The lookup is scoped to the
+ * actor's own organization, so a member ID from another tenant reads as absent
+ * rather than leaking its existence.
+ */
+async function requireManageableMember(
+  context: HandlerContext,
+  actor: RequestActor,
+  organizationId: string,
+  userId: string,
+): Promise<unknown> {
+  if (userId === actor.id) {
+    throw new ApiError(
+      409,
+      "CANNOT_MODIFY_SELF",
+      "Organization administrators cannot change their own membership.",
+    );
+  }
+  const member = await context.repository.getOrganizationMember(
+    organizationId,
+    userId,
+  );
+  if (!member) {
+    throw new ApiError(
+      404,
+      "MEMBER_NOT_FOUND",
+      "The organization member was not found.",
+    );
+  }
+  if (stringField(member, "organizationRole") === "owner") {
+    throw new ApiError(
+      409,
+      "OWNER_IMMUTABLE",
+      "The organization owner cannot be modified or removed.",
+    );
+  }
+  return member;
+}
+
 async function resolveActor(
   request: IncomingMessage,
   context: HandlerContext,
@@ -803,6 +1065,7 @@ async function resolveActor(
         "The authenticated identity must complete /v1/auth/onboarding.",
       );
     }
+    rejectSuspendedAccount(user);
     const organization = actorOrganization(user);
     if (
       principal.organizationId &&
@@ -827,6 +1090,7 @@ async function resolveActor(
   if (!user) {
     throw new ApiError(401, "UNKNOWN_DEV_USER", "The development user does not exist.");
   }
+  rejectSuspendedAccount(user);
   const organization = actorOrganization(user);
   const roles = [
     ...(organization ? ["org_member"] : ["individual"]),
@@ -845,6 +1109,7 @@ async function route(
 ): Promise<void> {
   await context.ready;
   const method = request.method ?? "GET";
+  const actorIp = clientIpOf(request, context.trustProxyHeaders);
   const url = new URL(request.url ?? "/", "http://api.local");
   const ingressPath = url.pathname.replace(/\/+$/, "") || "/";
   const path =
@@ -878,15 +1143,23 @@ async function route(
         "Password registration is disabled; authenticate with OIDC and use /v1/auth/onboarding.",
       );
     }
-    const input = normalizeRegistration(await readJson(request));
+    const input = await withResolvedHandle(
+      context,
+      normalizeRegistration(await readJson(request)),
+    );
     const user = await context.repository.register(input);
     const userId = stringField(user, "id") as string;
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: userId,
       action: "auth.user_registered",
       resourceType: "user",
       resourceId: userId,
-      metadata: { accountType: input.accountType },
+      metadata: {
+        accountType: input.accountType,
+        termsVersion: TERMS_VERSION,
+        privacyVersion: PRIVACY_POLICY_VERSION,
+      },
     });
     sendJson(response, 201, {
       data: {
@@ -937,14 +1210,17 @@ async function route(
         "OIDC onboarding never accepts a password.",
       );
     }
-    const input = normalizeRegistration({
-      ...onboardingBody,
-      email: principal.email,
-      displayName: onboardingBody.displayName ?? principal.displayName,
-      ...(principal.organizationId
-        ? { accountType: "organization", organizationId: principal.organizationId }
-        : {}),
-    });
+    const input = await withResolvedHandle(
+      context,
+      normalizeRegistration({
+        ...onboardingBody,
+        email: principal.email,
+        displayName: onboardingBody.displayName ?? principal.displayName,
+        ...(principal.organizationId
+          ? { accountType: "organization", organizationId: principal.organizationId }
+          : {}),
+      }),
+    );
     const hasOrganizationRole = principal.roles.some(
       (role) => role === "org_member" || role === "org_admin",
     );
@@ -975,6 +1251,7 @@ async function route(
     });
     const userId = stringField(user, "id") as string;
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: userId,
       action: "auth.identity_onboarded",
       resourceType: "user",
@@ -1096,6 +1373,31 @@ async function route(
     return;
   }
 
+  if (method === "GET" && path === "/v1/admin/audit-logs") {
+    requirePlatformAdmin(actor);
+    const query = parseAdminPageQuery(url, "auditLogs");
+    sendJson(
+      response,
+      200,
+      adminPagePayload(await context.repository.listAdminAuditLogs(query), query),
+    );
+    return;
+  }
+
+  if (method === "GET" && path === "/v1/admin/organization/audit-logs") {
+    const organizationId = requireOrganizationAdmin(actor);
+    const query = parseAdminPageQuery(url, "organizationAuditLogs");
+    sendJson(
+      response,
+      200,
+      adminPagePayload(
+        await context.repository.listOrganizationAuditLogs(organizationId, query),
+        query,
+      ),
+    );
+    return;
+  }
+
   if (method === "GET" && path === "/v1/admin/organization/members") {
     const organizationId = requireOrganizationAdmin(actor);
     const query = parseAdminPageQuery(url, "members");
@@ -1156,6 +1458,7 @@ async function route(
       storedPayload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "admin.organization_created",
       resourceType: "organization",
@@ -1236,6 +1539,7 @@ async function route(
       storedPayload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "admin.organization_join_code_rotated",
       resourceType: "organization",
@@ -1293,11 +1597,66 @@ async function route(
       payload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "admin.lab_quarantined",
       resourceType: "lab",
       resourceId: labId,
       metadata: { reason },
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  const releaseLabMatch = path.match(/^\/v1\/admin\/labs\/([^/]+)\/release$/);
+  if (method === "POST" && releaseLabMatch) {
+    requirePlatformAdmin(actor);
+    const labId = decodeAdminIdentifier(releaseLabMatch[1], "lab");
+    const body = await readJson(request);
+    const reason = normalizeAdminReason(body, "Administrative release");
+    const key = idempotencyKey(request);
+    const digest = requestDigest({ labId, body });
+    const operation = `admin.lab.release:${labId}`;
+    if (
+      await replayIfPresent(
+        context.repository,
+        response,
+        actor.id,
+        operation,
+        key,
+        digest,
+        200,
+      )
+    ) {
+      return;
+    }
+    const lab = await context.repository.releaseLabQuarantine(
+      labId,
+      new Date().toISOString(),
+    );
+    if (!lab) {
+      throw new ApiError(
+        409,
+        "LAB_NOT_QUARANTINED",
+        "The lab was not found or is not quarantined.",
+      );
+    }
+    const payload = { data: { lab } };
+    await context.repository.saveIdempotencyRecord(
+      actor.id,
+      operation,
+      key,
+      digest,
+      labId,
+      payload,
+    );
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.lab_quarantine_released",
+      resourceType: "lab",
+      resourceId: labId,
+      metadata: { reason, restoredStatus: "draft" },
     });
     sendJson(response, 200, payload);
     return;
@@ -1354,6 +1713,7 @@ async function route(
       payload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "admin.runtime_terminated",
       resourceType: "runtime_run",
@@ -1364,8 +1724,369 @@ async function route(
     return;
   }
 
+  const platformRoleMatch = path.match(
+    /^\/v1\/admin\/users\/([^/]+)\/platform-role$/,
+  );
+  if (method === "POST" && platformRoleMatch) {
+    requirePlatformAdmin(actor);
+    const userId = decodeAdminIdentifier(platformRoleMatch[1], "user");
+    const body = await readJson(request);
+    const platformRole = enumBodyField(
+      body,
+      "platformRole",
+      ["user", "platform_admin"] as const,
+      "INVALID_PLATFORM_ROLE",
+    );
+    const reason = normalizeAdminReason(body, "Administrative role change");
+    // Blocking self-demotion keeps at least one platform admin reachable; an
+    // admin who locked themselves out cannot be recovered through the console.
+    if (userId === actor.id) {
+      throw new ApiError(
+        409,
+        "CANNOT_MODIFY_SELF",
+        "Platform administrators cannot change their own platform role.",
+      );
+    }
+    const key = idempotencyKey(request);
+    const digest = requestDigest({ userId, body });
+    const operation = `admin.user.platform_role:${userId}`;
+    if (
+      await replayIfPresent(
+        context.repository,
+        response,
+        actor.id,
+        operation,
+        key,
+        digest,
+        200,
+      )
+    ) {
+      return;
+    }
+    const current = await context.repository.getAdminUser(userId);
+    if (!current) {
+      throw new ApiError(404, "USER_NOT_FOUND", "The user was not found.");
+    }
+    const previousRole = stringField(current, "platformRole");
+    const user = await context.repository.setUserPlatformRole(userId, platformRole);
+    if (!user) {
+      throw new ApiError(404, "USER_NOT_FOUND", "The user was not found.");
+    }
+    const payload = { data: { user } };
+    await context.repository.saveIdempotencyRecord(
+      actor.id,
+      operation,
+      key,
+      digest,
+      userId,
+      payload,
+    );
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.user_platform_role_changed",
+      resourceType: "user",
+      resourceId: userId,
+      metadata: { previousRole, platformRole, reason },
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  const suspensionMatch = path.match(/^\/v1\/admin\/users\/([^/]+)\/suspension$/);
+  if (method === "POST" && suspensionMatch) {
+    requirePlatformAdmin(actor);
+    const userId = decodeAdminIdentifier(suspensionMatch[1], "user");
+    const body = await readJson(request);
+    const suspended = booleanBodyField(body, "suspended", "INVALID_SUSPENSION");
+    const reason = normalizeAdminReason(
+      body,
+      suspended ? "Administrative suspension" : "Administrative reinstatement",
+    );
+    if (userId === actor.id) {
+      throw new ApiError(
+        409,
+        "CANNOT_MODIFY_SELF",
+        "Platform administrators cannot suspend their own account.",
+      );
+    }
+    const key = idempotencyKey(request);
+    const digest = requestDigest({ userId, body });
+    const operation = `admin.user.suspension:${userId}`;
+    if (
+      await replayIfPresent(
+        context.repository,
+        response,
+        actor.id,
+        operation,
+        key,
+        digest,
+        200,
+      )
+    ) {
+      return;
+    }
+    const changedAt = new Date().toISOString();
+    const user = await context.repository.setUserDisabled(
+      userId,
+      suspended,
+      actor.id,
+      reason,
+      changedAt,
+    );
+    if (!user) {
+      throw new ApiError(404, "USER_NOT_FOUND", "The user was not found.");
+    }
+    // Suspension only blocks the API; an issued OpenVPN profile bypasses it, so
+    // the environments themselves have to be torn down.
+    const terminatedRuns = suspended
+      ? await terminateRunsForUser(
+          context,
+          userId,
+          actor.id,
+          "account_suspended",
+        )
+      : [];
+    const payload = { data: { user, terminatedRuns } };
+    await context.repository.saveIdempotencyRecord(
+      actor.id,
+      operation,
+      key,
+      digest,
+      userId,
+      payload,
+    );
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: suspended ? "admin.user_suspended" : "admin.user_reinstated",
+      resourceType: "user",
+      resourceId: userId,
+      metadata: { reason, terminatedRuns: terminatedRuns.length },
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  const memberRoleMatch = path.match(
+    /^\/v1\/admin\/organization\/members\/([^/]+)\/role$/,
+  );
+  if (method === "POST" && memberRoleMatch) {
+    const organizationId = requireOrganizationAdmin(actor);
+    const userId = decodeAdminIdentifier(memberRoleMatch[1], "member");
+    const body = await readJson(request);
+    const role = enumBodyField(
+      body,
+      "role",
+      ["org_admin", "member"] as const,
+      "INVALID_MEMBERSHIP_ROLE",
+    );
+    const reason = normalizeAdminReason(body, "Organization role change");
+    const member = await requireManageableMember(
+      context,
+      actor,
+      organizationId,
+      userId,
+    );
+    // Granting org_admin is symmetric, but revoking it is owner-only so two
+    // organization admins cannot strip each other's access.
+    if (
+      stringField(member, "organizationRole") === "org_admin" &&
+      role === "member" &&
+      actorOrganizationRole(actor) !== "owner"
+    ) {
+      throw new ApiError(
+        403,
+        "ORGANIZATION_OWNER_REQUIRED",
+        "Only the organization owner can demote an organization administrator.",
+      );
+    }
+    const key = idempotencyKey(request);
+    const digest = requestDigest({ organizationId, userId, body });
+    const operation = `admin.organization.member_role:${organizationId}:${userId}`;
+    if (
+      await replayIfPresent(
+        context.repository,
+        response,
+        actor.id,
+        operation,
+        key,
+        digest,
+        200,
+      )
+    ) {
+      return;
+    }
+    const previousRole = stringField(member, "organizationRole");
+    const updated = await context.repository.setOrganizationMemberRole(
+      organizationId,
+      userId,
+      role,
+    );
+    if (!updated) {
+      throw new ApiError(
+        404,
+        "MEMBER_NOT_FOUND",
+        "The organization member was not found.",
+      );
+    }
+    const payload = { data: { member: updated } };
+    await context.repository.saveIdempotencyRecord(
+      actor.id,
+      operation,
+      key,
+      digest,
+      userId,
+      payload,
+    );
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.organization_member_role_changed",
+      resourceType: "organization_membership",
+      resourceId: userId,
+      metadata: { organizationId, previousRole, role, reason },
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  const memberRemoveMatch = path.match(
+    /^\/v1\/admin\/organization\/members\/([^/]+)\/remove$/,
+  );
+  if (method === "POST" && memberRemoveMatch) {
+    const organizationId = requireOrganizationAdmin(actor);
+    const userId = decodeAdminIdentifier(memberRemoveMatch[1], "member");
+    const body = await readJson(request);
+    const reason = normalizeAdminReason(body, "Organization membership removed");
+    const member = await requireManageableMember(
+      context,
+      actor,
+      organizationId,
+      userId,
+    );
+    const previousRole = stringField(member, "organizationRole");
+    if (previousRole === "org_admin" && actorOrganizationRole(actor) !== "owner") {
+      throw new ApiError(
+        403,
+        "ORGANIZATION_OWNER_REQUIRED",
+        "Only the organization owner can remove an organization administrator.",
+      );
+    }
+    const key = idempotencyKey(request);
+    const digest = requestDigest({ organizationId, userId, body });
+    const operation = `admin.organization.member_remove:${organizationId}:${userId}`;
+    if (
+      await replayIfPresent(
+        context.repository,
+        response,
+        actor.id,
+        operation,
+        key,
+        digest,
+        200,
+      )
+    ) {
+      return;
+    }
+    const removed = await context.repository.removeOrganizationMember(
+      organizationId,
+      userId,
+    );
+    if (!removed) {
+      throw new ApiError(
+        404,
+        "MEMBER_NOT_FOUND",
+        "The organization member was not found.",
+      );
+    }
+    const payload = { data: { removed: true, userId } };
+    await context.repository.saveIdempotencyRecord(
+      actor.id,
+      operation,
+      key,
+      digest,
+      userId,
+      payload,
+    );
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.organization_member_removed",
+      resourceType: "organization_membership",
+      resourceId: userId,
+      metadata: { organizationId, previousRole, reason },
+    });
+    sendJson(response, 200, payload);
+    return;
+  }
+
+  // Accounts created before the consent requirement, or whose agreement predates
+  // the current document versions, must re-consent before using the service.
+  const consentRequired = consentOutstanding(actor.user);
+  if (consentRequired && !CONSENT_EXEMPT_PATHS.has(path)) {
+    throw new ApiError(
+      403,
+      "CONSENT_REQUIRED",
+      "Agreement to the current terms of service and privacy notice is required.",
+      {
+        termsVersion: TERMS_VERSION,
+        privacyVersion: PRIVACY_POLICY_VERSION,
+      },
+    );
+  }
+
   if (method === "GET" && path === "/v1/me") {
-    sendJson(response, 200, { data: { user: actor.user } });
+    sendJson(response, 200, {
+      data: {
+        user: actor.user,
+        consentRequired,
+        termsVersion: TERMS_VERSION,
+        privacyVersion: PRIVACY_POLICY_VERSION,
+      },
+    });
+    return;
+  }
+
+  if (method === "POST" && path === "/v1/me/consent") {
+    const body = await readJson(request);
+    const consent: Record<string, unknown> =
+      typeof body === "object" && body !== null && "consent" in body &&
+      typeof (body as Record<string, unknown>).consent === "object" &&
+      (body as Record<string, unknown>).consent !== null
+        ? ((body as Record<string, unknown>).consent as Record<string, unknown>)
+        : (isObject(body) ? body : {});
+    if (consent.terms !== true || consent.privacy !== true) {
+      throw new ApiError(
+        400,
+        "CONSENT_REQUIRED",
+        "Agreement to the terms of service and the privacy notice is required.",
+      );
+    }
+    const agreedAt = new Date().toISOString();
+    const user = await context.repository.recordUserConsent(
+      actor.id,
+      agreedAt,
+      TERMS_VERSION,
+      PRIVACY_POLICY_VERSION,
+    );
+    if (!user) {
+      throw new ApiError(404, "USER_NOT_FOUND", "The user was not found.");
+    }
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "auth.consent_recorded",
+      resourceType: "user",
+      resourceId: actor.id,
+      metadata: {
+        termsVersion: TERMS_VERSION,
+        privacyVersion: PRIVACY_POLICY_VERSION,
+      },
+    });
+    sendJson(response, 200, {
+      data: { user, consentRequired: false },
+    });
     return;
   }
 
@@ -1397,6 +2118,7 @@ async function route(
     })) as ReportingDataset;
     const report = organizationReport(dataset, organizationId);
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "report.organization_viewed",
       resourceType: "organization",
@@ -1420,6 +2142,7 @@ async function route(
     const dataset = (await context.repository.getReportingDataset()) as ReportingDataset;
     const report = platformReport(dataset);
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "report.platform_viewed",
       resourceType: "platform",
@@ -1533,6 +2256,7 @@ async function route(
       payload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "lab.generated",
       resourceType: "lab",
@@ -1594,6 +2318,7 @@ async function route(
     const payload = { data: { lab: updatedLab, build: operation } };
     await context.repository.saveIdempotencyRecord(actor.id, operationName, key, digest, operation.id, payload);
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "lab.environment_build_started",
       resourceType: "lab",
@@ -1623,6 +2348,7 @@ async function route(
     );
     const updatedLab = await context.repository.getLab(actor.id, labId);
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "lab.validation_completed",
       resourceType: "lab",
@@ -1734,6 +2460,7 @@ async function route(
       payload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "runtime.deployed",
       resourceType: "runtime_run",
@@ -1783,6 +2510,7 @@ async function route(
       createdAt: createdAt.toISOString(),
     });
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "desktop_ticket.issued",
       resourceType: "runtime_run",
@@ -1840,6 +2568,7 @@ async function route(
       createdAt: createdAt.toISOString(),
     });
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "openvpn_ticket.issued",
       resourceType: "runtime_run",
@@ -1887,6 +2616,7 @@ async function route(
     }
     const result = await context.telemetryGateway.search(runId, query, size);
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "elk.search_executed",
       resourceType: "runtime_run",
@@ -1979,6 +2709,7 @@ async function route(
       payload,
     );
     await context.repository.recordAudit({
+      actorIp,
       actorUserId: actor.id,
       action: "challenge.submitted",
       resourceType: "challenge_result",
@@ -2285,7 +3016,46 @@ export function createApplication(options: ApplicationOptions = {}) {
       openVpnDownloadPublicUrl,
     });
   }
+  const trustProxyHeaders =
+    options.trustProxyHeaders ?? process.env.TRUST_PROXY_HEADERS === "true";
   const ready = Promise.resolve(repository.initialize());
+
+  const handlerContext: HandlerContext = {
+    repository,
+    runtime,
+    labGenerator,
+    evidenceGrader,
+    labValidator,
+    telemetryGateway,
+    environmentBuilder,
+    authMode,
+    oidcVerifier,
+    desktopGatewayInternalToken,
+    desktopGatewayPublicUrl,
+    openVpnDownloadInternalToken,
+    openVpnDownloadPublicUrl,
+    trustProxyHeaders,
+    ready,
+  };
+
+  const runSweep = async (now?: string) => {
+    await ready;
+    return sweepExpiredRuns(handlerContext, now);
+  };
+
+  const sweepIntervalMs =
+    options.runSweepIntervalMs ??
+    Number.parseInt(process.env.RUN_SWEEP_INTERVAL_MS ?? "60000", 10);
+  let sweepTimer: ReturnType<typeof setInterval> | undefined;
+  if (Number.isFinite(sweepIntervalMs) && sweepIntervalMs > 0) {
+    sweepTimer = setInterval(() => {
+      void runSweep().catch((error: unknown) => {
+        console.error("expired run sweep failed", error);
+      });
+    }, sweepIntervalMs);
+    // Never hold the process open for the sweep alone.
+    sweepTimer.unref?.();
+  }
 
   const server = createServer((request, response) => {
     if (!applyCors(request, response, allowedOrigins)) {
@@ -2297,22 +3067,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       });
       return;
     }
-    route(request, response, {
-      repository,
-      runtime,
-      labGenerator,
-      evidenceGrader,
-      labValidator,
-      telemetryGateway,
-      environmentBuilder,
-      authMode,
-      oidcVerifier,
-      desktopGatewayInternalToken,
-      desktopGatewayPublicUrl,
-      openVpnDownloadInternalToken,
-      openVpnDownloadPublicUrl,
-      ready,
-    }).catch((error: unknown) => {
+    route(request, response, handlerContext).catch((error: unknown) => {
       if (response.headersSent) {
         response.end();
         return;
@@ -2368,7 +3123,10 @@ export function createApplication(options: ApplicationOptions = {}) {
     authMode,
     repositoryMode,
     ready,
+    /** Runs the expiry sweep once. Exposed so tests can drive it deterministically. */
+    sweepExpiredRuns: runSweep,
     async close(): Promise<void> {
+      if (sweepTimer) clearInterval(sweepTimer);
       if (server.listening) {
         await new Promise<void>((resolve, reject) => {
           server.close((error) => (error ? reject(error) : resolve()));

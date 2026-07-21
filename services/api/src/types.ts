@@ -19,17 +19,37 @@ export type QuestionType =
 
 export type JsonObject = Record<string, unknown>;
 
+/**
+ * Versions of the documents shown at signup. Bumping one means existing
+ * agreements no longer cover the current text and re-consent is required.
+ */
+export const TERMS_VERSION = "2026-07-22";
+export const PRIVACY_POLICY_VERSION = "2026-07-22";
+
+export interface RegistrationConsent {
+  terms: boolean;
+  privacy: boolean;
+}
+
 export interface RegistrationInput {
   email: string;
-  handle: string;
+  /** Optional: derived from the email when the client does not supply one. */
+  handle?: string;
   displayName: string;
+  affiliation: string;
   password?: string;
   accountType: "personal" | "organization";
   organizationId?: string;
   organizationJoinCode?: string;
+  consent: RegistrationConsent;
 }
 
-export interface IdentityOnboardingInput extends RegistrationInput {
+/** A registration whose handle has been resolved; what the repository stores. */
+export interface ResolvedRegistrationInput extends RegistrationInput {
+  handle: string;
+}
+
+export interface IdentityOnboardingInput extends ResolvedRegistrationInput {
   externalSubject: string;
   platformRole: "user" | "platform_admin";
   organizationRole: "member" | "org_admin";
@@ -120,7 +140,21 @@ export interface AdminPageQuery {
   labStatus?: "draft" | "validated" | "quarantined";
   runStatus?: "provisioning" | "ready" | "failed" | "stopped" | "expired";
   accessMethod?: LabAccessMethod;
+  auditAction?: string;
+  auditResourceType?: AuditResourceType;
 }
+
+export const AUDIT_RESOURCE_TYPES = [
+  "user",
+  "organization",
+  "organization_membership",
+  "lab",
+  "runtime_run",
+  "challenge_result",
+  "platform",
+] as const;
+
+export type AuditResourceType = (typeof AUDIT_RESOURCE_TYPES)[number];
 
 export interface AdminPageResult {
   items: unknown[];
