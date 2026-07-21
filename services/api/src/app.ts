@@ -68,6 +68,11 @@ import {
   type ReportingDataset,
 } from "@codegate/reporting";
 import {
+  RANKING_DOMAINS,
+  type RankingDomain,
+  type RankingSeason,
+} from "@codegate/contracts";
+import {
   gradeRun,
   type ServerQuestion,
   type SubmittedAnswer,
@@ -613,6 +618,41 @@ function booleanBodyField(value: unknown, name: string, code: string): boolean {
     throw new ApiError(400, code, `${name} must be a boolean.`);
   }
   return value[name] as boolean;
+}
+
+function normalizeSeasonBody(value: unknown): {
+  name: string;
+  slug: string;
+  startsAt: string;
+  endsAt: string;
+} {
+  if (!isObject(value)) {
+    throw new ApiError(400, "INVALID_SEASON", "A JSON object is required.");
+  }
+  const name = typeof value.name === "string" ? value.name.trim() : "";
+  const slug = typeof value.slug === "string" ? value.slug.trim().toLowerCase() : "";
+  const startsAt = typeof value.startsAt === "string" ? value.startsAt : "";
+  const endsAt = typeof value.endsAt === "string" ? value.endsAt : "";
+  if (name.length < 2 || name.length > 80) {
+    throw new ApiError(400, "INVALID_SEASON", "name must be 2-80 characters.");
+  }
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug) || slug.length > 63) {
+    throw new ApiError(400, "INVALID_SEASON", "slug must be lowercase kebab-case.");
+  }
+  const start = Date.parse(startsAt);
+  const end = Date.parse(endsAt);
+  if (Number.isNaN(start) || Number.isNaN(end)) {
+    throw new ApiError(400, "INVALID_SEASON", "startsAt and endsAt must be ISO timestamps.");
+  }
+  if (end <= start) {
+    throw new ApiError(400, "INVALID_SEASON", "endsAt must be after startsAt.");
+  }
+  return {
+    name,
+    slug,
+    startsAt: new Date(start).toISOString(),
+    endsAt: new Date(end).toISOString(),
+  };
 }
 
 function actorOrganizationRole(actor: RequestActor): string {
@@ -2179,14 +2219,109 @@ async function route(
         "Organization ranking is available only to members of that organization.",
       );
     }
+    const rawDomain = url.searchParams.get("domain");
+    if (
+      rawDomain !== null &&
+      !RANKING_DOMAINS.some((item) => item.key === rawDomain)
+    ) {
+      throw new ApiError(
+        400,
+        "INVALID_RANKING_DOMAIN",
+        `domain must be one of: ${RANKING_DOMAINS.map((item) => item.key).join(", ")}.`,
+      );
+    }
+    // Cross-organization standings compare every opted-in tenant, so the board
+    // is always computed from the full dataset even when the viewer is scoped
+    // to their own organization.
     const dataset = (await context.repository.getReportingDataset(
-      rawScope === "organization" ? { organizationId: organizationId as string } : {},
+      {},
     )) as ReportingDataset;
+    const season = (await context.repository.getActiveSeason(
+      new Date().toISOString(),
+    )) as RankingSeason | null;
     const result = ranking(dataset, rawScope, rawPeriod, {
       organizationId: organizationId ?? undefined,
       currentUserId: actor.id,
+      season,
+      domain: (rawDomain as RankingDomain | null) ?? null,
     });
     sendJson(response, 200, { data: { ranking: result } });
+    return;
+  }
+
+  if (method === "GET" && path === "/v1/admin/seasons") {
+    requirePlatformAdmin(actor);
+    sendJson(response, 200, {
+      data: { seasons: await context.repository.listSeasons() },
+    });
+    return;
+  }
+
+  if (method === "POST" && path === "/v1/admin/seasons") {
+    requirePlatformAdmin(actor);
+    const body = await readJson(request);
+    const season = normalizeSeasonBody(body);
+    const created = await context.repository.createSeason({
+      id: `season_${randomUUID()}`,
+      ...season,
+      createdAt: new Date().toISOString(),
+    });
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.season_created",
+      resourceType: "platform",
+      resourceId: stringField(created, "id") as string,
+      metadata: { name: season.name, startsAt: season.startsAt, endsAt: season.endsAt },
+    });
+    sendJson(response, 201, { data: { season: created } });
+    return;
+  }
+
+  const deleteSeasonMatch = path.match(/^\/v1\/admin\/seasons\/([^/]+)$/);
+  if (method === "DELETE" && deleteSeasonMatch) {
+    requirePlatformAdmin(actor);
+    const seasonId = decodeAdminIdentifier(deleteSeasonMatch[1], "season");
+    if (!(await context.repository.deleteSeason(seasonId))) {
+      throw new ApiError(404, "SEASON_NOT_FOUND", "The season was not found.");
+    }
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.season_deleted",
+      resourceType: "platform",
+      resourceId: seasonId,
+    });
+    sendJson(response, 200, { data: { deleted: true, seasonId } });
+    return;
+  }
+
+  // The organization decides whether its own headcount and readiness appear in
+  // the public board, mirroring how individuals opt into the global ranking.
+  if (method === "POST" && path === "/v1/admin/organization/ranking-opt-in") {
+    const organizationId = requireOrganizationAdmin(actor);
+    const body = await readJson(request);
+    const optIn = booleanBodyField(body, "optIn", "INVALID_RANKING_OPT_IN");
+    const organization = await context.repository.setOrganizationRankingOptIn(
+      organizationId,
+      optIn,
+    );
+    if (!organization) {
+      throw new ApiError(
+        404,
+        "ORGANIZATION_NOT_FOUND",
+        "The organization was not found.",
+      );
+    }
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: actor.id,
+      action: "admin.organization_ranking_opt_in_changed",
+      resourceType: "organization",
+      resourceId: organizationId,
+      metadata: { optIn },
+    });
+    sendJson(response, 200, { data: { organization } });
     return;
   }
 

@@ -31,6 +31,7 @@ import {
   type AdminPageQuery,
   type AdminPageResult,
   type OrganizationCreateInput,
+  type SeasonInput,
   type JsonObject,
 } from "./types.ts";
 import type {
@@ -159,6 +160,16 @@ function auditLogFromRow(row: Row, metadata: Record<string, unknown>): JsonValue
     metadata: metadata as JsonValue,
     actorIp: (row.actor_ip as string | null) ?? null,
     createdAt: row.created_at,
+  };
+}
+
+function seasonFromRow(row: Row): JsonValue {
+  return {
+    id: row.id,
+    name: row.name,
+    slug: row.slug,
+    startsAt: row.starts_at,
+    endsAt: row.ends_at,
   };
 }
 
@@ -528,6 +539,15 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         occurred_at TEXT NOT NULL
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS ranking_seasons (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        slug TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        starts_at TEXT NOT NULL,
+        ends_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS access_tickets (
         ticket_hash TEXT PRIMARY KEY,
         run_id TEXT NOT NULL REFERENCES runtime_runs(id) ON DELETE CASCADE,
@@ -592,6 +612,12 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       "TEXT NOT NULL DEFAULT '{\"questions\":[]}'",
     );
     ensureColumn(this.database, "audit_logs", "actor_ip", "TEXT");
+    ensureColumn(
+      this.database,
+      "organizations",
+      "ranking_opt_in",
+      "INTEGER NOT NULL DEFAULT 0 CHECK (ranking_opt_in IN (0, 1))",
+    );
     ensureColumn(this.database, "users", "affiliation", "TEXT");
     ensureColumn(this.database, "users", "terms_agreed_at", "TEXT");
     ensureColumn(this.database, "users", "terms_version", "TEXT");
@@ -1534,7 +1560,10 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         .all(filter.userId) as Row[];
       organizations = this.database
         .prepare(
-          `SELECT id, name, slug FROM organizations
+          `SELECT id, name, slug, ranking_opt_in,
+                  (SELECT count(*) FROM organization_memberships m
+                    WHERE m.organization_id = organizations.id) AS member_count
+             FROM organizations
             WHERE id IN (
               SELECT organization_id FROM organization_memberships WHERE user_id = ?
             )`,
@@ -1562,7 +1591,12 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         )
         .all(filter.organizationId) as Row[];
       organizations = this.database
-        .prepare("SELECT id, name, slug FROM organizations WHERE id = ?")
+        .prepare(
+          `SELECT id, name, slug, ranking_opt_in,
+                  (SELECT count(*) FROM organization_memberships m
+                    WHERE m.organization_id = organizations.id) AS member_count
+             FROM organizations WHERE id = ?`,
+        )
         .all(filter.organizationId) as Row[];
       evidence = this.database
         .prepare(
@@ -1585,7 +1619,12 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         )
         .all() as Row[];
       organizations = this.database
-        .prepare("SELECT id, name, slug FROM organizations")
+        .prepare(
+          `SELECT id, name, slug, ranking_opt_in,
+                  (SELECT count(*) FROM organization_memberships m
+                    WHERE m.organization_id = organizations.id) AS member_count
+             FROM organizations`,
+        )
         .all() as Row[];
       evidence = this.database
         .prepare(
@@ -1611,6 +1650,8 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         id: row.id,
         name: row.name,
         slug: row.slug,
+        rankingOptIn: row.ranking_opt_in === 1,
+        memberCount: Number(row.member_count ?? 0),
       })),
       evidence: evidence.map((row) => {
         const storedSkills = parseJson<Record<string, unknown>>(row.skills_json, {});
@@ -2059,6 +2100,95 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       .run(agreedAt, termsVersion, agreedAt, privacyVersion, userId);
     if (result.changes !== 1) return null;
     return this.getUser(userId);
+  }
+
+  getActiveSeason(at: string): JsonValue | null {
+    const row = this.database
+      .prepare(
+        `SELECT * FROM ranking_seasons
+          WHERE starts_at <= ? AND ends_at > ?
+          ORDER BY starts_at DESC LIMIT 1`,
+      )
+      .get(at, at) as Row | undefined;
+    return row ? seasonFromRow(row) : null;
+  }
+
+  listSeasons(): JsonValue[] {
+    const rows = this.database
+      .prepare("SELECT * FROM ranking_seasons ORDER BY starts_at DESC")
+      .all() as Row[];
+    return rows.map(seasonFromRow);
+  }
+
+  createSeason(input: SeasonInput): JsonValue {
+    const overlap = this.database
+      .prepare(
+        `SELECT id FROM ranking_seasons
+          WHERE starts_at < ? AND ends_at > ?`,
+      )
+      .get(input.endsAt, input.startsAt) as Row | undefined;
+    if (overlap) {
+      throw new RepositoryError(
+        "SEASON_OVERLAPS",
+        "A season already covers part of that period.",
+        409,
+      );
+    }
+    try {
+      this.database
+        .prepare(
+          `INSERT INTO ranking_seasons
+            (id, name, slug, starts_at, ends_at, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          input.id,
+          input.name,
+          input.slug,
+          input.startsAt,
+          input.endsAt,
+          input.createdAt,
+        );
+    } catch {
+      throw new RepositoryError(
+        "SEASON_EXISTS",
+        "A season with that slug already exists.",
+        409,
+      );
+    }
+    const row = this.database
+      .prepare("SELECT * FROM ranking_seasons WHERE id = ?")
+      .get(input.id) as Row;
+    return seasonFromRow(row);
+  }
+
+  deleteSeason(seasonId: string): boolean {
+    return (
+      this.database
+        .prepare("DELETE FROM ranking_seasons WHERE id = ?")
+        .run(seasonId).changes === 1
+    );
+  }
+
+  setOrganizationRankingOptIn(
+    organizationId: string,
+    optIn: boolean,
+  ): JsonValue | null {
+    const result = this.database
+      .prepare("UPDATE organizations SET ranking_opt_in = ? WHERE id = ?")
+      .run(optIn ? 1 : 0, organizationId);
+    if (result.changes !== 1) return null;
+    const row = this.database
+      .prepare(
+        `SELECT o.*,
+                (SELECT count(*) FROM organization_memberships m
+                  WHERE m.organization_id = o.id) AS member_count,
+                (SELECT count(*) FROM labs l
+                  WHERE l.organization_id = o.id) AS lab_count
+           FROM organizations o WHERE o.id = ?`,
+      )
+      .get(organizationId) as Row;
+    return adminOrganizationFromRow(row) as JsonValue;
   }
 
   findAvailableHandle(base: string): string {

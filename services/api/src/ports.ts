@@ -8,6 +8,7 @@ import type {
   LabAccessMethod,
   LabGenerationInput,
   OrganizationCreateInput,
+  SeasonInput,
   ResolvedRegistrationInput,
   RuntimeRunInput,
   RuntimeRunStatusInput,
@@ -113,6 +114,15 @@ export interface PlatformRepository {
   ): MaybePromise<unknown | null>;
   /** Returns `base`, or the first free `base2`, `base3`, ... variant. */
   findAvailableHandle(base: string): MaybePromise<string>;
+  /** The season covering `at`, or null when none is running. */
+  getActiveSeason(at: string): MaybePromise<unknown | null>;
+  listSeasons(): MaybePromise<unknown[]>;
+  createSeason(input: SeasonInput): MaybePromise<unknown>;
+  deleteSeason(seasonId: string): MaybePromise<boolean>;
+  setOrganizationRankingOptIn(
+    organizationId: string,
+    optIn: boolean,
+  ): MaybePromise<unknown | null>;
   /** Records agreement for an account that predates the consent requirement. */
   recordUserConsent(
     userId: string,

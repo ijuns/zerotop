@@ -129,6 +129,15 @@ export interface OrganizationCreateInput {
   createdAt: string;
 }
 
+export interface SeasonInput {
+  id: string;
+  name: string;
+  slug: string;
+  startsAt: string;
+  endsAt: string;
+  createdAt: string;
+}
+
 export interface AdminPageQuery {
   limit: number;
   offset: number;

@@ -28,6 +28,7 @@ import {
   type AdminPageResult,
   type LabGenerationInput,
   type OrganizationCreateInput,
+  type SeasonInput,
   type RegistrationInput,
   type ResolvedRegistrationInput,
   type RuntimeRunInput,
@@ -103,6 +104,11 @@ const MIGRATIONS = [
     version: 13,
     name: "audit_source_address",
     url: new URL("../migrations/013_audit_source_address.sql", import.meta.url),
+  },
+  {
+    version: 14,
+    name: "ranking_seasons",
+    url: new URL("../migrations/014_ranking_seasons.sql", import.meta.url),
   },
 ] as const;
 
@@ -203,6 +209,16 @@ function auditLogFromRow(row: Row): unknown {
     metadata: jsonValue<Record<string, unknown>>(row.metadata_json, {}),
     actorIp: (row.actor_ip as string | null) ?? null,
     createdAt: timestamp(row.created_at),
+  };
+}
+
+function seasonFromRow(row: Row): unknown {
+  return {
+    id: row.id,
+    name: row.name,
+    slug: row.slug,
+    startsAt: timestamp(row.starts_at),
+    endsAt: timestamp(row.ends_at),
   };
 }
 
@@ -1171,7 +1187,10 @@ export class PostgresRepository implements PlatformRepository {
         parameters,
       ),
       this.pool.query(
-        `SELECT o.id, o.name, o.slug FROM organizations o ${organizationWhere}`,
+        `SELECT o.id, o.name, o.slug, o.ranking_opt_in,
+                (SELECT count(*) FROM organization_memberships m
+                  WHERE m.organization_id = o.id) AS member_count
+           FROM organizations o ${organizationWhere}`,
         parameters,
       ),
       this.pool.query(
@@ -1198,6 +1217,8 @@ export class PostgresRepository implements PlatformRepository {
         id: row.id,
         name: row.name,
         slug: row.slug,
+        rankingOptIn: row.ranking_opt_in === true,
+        memberCount: Number(row.member_count ?? 0),
       })),
       evidence: evidenceResult.rows.map((row: Row) => {
         const storedSkills = jsonValue<Record<string, unknown>>(row.skills_json, {});
@@ -1571,6 +1592,92 @@ export class PostgresRepository implements PlatformRepository {
     );
     if (result.rowCount !== 1) return null;
     return this.getUser(userId);
+  }
+
+  async getActiveSeason(at: string): Promise<unknown | null> {
+    const result = await this.pool.query(
+      `SELECT * FROM ranking_seasons
+        WHERE starts_at <= $1 AND ends_at > $1
+        ORDER BY starts_at DESC LIMIT 1`,
+      [at],
+    );
+    return result.rowCount === 0 ? null : seasonFromRow(result.rows[0]);
+  }
+
+  async listSeasons(): Promise<unknown[]> {
+    const result = await this.pool.query(
+      "SELECT * FROM ranking_seasons ORDER BY starts_at DESC",
+    );
+    return result.rows.map(seasonFromRow);
+  }
+
+  async createSeason(input: SeasonInput): Promise<unknown> {
+    const overlap = await this.pool.query(
+      "SELECT id FROM ranking_seasons WHERE starts_at < $1 AND ends_at > $2",
+      [input.endsAt, input.startsAt],
+    );
+    if (overlap.rowCount > 0) {
+      throw new RepositoryError(
+        "SEASON_OVERLAPS",
+        "A season already covers part of that period.",
+        409,
+      );
+    }
+    try {
+      await this.pool.query(
+        `INSERT INTO ranking_seasons
+          (id, name, slug, starts_at, ends_at, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [input.id, input.name, input.slug, input.startsAt, input.endsAt, input.createdAt],
+      );
+    } catch (error: unknown) {
+      if (
+        typeof error === "object" && error !== null && "code" in error &&
+        error.code === "23505"
+      ) {
+        throw new RepositoryError(
+          "SEASON_EXISTS",
+          "A season with that slug already exists.",
+          409,
+        );
+      }
+      throw error;
+    }
+    const result = await this.pool.query(
+      "SELECT * FROM ranking_seasons WHERE id = $1",
+      [input.id],
+    );
+    return seasonFromRow(result.rows[0]);
+  }
+
+  async deleteSeason(seasonId: string): Promise<boolean> {
+    const result = await this.pool.query(
+      "DELETE FROM ranking_seasons WHERE id = $1",
+      [seasonId],
+    );
+    return result.rowCount === 1;
+  }
+
+  async setOrganizationRankingOptIn(
+    organizationId: string,
+    optIn: boolean,
+  ): Promise<unknown | null> {
+    const updated = await this.pool.query(
+      "UPDATE organizations SET ranking_opt_in = $1 WHERE id = $2 RETURNING id",
+      [optIn, organizationId],
+    );
+    if (updated.rowCount !== 1) return null;
+    const result = await this.pool.query(
+      `SELECT o.id, o.name, o.slug, o.join_code_rotated_at, o.created_at,
+              o.ranking_opt_in,
+              (SELECT count(*) FROM organization_memberships m
+                WHERE m.organization_id = o.id) AS member_count,
+              (SELECT count(*) FROM labs l
+                WHERE l.organization_id = o.id) AS lab_count
+         FROM organizations o WHERE o.id = $1`,
+      [organizationId],
+    );
+    return adminOrganizationFromRow(result.rows[0]);
   }
 
   async findAvailableHandle(base: string): Promise<string> {

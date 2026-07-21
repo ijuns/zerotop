@@ -32,6 +32,10 @@ import {
   type PlatformCapabilityReport,
   type PlatformRole,
   type QuestionType,
+  RANKING_DOMAINS,
+  type RankingDomain,
+  type OrganizationRankingEntry,
+  type RankingEntry,
   type RankingPeriod,
   type RankingResponse,
   type RankingScope,
@@ -403,6 +407,28 @@ function feedbackLabel(code: string) {
   }[code] || code;
 }
 
+/**
+ * Season boundaries are stored as UTC instants and entered that way by the
+ * administrator, so the label is rendered in UTC too. Formatting locally would
+ * show an end of 09-30T23:59Z as "10.01" east of Greenwich.
+ */
+function formatSeasonDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return month + "." + day;
+}
+
+function RankChange({ change }: { change: number }) {
+  if (change === 0) return <span className="rank-change">—</span>;
+  return (
+    <span className={change > 0 ? "rank-change is-up" : "rank-change is-down"}>
+      {change > 0 ? "↑" : "↓"} {Math.abs(change)}
+    </span>
+  );
+}
+
 function StatusDot({ state }: { state: HealthState }) {
   const label =
     state === "online" ? "API 정상" : state === "offline" ? "API 연결 실패" : "API 확인 중";
@@ -530,6 +556,9 @@ export default function HomePage() {
   const [reportData, setReportData] = useState<CapabilityReport | null>(null);
   const [reportError, setReportError] = useState<string | null>(null);
   const [rankingScope, setRankingScope] = useState<RankingScope>("global");
+  const [rankingBoard, setRankingBoard] = useState<"individual" | "organization">("individual");
+  const [rankingDomain, setRankingDomain] = useState<RankingDomain | null>(null);
+  const [rankingPolicyOpen, setRankingPolicyOpen] = useState(false);
   const [rankingPeriod, setRankingPeriod] = useState<RankingPeriod>("weekly");
   const [rankingState, setRankingState] = useState<DataState>("idle");
   const [rankingData, setRankingData] = useState<RankingResponse | null>(null);
@@ -678,12 +707,16 @@ export default function HomePage() {
     }
   }, []);
 
-  const loadRankings = useCallback(async (scope: RankingScope, period: RankingPeriod) => {
+  const loadRankings = useCallback(async (
+    scope: RankingScope,
+    period: RankingPeriod,
+    domain: RankingDomain | null = null,
+  ) => {
     setRankingState("loading");
     setRankingError(null);
     setRankingData(null);
     try {
-      const result = await api.rankings(scope, period);
+      const result = await api.rankings(scope, period, domain);
       setRankingData(result);
       setRankingState("ready");
     } catch (error) {
@@ -724,11 +757,12 @@ export default function HomePage() {
       setRankingError(null);
       return;
     }
-    void loadRankings(rankingScope, rankingPeriod);
+    void loadRankings(rankingScope, rankingPeriod, rankingDomain);
   }, [
     activeView,
     hasOrganization,
     loadRankings,
+    rankingDomain,
     rankingPeriod,
     rankingScope,
     user,
@@ -1912,33 +1946,168 @@ export default function HomePage() {
   };
 
   const renderRanking = () => {
-    const rankingUnavailable = rankingScope === "organization" && user && !hasOrganization;
+    const season = rankingData?.season ?? null;
+    const viewer = rankingData?.viewer;
+    const organizationBoard = rankingBoard === "organization";
+    const podium = organizationBoard
+      ? (rankingData?.organizations ?? []).slice(0, 3)
+      : (rankingData?.entries ?? []).slice(0, 3);
+    // The mockup orders the podium 2 / 1 / 3 so the leader sits centre stage.
+    const podiumOrder = [podium[1], podium[0], podium[2]];
+    const seasonRange = season
+      ? formatSeasonDate(season.startsAt) + " – " + formatSeasonDate(season.endsAt)
+      : "상시 집계";
+    const rowsEmpty = organizationBoard
+      ? (rankingData?.organizations.length ?? 0) === 0
+      : (rankingData?.entries.length ?? 0) === 0;
+
     return (
       <>
-        <section className="hero-row hero-row--compact"><div><div className="eyebrow">SEASON RANKING</div><h1>시즌 랭킹</h1><p>공개에 동의하고 검증된 실습 결과만 기간별 랭킹에 반영됩니다.</p></div>{rankingData && <span className="report-updated">기준 {formatDate(rankingData.generatedAt)}</span>}</section>
-        <section className="panel ranking-panel">
-          <div className="ranking-toolbar">
-            <div className="ranking-tabs" role="tablist" aria-label="랭킹 범위">
-              <button type="button" role="tab" aria-selected={rankingScope === "global"} onClick={() => setRankingScope("global")}>글로벌 개인 랭킹</button>
-              <button type="button" role="tab" aria-selected={rankingScope === "organization"} onClick={() => setRankingScope("organization")}>조직 내부 랭킹</button>
-            </div>
-            <label className="period-select"><span>집계 기간</span><select value={rankingPeriod} onChange={(event) => setRankingPeriod(event.target.value as RankingPeriod)}><option value="weekly">주간</option><option value="monthly">월간</option><option value="all_time">전체</option></select></label>
+        <section className="hero-row hero-row--compact">
+          <div>
+            <div className="eyebrow">VERIFIED SEASON RANKING</div>
+            <h1>시즌 랭킹</h1>
+            <p>AI와 정책 엔진이 정상 완료로 검증한 실습 결과만 반영되는 실전 역량 순위입니다.</p>
           </div>
-          {rankingUnavailable ? (
-            <EmptyState icon="◇" title="조직 소속 사용자만 확인할 수 있습니다" description="조직 내부 랭킹은 같은 조직 구성원에게만 공개됩니다." />
-          ) : rankingState === "idle" || rankingState === "loading" ? (
+          <div className="ranking-hero-actions">
+            <button className="secondary-button" type="button" onClick={() => setRankingPolicyOpen((open) => !open)}>점수 산정 기준</button>
+            <button className="primary-button" type="button" onClick={() => chooseView("report-personal")}>내 공개 설정</button>
+          </div>
+        </section>
+
+        <section className="season-banner">
+          <div>
+            <span className="season-badge">{season ? season.name : "SEASON"}</span>
+            <h2>검증된 성과로 경쟁하는 시즌</h2>
+            <p>난이도, 증거 정확도, 필수 과제 완료율을 보정해 단순 문제 풀이 수보다 실제 대응 역량을 평가합니다.</p>
+          </div>
+          <div className="season-banner__meta">
+            <span>현재 시즌</span>
+            <strong>{seasonRange}</strong>
+            {rankingData && <small>{formatDate(rankingData.generatedAt)} 기준</small>}
+          </div>
+        </section>
+
+        <div className="ranking-controls">
+          <div className="ranking-tabs" role="tablist" aria-label="랭킹 범위">
+            <button type="button" role="tab" aria-selected={!organizationBoard} className={!organizationBoard ? "is-active" : ""} onClick={() => setRankingBoard("individual")}>개인 전체</button>
+            <button type="button" role="tab" aria-selected={organizationBoard} className={organizationBoard ? "is-active" : ""} onClick={() => setRankingBoard("organization")}>조직 종합</button>
+          </div>
+          <div className="ranking-domains" role="group" aria-label="영역 필터">
+            <button type="button" className={rankingDomain === null ? "is-active" : ""} onClick={() => setRankingDomain(null)}>종합</button>
+            {RANKING_DOMAINS.map((item) => (
+              <button key={item.key} type="button" className={rankingDomain === item.key ? "is-active" : ""} onClick={() => setRankingDomain(item.key)}>{item.label}</button>
+            ))}
+          </div>
+        </div>
+
+        {!organizationBoard && viewer && (
+          <section className="metric-grid metric-grid--four" aria-label="내 시즌 요약">
+            <article className="metric-card"><span>내 순위</span><strong>{viewer.rank ? viewer.rank + "위" : "—"}</strong><small>{viewer.totalParticipants.toLocaleString("ko-KR")}명 중{viewer.topPercent !== null ? " · 상위 " + viewer.topPercent + "%" : ""}</small></article>
+            <article className="metric-card"><span>시즌 점수</span><strong>{viewer.points.toLocaleString("ko-KR")} XP</strong><small>직전 기간 대비 {viewer.pointsDelta >= 0 ? "+" : ""}{viewer.pointsDelta.toLocaleString("ko-KR")}</small></article>
+            <article className="metric-card"><span>완료 Lab</span><strong>{viewer.completedLabs}개</strong><small>검증 완료 결과 · 정확도 {viewer.accuracy}%</small></article>
+            <article className="metric-card"><span>연속 학습</span><strong>{viewer.streakDays}일</strong><small>개인 최고 {viewer.bestStreakDays}일</small></article>
+          </section>
+        )}
+
+        {rankingState === "ready" && podium[0] && (
+          <section className="podium" aria-label="상위 3위">
+            {podiumOrder.map((item, index) => {
+              if (!item) return <div key={"empty-" + index} className="podium-card podium-card--empty" aria-hidden="true" />;
+              const place = organizationBoard
+                ? (item as OrganizationRankingEntry).rank
+                : (item as RankingEntry).rank;
+              const name = organizationBoard
+                ? (item as OrganizationRankingEntry).name
+                : (item as RankingEntry).handle;
+              const value = organizationBoard
+                ? String((item as OrganizationRankingEntry).readiness)
+                : (item as RankingEntry).points.toLocaleString("ko-KR") + " XP";
+              return (
+                <article key={name} className={place === 1 ? "podium-card podium-card--leader" : "podium-card"}>
+                  <span className="podium-avatar" aria-hidden="true">{name.slice(0, 2).toUpperCase()}</span>
+                  <span className="podium-place">{place}위</span>
+                  <strong>{name}</strong>
+                  <span className="podium-score">{value}</span>
+                  <i className="podium-rank" aria-hidden="true">{place}</i>
+                </article>
+              );
+            })}
+          </section>
+        )}
+
+        <section className="panel ranking-panel">
+          <div className="panel-heading">
+            <div>
+              <h2>{organizationBoard ? "조직 종합 순위" : "공개 개인 순위"}</h2>
+              <p>{organizationBoard ? "랭킹 공개에 동의한 조직만 · 규모를 보정한 준비도 기준" : "랭킹 공개에 동의한 사용자와 검증 완료 결과만 표시"}</p>
+            </div>
+            <span className="ranking-badge">AI 난이도 보정 적용</span>
+          </div>
+
+          {rankingState === "idle" || rankingState === "loading" ? (
             <DataLoading label="시즌 랭킹" />
           ) : rankingState === "error" ? (
-            <EmptyState icon="!" title="랭킹을 불러오지 못했습니다" description={rankingError || "잠시 후 다시 시도해 주세요."} action={<button className="secondary-button" type="button" onClick={() => void loadRankings(rankingScope, rankingPeriod)}>다시 시도</button>} />
-          ) : !rankingData || rankingData.entries.length === 0 ? (
-            <EmptyState icon="△" title="집계된 시즌 기록이 없습니다" description={rankingScope === "organization" ? "조직 구성원의 검증된 기록이 생기면 내부 순위가 표시됩니다." : "공개에 동의한 사용자의 검증된 기록이 생기면 순위가 표시됩니다."} />
+            <EmptyState icon="!" title="랭킹을 불러오지 못했습니다" description={rankingError || "잠시 후 다시 시도해 주세요."} action={<button className="secondary-button" type="button" onClick={() => void loadRankings(rankingScope, rankingPeriod, rankingDomain)}>다시 시도</button>} />
+          ) : rowsEmpty ? (
+            <EmptyState icon="△" title={organizationBoard ? "공개에 동의한 조직이 없습니다" : "집계된 시즌 기록이 없습니다"} description={organizationBoard ? "조직 관리자가 랭킹 공개에 동의하면 순위가 표시됩니다." : "공개에 동의한 사용자의 검증된 기록이 생기면 순위가 표시됩니다."} />
+          ) : organizationBoard ? (
+            <div className="table-scroll"><table className="data-table ranking-table"><thead><tr><th>순위</th><th>조직</th><th>규모</th><th>준비도</th><th>참여율</th><th>완료율</th><th>변동</th></tr></thead><tbody>
+              {rankingData?.organizations.map((entry) => (
+                <tr key={entry.organizationId} className={rankingData.currentOrganization?.organizationId === entry.organizationId ? "is-current-user" : ""}>
+                  <td><strong className="rank-number">{entry.rank}</strong></td>
+                  <td><strong>{entry.name}</strong>{rankingData.currentOrganization?.organizationId === entry.organizationId && <span className="rank-mine">MY</span>}</td>
+                  <td className="number-cell">{entry.memberCount}명</td>
+                  <td className="number-cell">{entry.readiness}</td>
+                  <td className="number-cell">{entry.participationRate}%</td>
+                  <td className="number-cell">{entry.completionRate}%</td>
+                  <td><RankChange change={entry.change} /></td>
+                </tr>
+              ))}
+            </tbody></table></div>
           ) : (
-            <>
-              {rankingData.currentUser && <div className="my-rank"><span>내 순위</span><strong>{rankingData.currentUser.rank}위</strong><small>{rankingData.currentUser.points.toLocaleString("ko-KR")}점 · Lab {rankingData.currentUser.completedLabs}개</small></div>}
-              <div className="table-scroll"><table className="data-table ranking-table"><thead><tr><th>순위</th><th>사용자</th><th>조직</th><th>포인트</th><th>완료 Lab</th><th>변동</th></tr></thead><tbody>{rankingData.entries.map((entry) => <tr key={`${entry.userId}-${entry.rank}`} className={rankingData.currentUser?.userId === entry.userId ? "is-current-user" : ""}><td><strong className="rank-number">{entry.rank}</strong></td><td><strong>@{entry.handle}</strong></td><td>{entry.organizationName || "개인"}</td><td className="number-cell">{entry.points.toLocaleString("ko-KR")}</td><td className="number-cell">{entry.completedLabs}</td><td><span className={entry.change > 0 ? "rank-change is-up" : entry.change < 0 ? "rank-change is-down" : "rank-change"}>{entry.change > 0 ? `+${entry.change}` : entry.change}</span></td></tr>)}</tbody></table></div>
-            </>
+            <div className="table-scroll"><table className="data-table ranking-table"><thead><tr><th>순위</th><th>사용자</th><th>주요 영역</th><th>시즌 점수</th><th>완료 Lab</th><th>정확도</th><th>변동</th></tr></thead><tbody>
+              {rankingData?.entries.map((entry) => (
+                <tr key={entry.userId + "-" + entry.rank} className={rankingData.currentUser?.userId === entry.userId ? "is-current-user" : ""}>
+                  <td><strong className="rank-number">{entry.rank}</strong></td>
+                  <td><strong>{entry.handle}</strong>{rankingData.currentUser?.userId === entry.userId && <span className="rank-mine">MY</span>}</td>
+                  <td>{entry.primaryDomain?.label ?? "—"}</td>
+                  <td className="number-cell">{entry.points.toLocaleString("ko-KR")} XP</td>
+                  <td className="number-cell">{entry.completedLabs}</td>
+                  <td className="number-cell">{entry.accuracy}%</td>
+                  <td><RankChange change={entry.change} /></td>
+                </tr>
+              ))}
+            </tbody></table></div>
           )}
         </section>
+
+        <div className="ranking-footer">
+          <section className="panel scoring-policy">
+            <span className="panel-kicker">SCORING POLICY</span>
+            <h2>순위 산정 방식</h2>
+            <ol>
+              <li><strong>난이도 보정</strong><small>초급 100 · 중급 250 · 고급 500</small></li>
+              <li><strong>증거 정확도</strong><small>필수 과제와 대응 증거의 완성도</small></li>
+              <li><strong>시간 · 힌트</strong><small>시간 보너스 최대 20% · 힌트 감점 최대 20%</small></li>
+            </ol>
+          </section>
+          <section className="panel privacy-scope">
+            <span className="panel-kicker">PRIVACY BY SCOPE</span>
+            <h2>랭킹에서도 활동 범위를 분리합니다.</h2>
+            <p>글로벌 개인 랭킹은 공개에 동의한 핸들만 표시합니다. 조직 종합 순위는 공개에 동의한 조직만 집계되며, 조직 관리자는 개인 워크스페이스 기록을 볼 수 없습니다.</p>
+            <button className="primary-button primary-button--wide" type="button" onClick={() => chooseView(hasOrganization ? "report-organization" : "signup")}>
+              {hasOrganization ? "조직 리포트 보기" : "조직 연결 후 내부 랭킹 보기"}
+            </button>
+          </section>
+        </div>
+
+        {rankingPolicyOpen && (
+          <section className="panel" role="note">
+            <h2>점수 산정 기준</h2>
+            <p>시즌 점수는 검증을 통과한 실습의 획득 점수 합계입니다. 정확도는 획득 점수를 배점 합계로 나눈 값이며, 조직 준비도는 정확도 50% · 참여율 30% · 완료율 20%의 가중 평균입니다.</p>
+          </section>
+        )}
       </>
     );
   };

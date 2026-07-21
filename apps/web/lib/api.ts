@@ -172,6 +172,22 @@ export type CapabilityReport =
   | OrganizationCapabilityReport
   | PlatformCapabilityReport;
 
+export const RANKING_DOMAINS = [
+  { key: "vulnerability", label: "취약점 분석" },
+  { key: "detection", label: "탐지 · 조사" },
+  { key: "response", label: "완화 · 복구" },
+] as const;
+
+export type RankingDomain = (typeof RANKING_DOMAINS)[number]["key"];
+
+export interface RankingSeason {
+  id: string;
+  name: string;
+  slug: string;
+  startsAt: string;
+  endsAt: string;
+}
+
 export interface RankingEntry {
   rank: number;
   userId: string;
@@ -180,14 +196,44 @@ export interface RankingEntry {
   points: number;
   completedLabs: number;
   change: number;
+  accuracy: number;
+  primaryDomain: { key: RankingDomain; label: string } | null;
+}
+
+export interface OrganizationRankingEntry {
+  rank: number;
+  organizationId: string;
+  name: string;
+  memberCount: number;
+  readiness: number;
+  participationRate: number;
+  completionRate: number;
+  change: number;
+}
+
+export interface RankingViewerSummary {
+  rank: number | null;
+  totalParticipants: number;
+  topPercent: number | null;
+  points: number;
+  pointsDelta: number;
+  completedLabs: number;
+  accuracy: number;
+  streakDays: number;
+  bestStreakDays: number;
 }
 
 export interface RankingResponse {
   scope: RankingScope;
   period: RankingPeriod;
   generatedAt: string;
+  season: RankingSeason | null;
+  domain: RankingDomain | null;
   entries: RankingEntry[];
+  organizations: OrganizationRankingEntry[];
+  viewer: RankingViewerSummary;
   currentUser?: RankingEntry;
+  currentOrganization?: OrganizationRankingEntry;
 }
 
 export interface ValidationCheck {
@@ -693,6 +739,44 @@ function rankingEntryOf(value: unknown): RankingEntry {
     points: numberValue(item.points ?? item.score),
     completedLabs: numberValue(item.completedLabs ?? item.completed_labs),
     change: numberValue(item.change ?? item.rankChange ?? item.rank_change),
+    accuracy: numberValue(item.accuracy),
+    primaryDomain: isRecord(item.primaryDomain)
+      ? {
+          key: stringValue(item.primaryDomain.key) as RankingDomain,
+          label: stringValue(item.primaryDomain.label),
+        }
+      : null,
+  };
+}
+
+function organizationRankingEntryOf(value: unknown): OrganizationRankingEntry {
+  const item = isRecord(value) ? value : {};
+  return {
+    rank: numberValue(item.rank),
+    organizationId: stringValue(item.organizationId ?? item.organization_id),
+    name: stringValue(item.name, "이름 없는 조직"),
+    memberCount: numberValue(item.memberCount ?? item.member_count),
+    readiness: numberValue(item.readiness),
+    participationRate: numberValue(item.participationRate ?? item.participation_rate),
+    completionRate: numberValue(item.completionRate ?? item.completion_rate),
+    change: numberValue(item.change),
+  };
+}
+
+function rankingViewerOf(value: unknown): RankingViewerSummary {
+  const item = isRecord(value) ? value : {};
+  const rank = item.rank;
+  const topPercent = item.topPercent ?? item.top_percent;
+  return {
+    rank: typeof rank === "number" ? rank : null,
+    totalParticipants: numberValue(item.totalParticipants ?? item.total_participants),
+    topPercent: typeof topPercent === "number" ? topPercent : null,
+    points: numberValue(item.points),
+    pointsDelta: numberValue(item.pointsDelta ?? item.points_delta),
+    completedLabs: numberValue(item.completedLabs ?? item.completed_labs),
+    accuracy: numberValue(item.accuracy),
+    streakDays: numberValue(item.streakDays ?? item.streak_days),
+    bestStreakDays: numberValue(item.bestStreakDays ?? item.best_streak_days),
   };
 }
 
@@ -705,7 +789,22 @@ function rankingOf(value: unknown): RankingResponse {
         ? item.period
         : "weekly",
     generatedAt: stringValue(item.generatedAt ?? item.generated_at),
+    season: isRecord(item.season)
+      ? {
+          id: stringValue(item.season.id),
+          name: stringValue(item.season.name),
+          slug: stringValue(item.season.slug),
+          startsAt: stringValue(item.season.startsAt ?? item.season.starts_at),
+          endsAt: stringValue(item.season.endsAt ?? item.season.ends_at),
+        }
+      : null,
+    domain: typeof item.domain === "string" ? (item.domain as RankingDomain) : null,
     entries: arrayValue(item.entries ?? item.rankings).map(rankingEntryOf),
+    organizations: arrayValue(item.organizations).map(organizationRankingEntryOf),
+    viewer: rankingViewerOf(item.viewer),
+    ...(item.currentOrganization
+      ? { currentOrganization: organizationRankingEntryOf(item.currentOrganization) }
+      : {}),
     ...(item.currentUser || item.current_user
       ? { currentUser: rankingEntryOf(item.currentUser ?? item.current_user) }
       : {}),
@@ -1261,11 +1360,15 @@ export const api = {
       entityOf<unknown>(await request("/v1/admin/reports/platform"), "report"),
     ),
 
-  rankings: async (scope: RankingScope, period: RankingPeriod) =>
+  rankings: async (
+    scope: RankingScope,
+    period: RankingPeriod,
+    domain?: RankingDomain | null,
+  ) =>
     rankingOf(
       entityOf<unknown>(
         await request(
-          `/v1/rankings?scope=${encodeURIComponent(scope)}&period=${encodeURIComponent(period)}`,
+          `/v1/rankings?scope=${encodeURIComponent(scope)}&period=${encodeURIComponent(period)}${domain ? `&domain=${encodeURIComponent(domain)}` : ""}`,
         ),
         "ranking",
       ),
@@ -1304,6 +1407,15 @@ export const api = {
     adminPageOf(
       await request(`/v1/admin/audit-logs${adminQueryString(query)}`),
       adminAuditLogOf,
+    ),
+
+  setOrganizationRankingOptIn: async (optIn: boolean) =>
+    entityOf<AdminOrganization>(
+      await request("/v1/admin/organization/ranking-opt-in", {
+        method: "POST",
+        body: JSON.stringify({ optIn }),
+      }),
+      "organization",
     ),
 
   organizationAuditLogs: async (query: AdminPageQuery = {}) =>

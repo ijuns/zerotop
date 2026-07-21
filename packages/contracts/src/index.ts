@@ -200,6 +200,38 @@ export interface PlatformCapabilityReport {
   }>;
 }
 
+/**
+ * Ranking domains shown as filters. Each maps to the skill keys graders emit,
+ * so the taxonomy stays in one place for both the server and the client.
+ */
+export const RANKING_DOMAINS = [
+  {
+    key: "vulnerability",
+    label: "취약점 분석",
+    skills: ["web_exploitation", "exploit_analysis", "privilege_escalation"],
+  },
+  {
+    key: "detection",
+    label: "탐지 · 조사",
+    skills: ["log_analysis", "mitre_attack"],
+  },
+  {
+    key: "response",
+    label: "완화 · 복구",
+    skills: ["incident_response"],
+  },
+] as const;
+
+export type RankingDomain = (typeof RANKING_DOMAINS)[number]["key"];
+
+export interface RankingSeason {
+  id: string;
+  name: string;
+  slug: string;
+  startsAt: string;
+  endsAt: string;
+}
+
 export interface RankingEntry {
   rank: number;
   userId: string;
@@ -208,14 +240,50 @@ export interface RankingEntry {
   points: number;
   completedLabs: number;
   change: number;
+  /** Share of available points earned, 0-100. */
+  accuracy: number;
+  /** Highest-scoring domain, or null when no graded evidence maps to one. */
+  primaryDomain: { key: RankingDomain; label: string } | null;
+}
+
+/** Aggregate standing of one organization against others that opted in. */
+export interface OrganizationRankingEntry {
+  rank: number;
+  organizationId: string;
+  name: string;
+  memberCount: number;
+  /** Composite of accuracy, participation and completion, 0-100. */
+  readiness: number;
+  participationRate: number;
+  completionRate: number;
+  change: number;
+}
+
+/** Season totals for the viewer, shown above the table. */
+export interface RankingViewerSummary {
+  rank: number | null;
+  totalParticipants: number;
+  /** Percentile position, 0-100; null until the viewer is ranked. */
+  topPercent: number | null;
+  points: number;
+  pointsDelta: number;
+  completedLabs: number;
+  accuracy: number;
+  streakDays: number;
+  bestStreakDays: number;
 }
 
 export interface RankingResponse {
   scope: RankingScope;
   period: RankingPeriod;
   generatedAt: string;
+  season: RankingSeason | null;
+  domain: RankingDomain | null;
   entries: RankingEntry[];
+  organizations: OrganizationRankingEntry[];
+  viewer: RankingViewerSummary;
   currentUser?: RankingEntry;
+  currentOrganization?: OrganizationRankingEntry;
 }
 
 export interface ApiError {
