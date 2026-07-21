@@ -45,6 +45,14 @@ spec:
           && params.data['UBUNTU_DESKTOP_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
           && 'KALI_DESKTOP_IMAGE' in params.data
           && params.data['KALI_DESKTOP_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
+          && 'RANGE_ELASTICSEARCH_IMAGE' in params.data
+          && params.data['RANGE_ELASTICSEARCH_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
+          && 'RANGE_KIBANA_IMAGE' in params.data
+          && params.data['RANGE_KIBANA_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
+          && 'RANGE_ELASTIC_AGENT_IMAGE' in params.data
+          && params.data['RANGE_ELASTIC_AGENT_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
+          && 'RANGE_SCENARIO_LOG_GENERATOR_IMAGE' in params.data
+          && params.data['RANGE_SCENARIO_LOG_GENERATOR_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
           && 'OPENVPN_GATEWAY_IMAGE' in params.data
           && params.data['OPENVPN_GATEWAY_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
           && 'SANDBOX_PROBE_IMAGE' in params.data
@@ -80,14 +88,22 @@ spec:
             && (request.namespace.startsWith('range-')
               ? (object.metadata.name == 'run-quota'
                 && object.spec.hard.size() == 9
-                && object.spec.hard['requests.cpu'] == '4'
-                && object.spec.hard['requests.memory'] == '10Gi'
-                && object.spec.hard['limits.cpu'] == '8'
-                && object.spec.hard['limits.memory'] == '16Gi'
-                && object.spec.hard['pods'] == '12'
-                && object.spec.hard['services'] == '8'
-                && object.spec.hard['count/secrets'] == '4'
-                && object.spec.hard['count/deployments.apps'] == '2'
+                && ((object.spec.hard['requests.cpu'] == '4'
+                    && object.spec.hard['requests.memory'] == '10Gi'
+                    && object.spec.hard['limits.cpu'] == '8'
+                    && object.spec.hard['limits.memory'] == '16Gi'
+                    && object.spec.hard['pods'] == '12'
+                    && object.spec.hard['services'] == '8'
+                    && object.spec.hard['count/secrets'] == '4'
+                    && object.spec.hard['count/deployments.apps'] == '2')
+                  || (object.spec.hard['requests.cpu'] == '6'
+                    && object.spec.hard['requests.memory'] == '14Gi'
+                    && object.spec.hard['limits.cpu'] == '12'
+                    && object.spec.hard['limits.memory'] == '24Gi'
+                    && object.spec.hard['pods'] == '18'
+                    && object.spec.hard['services'] == '12'
+                    && object.spec.hard['count/secrets'] == '6'
+                    && object.spec.hard['count/deployments.apps'] == '5'))
                 && object.spec.hard['count/virtualmachines.kubevirt.io'] == '1')
               : (object.metadata.name == 'validation-quota'
                 && object.spec.hard.size() == 8
@@ -127,23 +143,27 @@ spec:
                 && object.spec.ports.size() == 1
                 && object.spec.ports[0].protocol == 'UDP'
                 && object.spec.ports[0].port == 1194)
-              : (object.metadata.name in ['target', 'desktop']
+              : (object.metadata.name in ['target', 'desktop', 'elasticsearch', 'kibana']
                 && object.spec.type == 'ClusterIP'
                 && object.spec.ports.size() == 1
-                && (object.metadata.name != 'desktop'
-                  || (request.namespace.startsWith('range-')
-                    && object.spec.ports[0].protocol == 'TCP'
-                    && object.spec.ports[0].port == 6080)))))
-      message: Runtime Services are limited to the internal target/desktop endpoints and the non-NodePort UDP VPN load balancer.
+                && request.namespace.startsWith('range-')
+                && object.spec.ports[0].protocol == 'TCP'
+                && (object.metadata.name == 'target'
+                  || (object.metadata.name == 'desktop' && object.spec.ports[0].port == 6080)
+                  || (object.metadata.name == 'elasticsearch' && object.spec.ports[0].port == 9200)
+                  || (object.metadata.name == 'kibana' && object.spec.ports[0].port == 5601)))))
+      message: Runtime Services are limited to the internal target, desktop and per-run Elastic endpoints plus the non-NodePort UDP VPN load balancer.
     - expression: >-
         request.resource.resource != 'deployments'
           || (object.spec.replicas == 1
             && has(object.metadata.labels)
             && 'codegate.ai/role' in object.metadata.labels
-            && object.metadata.labels['codegate.ai/role'] in ['target', 'validation-target', 'vpn-gateway']
+            && object.metadata.labels['codegate.ai/role'] in ['target', 'validation-target', 'vpn-gateway', 'elasticsearch', 'kibana']
             && ((request.namespace.startsWith('range-')
                 && ((object.metadata.name == 'target' && object.metadata.labels['codegate.ai/role'] == 'target')
-                  || (object.metadata.name == 'openvpn-gateway' && object.metadata.labels['codegate.ai/role'] == 'vpn-gateway')))
+                  || (object.metadata.name == 'openvpn-gateway' && object.metadata.labels['codegate.ai/role'] == 'vpn-gateway')
+                  || (object.metadata.name == 'elasticsearch' && object.metadata.labels['codegate.ai/role'] == 'elasticsearch')
+                  || (object.metadata.name == 'kibana' && object.metadata.labels['codegate.ai/role'] == 'kibana')))
               || (request.namespace.startsWith('validation-')
                 && object.metadata.name == 'target'
                 && object.metadata.labels['codegate.ai/role'] == 'validation-target'))
@@ -158,20 +178,31 @@ spec:
             && has(object.spec.template.spec.securityContext.seccompProfile)
             && object.spec.template.spec.securityContext.seccompProfile.type == 'RuntimeDefault'
             && (!has(object.spec.template.spec.initContainers) || object.spec.template.spec.initContainers.size() == 0)
-            && object.spec.template.spec.containers.size() == 1
+            && (object.metadata.labels['codegate.ai/role'] == 'target'
+              ? object.spec.template.spec.containers.size() in [1, 3]
+              : object.spec.template.spec.containers.size() == 1)
             && object.spec.template.spec.containers.all(c,
               c.image.matches('^.+@sha256:[a-f0-9]{64}$')
               && (object.metadata.labels['codegate.ai/role'] == 'vpn-gateway'
                 ? c.image == params.data['OPENVPN_GATEWAY_IMAGE']
-                : params.data['TARGET_IMAGE_REGISTRIES'].split(',').exists(registry,
-                    c.image.startsWith(registry + '/')))
+                : (object.metadata.labels['codegate.ai/role'] == 'elasticsearch'
+                  ? c.image == params.data['RANGE_ELASTICSEARCH_IMAGE']
+                  : (object.metadata.labels['codegate.ai/role'] == 'kibana'
+                    ? c.image == params.data['RANGE_KIBANA_IMAGE']
+                    : (c.name == 'elastic-agent'
+                      ? c.image == params.data['RANGE_ELASTIC_AGENT_IMAGE']
+                      : (c.name == 'scenario-log-generator'
+                        ? c.image == params.data['RANGE_SCENARIO_LOG_GENERATOR_IMAGE']
+                        : params.data['TARGET_IMAGE_REGISTRIES'].split(',').exists(registry,
+                            c.image.startsWith(registry + '/')))))))
               && (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))
               && has(c.securityContext)
               && has(c.securityContext.allowPrivilegeEscalation)
               && c.securityContext.allowPrivilegeEscalation == false
               && (!has(c.securityContext.privileged) || c.securityContext.privileged == false)
-              && has(c.securityContext.readOnlyRootFilesystem)
-              && c.securityContext.readOnlyRootFilesystem == true
+              && (object.metadata.labels['codegate.ai/role'] in ['elasticsearch', 'kibana']
+                || (has(c.securityContext.readOnlyRootFilesystem)
+                  && c.securityContext.readOnlyRootFilesystem == true))
               && has(c.securityContext.capabilities)
               && has(c.securityContext.capabilities.drop)
               && 'ALL' in c.securityContext.capabilities.drop
@@ -180,7 +211,9 @@ spec:
               && has(c.resources.limits))
             && (!has(object.spec.template.spec.volumes)
               || object.spec.template.spec.volumes.all(v, has(v.emptyDir)))
-            && (object.metadata.labels['codegate.ai/role'] == 'vpn-gateway'
+            && (object.metadata.labels['codegate.ai/role'] in ['elasticsearch', 'kibana']
+              ? true
+              : (object.metadata.labels['codegate.ai/role'] == 'vpn-gateway'
               ? (object.spec.template.spec.containers.all(c,
                   has(c.securityContext.runAsUser)
                   && c.securityContext.runAsUser == 0
@@ -198,12 +231,8 @@ spec:
                 && object.spec.template.spec.securityContext.runAsGroup == 65532
                 && object.spec.template.spec.containers.all(c,
                   (!has(c.securityContext.capabilities.add)
-                    || c.securityContext.capabilities.add.size() == 0)
-                  && c.resources.requests['cpu'] == '250m'
-                  && c.resources.requests['memory'] == '256Mi'
-                  && c.resources.limits['cpu'] == '1'
-                  && c.resources.limits['memory'] == '512Mi'))))
-      message: Runtime Deployments must match the restricted target or NET_ADMIN-only VPN gateway shape; host namespaces, host ports, host paths and privileged containers are forbidden.
+                    || c.securityContext.capabilities.add.size() == 0)))))
+      message: Runtime Deployments must match the restricted target, per-run Elastic services or NET_ADMIN-only VPN gateway shape; host namespaces, host ports, host paths and privileged containers are forbidden.
     - expression: >-
         request.resource.resource != 'jobs'
           || (request.namespace.startsWith('validation-')
@@ -271,7 +300,7 @@ spec:
     - expression: >-
         request.resource.resource != 'networkpolicies'
           || ((request.namespace.startsWith('range-')
-              && object.metadata.name in ['default-deny', 'allow-target-from-clients', 'allow-workstation-to-target', 'allow-vpn-to-target', 'allow-dns', 'allow-desktop-gateway', 'allow-vpn-public', 'allow-vpn-bootstrap'])
+              && object.metadata.name in ['default-deny', 'allow-target-from-clients', 'allow-workstation-to-target', 'allow-vpn-to-target', 'allow-dns', 'allow-desktop-gateway', 'allow-vpn-public', 'allow-vpn-bootstrap', 'allow-workstation-to-kibana', 'allow-kibana-from-workstation', 'allow-kibana-to-elasticsearch', 'allow-target-agent-to-elasticsearch', 'allow-target-agent-to-kibana', 'allow-kibana-from-target-agent', 'allow-elasticsearch-ingest'])
             || (request.namespace.startsWith('validation-')
               && object.metadata.name in ['default-deny', 'allow-probe-target', 'allow-probe-dns', 'allow-target-from-probe']))
       message: The runtime may create only the approved run and validation NetworkPolicies.

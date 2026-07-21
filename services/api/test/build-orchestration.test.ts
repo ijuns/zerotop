@@ -22,6 +22,18 @@ test("generated Labs persist hidden build specs and refresh a successful immutab
           buildSpec,
           config: {
             ...input.config,
+            learning: {
+              title: "Generated CVE range",
+              summary: "Rich learner-facing curriculum",
+              prerequisites: ["HTTP fundamentals"],
+              objectives: ["Preserve the validated learning objective"],
+              sections: [{ id: "context", title: "Threat context", bodyMarkdown: "Learner-facing body that must survive the environment build." }],
+            },
+            scenario: {
+              summary: "Rich scenario summary",
+              logSources: ["nginx.access"],
+              attackChain: [{ id: "T1190", name: "Exploit Public-Facing Application", tactic: "initial-access" }],
+            },
             questions: [{ id: "red-q1", type: "single_choice", prompt: "Choose the safe action", points: 30, options: [{ id: "a", label: "Inspect" }, { id: "b", label: "Escape" }] }],
           },
         };
@@ -56,6 +68,13 @@ test("generated Labs persist hidden build specs and refresh a successful immutab
                 vulnerabilityProbes: [{ id: "cve", cveId: "CVE-2025-12345", kind: "http", method: "GET", path: "/version", expectedStatuses: [200], bodyIncludes: ["vulnerable"] }],
               },
             },
+            learning: {
+              title: "Generated CVE range",
+              summary: "Build projection",
+              sections: [{ id: "context", title: "Threat context", markdown: "Builder projection body" }],
+            },
+            scenario: { summary: "Build projection", mitreTechniques: ["T1190"] },
+            questions: [{ id: "builder-q", type: "single_choice", prompt: "Builder projection", points: 1 }],
           },
         };
       },
@@ -97,6 +116,14 @@ test("generated Labs persist hidden build specs and refresh a successful immutab
     const config = detailPayload.data.lab.config as Record<string, unknown>;
     assert.equal((config.builder as Record<string, unknown>).status, "succeeded");
     assert.equal((config.target as Record<string, unknown>).imageDigest, digest);
+    const learning = detailPayload.data.lab.learning as Record<string, unknown>;
+    assert.deepEqual(learning.objectives, ["Preserve the validated learning objective"]);
+    assert.deepEqual(learning.prerequisites, ["HTTP fundamentals"]);
+    assert.equal(((learning.sections as Array<Record<string, unknown>>)[0]).bodyMarkdown, "Learner-facing body that must survive the environment build.");
+    const scenario = detailPayload.data.lab.scenario as Record<string, unknown>;
+    assert.equal(scenario.summary, "Rich scenario summary");
+    assert.deepEqual(scenario.logSources, ["nginx.access"]);
+    assert.equal(((detailPayload.data.lab.questions as Array<Record<string, unknown>>)[0]).id, "red-q1");
     assert.equal("builderSpec" in config, false);
     assert.equal(statusRequests, 1);
     assert.deepEqual(await application.repository.getLabBuildSpec("user_dev", String(firstPayload.data.lab.id)), buildSpec);

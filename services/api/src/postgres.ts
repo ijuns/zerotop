@@ -135,6 +135,15 @@ function labFromRow(row: Row | undefined): unknown | null {
     typeof config.scenario === "object" && config.scenario !== null
       ? (config.scenario as Record<string, unknown>)
       : {};
+  const learning =
+    typeof config.learning === "object" && config.learning !== null
+      ? config.learning
+      : undefined;
+  const target =
+    typeof config.target === "object" && config.target !== null
+      ? config.target
+      : undefined;
+  const questions = Array.isArray(config.questions) ? config.questions : undefined;
   const accessMethod =
     accessModes.includes("browser_desktop") && accessModes.includes("openvpn")
       ? "both"
@@ -157,12 +166,19 @@ function labFromRow(row: Row | undefined): unknown | null {
     status: canonicalStatus,
     network: { egress: "deny", isolation: "per_run" },
     scenario: {
-      summary: scenario.objective ?? row.description,
-      logSources: row.team_type === "blue" ? ["elasticsearch", "endpoint"] : [],
-      attackChain: Array.isArray(scenario.mitreTechniques)
-        ? scenario.mitreTechniques.map((id) => ({ id, name: id, tactic: "unknown" }))
-        : [],
+      summary: scenario.summary ?? scenario.objective ?? row.description,
+      logSources: Array.isArray(scenario.logSources)
+        ? scenario.logSources
+        : row.team_type === "blue" ? ["elasticsearch", "endpoint"] : [],
+      attackChain: Array.isArray(scenario.attackChain)
+        ? scenario.attackChain
+        : Array.isArray(scenario.mitreTechniques)
+          ? scenario.mitreTechniques.map((id) => ({ id, name: id, tactic: "unknown" }))
+          : [],
     },
+    ...(learning ? { learning } : {}),
+    ...(target ? { target } : {}),
+    ...(questions ? { questions } : {}),
     // Compatibility aliases for the pre-contract web client.
     name: row.name,
     description: row.description,

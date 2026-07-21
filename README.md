@@ -10,12 +10,13 @@ AI가 최신 CVE와 훈련 목표를 바탕으로 강의 자료, 취약 환경, 
 
 - `Next.js 16 + React 19 + TypeScript` 웹: 설계·검증, 실습 워크스페이스, 리포트, 랭킹, 관리자 화면
 - OIDC/Keycloak 인증과 개인·조직 가입: 한 사용자는 조직에 속하지 않거나 정확히 한 조직에만 소속
-- 블루팀 Lab: Ubuntu 기반 분석 환경, 실행별 ELK 검색, 증거 선택, MITRE ATT&CK 매핑
-- 레드팀 Lab: Kali/Ubuntu 환경, 단일 선택·복수 선택·주관식·MITRE ATT&CK 문제
-- AI Lab Builder: NVD로 확인한 CVE 정보와 운영자 승인 component catalog를 기반으로 학습 본문, 공개 문제, 비공개 채점 계약, 텔레메트리, 선언형 이미지 빌드 명세 생성
+- 블루팀 Lab: 브라우저 분석 데스크톱, 실행 전용 ELK/Kibana, 분리된 피해 시스템과 Elastic Agent, 시나리오 행위·로그 생성, 증거 선택과 MITRE ATT&CK 매핑
+- 레드팀 Lab: 브라우저 Kali 또는 OpenVPN 진입점과 별도로 격리된 취약 대상, 단일 선택·복수 선택·주관식·MITRE ATT&CK 문제
+- AI Lab Builder: NVD로 확인한 CVE 정보와 운영자 승인 component catalog를 기반으로 학습 본문, 문제·채점 계약, 팀별 선언형 topology, 텔레메트리와 시나리오 행위 계획, 이미지 빌드 명세 생성
+- 운영 AI gateway: 동일한 JSON Schema 계약으로 OpenAI Responses API 또는 Anthropic Claude Messages API 선택 연결
 - 환경 빌더: 허용 목록으로 제한한 명세를 rootless BuildKit 작업으로 빌드하고 이미지 digest와 provenance 기록
 - 자동 검증: 서명, SBOM, 취약점 스캔, 기능·의도된 취약점 probe, 네트워크 격리, 블루팀 ELK 검색을 모두 통과해야 승인
-- 실습 런타임: 실행별 namespace, 학습자용 KubeVirt Ubuntu/Kali 워크스테이션, 제한된 취약 target Deployment·Service, 브라우저 noVNC와 실행별 OpenVPN
+- 실습 런타임: 실행별 namespace, Blue 분석 desktop·ELK·피해 환경 또는 Red Kali·취약 target을 분리 배치하고 브라우저 데스크톱과 실행별 OpenVPN 중 하나의 접속 방식만 활성화
 - 신뢰된 서버 채점: 정답과 ELK/AI 채점 자격 증명을 브라우저에 노출하지 않음
 - 개인 역량 리포트, 조직 관리자용 구성원 리포트, 플랫폼 관리자용 전체·조직별 리포트
 - 주간·월간·전체 기간의 조직/전체 랭킹과 전체 랭킹 공개 동의
@@ -29,10 +30,11 @@ AI가 최신 CVE와 훈련 목표를 바탕으로 강의 자료, 취약 환경, 
 
 ```mermaid
 flowchart LR
-    Prompt["CVE·훈련 목표 프롬프트"] --> AI["AI 콘텐츠 생성"]
-    AI --> Build["허용 목록 기반 환경 빌드"]
-    Build --> Validate["공급망·샌드박스·AI 자동 검증"]
-    Validate -->|통과| Run["격리된 Ubuntu/Kali Lab"]
+    Prompt["CVE·훈련 목표 프롬프트"] --> AI["AI 콘텐츠·문제 생성"]
+    AI --> Topology["팀별 선언형 topology"]
+    Topology --> Build["허용 목록 기반 환경 빌드"]
+    Build --> Validate["공급망·기능·격리·AI 자동 검증"]
+    Validate -->|통과| Run["격리된 팀별 Lab 배포"]
     Validate -->|실패| Quarantine["자동 격리"]
     Run --> Workspace["브라우저 데스크톱 또는 OpenVPN"]
     Workspace --> Grade["ELK·정답·AI 루브릭 서버 채점"]
@@ -40,6 +42,21 @@ flowchart LR
 ```
 
 상세 컴포넌트와 신뢰 경계는 [아키텍처 문서](docs/architecture.md)에 정리되어 있습니다.
+
+## 팀별 실습 topology
+
+프롬프트는 임의의 셸 스크립트로 바로 실행되지 않습니다. AI는 운영자가 승인한 이미지·패키지·행위 catalog 안에서 선언형 topology와 검증 계약을 만들고, 자동 검증을 통과한 실행만 학습자에게 배포합니다.
+
+| 구분 | 학습자 진입점 | 분리된 실습 대상 | 관측·문제 풀이 |
+|---|---|---|---|
+| Blue Team | Ubuntu 기반 분석 데스크톱의 브라우저 | Elastic Agent가 설치된 피해 VM/컨테이너 | 실행 전용 Kibana space와 Elasticsearch 인덱스에서 시나리오 악성 행위 로그를 검색하고 MITRE ATT&CK을 매핑 |
+| Red Team | Kali 브라우저 데스크톱 또는 학습자 장비의 OpenVPN | AI가 선택한 취약 서비스와 데이터가 배치된 별도 target VM/컨테이너 | Kali 도구로 격리된 target을 분석·공격하고 문제와 증거를 제출 |
+
+Blue Team 시나리오의 악성 행위는 승인된 행위 catalog를 피해 환경에서 재생하며, Elastic Agent가 수집한 원본 이벤트가 실행 전용 ELK에 도착해야 합니다. 단순히 정답용 로그 파일을 미리 넣는 방식이 아니라 agent 등록, 이벤트 수집, Kibana 검색과 예상 ATT&CK 증거까지 자동 검증합니다. Red Team은 Kali와 target을 같은 VM에 넣지 않으며, 의도된 서비스와 취약점이 Kali 또는 해당 실행의 VPN 대역에서만 도달 가능한지 확인합니다.
+
+한 실행의 `accessMode`는 `browser_desktop` 또는 `openvpn` 중 하나입니다. 브라우저 세션과 VPN 프로필을 동시에 열지 않으며, 접속 방식을 바꾸면 기존 티켓·프로필을 폐기한 뒤 새 진입점을 준비합니다. 피해 시스템, 취약 target, ELK 내부 endpoint와 다른 실행은 인터넷에 직접 공개하지 않습니다.
+
+화면 경험은 Hack The Box 등 공개된 사이버 레인지의 **워크스페이스와 별도 target을 연결하는 사용자 흐름**을 참고합니다. 해당 서비스의 비공개 내부 구현을 복제하거나 동일하다고 가정하지 않으며, ZeroTOP의 차별점은 프롬프트에서 topology·콘텐츠·문제·검증 계약을 동적으로 생성한다는 점입니다.
 
 ## 빠른 로컬 실행
 
@@ -62,7 +79,9 @@ Docker Desktop이 준비되어 있으면 PostgreSQL, Redis, Keycloak, Elasticsea
 .\scripts\local-dev.ps1 -Mode Docker
 ```
 
-로컬 모드는 제품 흐름을 개발하기 위한 안전한 시뮬레이터입니다. 실제 VM, 브라우저 데스크톱, OpenVPN, BuildKit 이미지 빌드와 격리 probe는 KubeVirt가 설치된 Kubernetes 런타임 플레인에서만 생성됩니다. 자세한 내용은 [로컬 개발 문서](docs/local-development.md)를 참고하세요.
+로컬 기본 모드는 제품 흐름을 개발하기 위한 안전한 시뮬레이터입니다. 별도의 `Desktop` 모드는 Docker 컨테이너 기반 Ubuntu/Kali GUI, Blue의 개발용 실행별 ELK·agent·scenario log generator·별도 target과 Red의 별도 target을 실행합니다. KubeVirt VM, 실제 취약 target, victim에서의 승인 행위 재생, OpenVPN, BuildKit 이미지 빌드와 운영 격리 probe를 포함한 전체 topology는 Kubernetes 런타임 플레인이 필요합니다. 자세한 내용은 [로컬 개발 문서](docs/local-development.md)와 [로컬 데스크톱 런타임 문서](docs/local-desktop-runtime.md)를 참고하세요.
+
+Blue ELK는 ZeroTOP의 **실습 워크스페이스 → 워크스페이스 열기**로 Ubuntu SOC 데스크톱에 들어간 뒤, 그 안의 브라우저에서 `http://kibana:5601`을 열어 사용합니다. 일회용 입장 티켓은 기본 5분이지만 첫 입장 후의 서명된 브라우저 세션과 ELK 사용은 run 만료 시각까지 유지됩니다.
 
 ## 품질 검사
 

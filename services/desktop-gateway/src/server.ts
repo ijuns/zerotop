@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { connect } from "node:net";
 import { backendPath, desktopHost, parseAuthorizedRun, parseTicketExchange, runIdFromPath, type AuthorizedRun } from "./routing.ts";
-import { cookieValue, createSessionToken, verifySessionToken } from "./session.ts";
+import { cookieValue, createDesktopSession, desktopSessionCookie, verifySessionToken } from "./session.ts";
 
 const port = integerEnv("PORT", 9001, 1, 65535);
 const apiUrl = requiredUrl("PLATFORM_API_URL");
@@ -12,6 +12,7 @@ const sessionSigningKey = requiredSecret("DESKTOP_SESSION_SIGNING_KEY", 32);
 const desktopClient = enumEnv("DESKTOP_CLIENT", "novnc", ["novnc", "webtop"] as const);
 const preserveUpstreamPath = booleanEnv("DESKTOP_PRESERVE_UPSTREAM_PATH", false);
 const secureCookie = booleanEnv("DESKTOP_COOKIE_SECURE", true);
+const sessionMaxMinutes = integerEnv("DESKTOP_SESSION_MAX_MINUTES", 1_440, 1, 1_440);
 const sessionCookie = "cg_desktop_session";
 const authorizationCache = new Map<string, { expiresAt: number; run: AuthorizedRun }>();
 
@@ -29,20 +30,20 @@ const server = createServer(async (request, response) => {
     const ticket = url.searchParams.get("ticket");
     if (ticket) {
       const run = await exchangeTicket(runId, ticket);
-      const session = createSessionToken(run, sessionSigningKey);
-      const desktopPath = `/sessions/${encodeURIComponent(runId)}/desktop`;
-      const websocketPath = `sessions/${encodeURIComponent(runId)}/desktop/websockify`;
-      const location = desktopClient === "webtop"
-        ? `${desktopPath}/`
-        : `${desktopPath}/vnc.html?path=${encodeURIComponent(websocketPath)}&autoconnect=1&resize=scale`;
-      const cookieFlags = secureCookie ? "; Secure" : "";
-      response.writeHead(302, {
-        location,
-        "set-cookie": `${sessionCookie}=${encodeURIComponent(session)}; Path=${desktopPath}; HttpOnly${cookieFlags}; SameSite=Strict`,
-        "cache-control": "no-store",
-        "content-security-policy": "default-src 'none'",
-      });
-      return response.end();
+      const now = Date.now();
+      const session = createDesktopSession(run, sessionSigningKey, now, sessionMaxMinutes * 60_000);
+      return redirectToDesktop(
+        response,
+        runId,
+        desktopSessionCookie(
+          sessionCookie,
+          session.token,
+          `/sessions/${encodeURIComponent(runId)}/desktop`,
+          session.expiresAt,
+          secureCookie,
+          now,
+        ),
+      );
     }
     const run = await requestRun(request, runId);
     if (url.pathname === `/sessions/${encodeURIComponent(runId)}/desktop`) {
@@ -144,6 +145,21 @@ async function requestRun(request: IncomingMessage, runId: string): Promise<Auth
     }
   }
   return authorizeRun(runId, bearer(request));
+}
+
+function redirectToDesktop(response: ServerResponse, runId: string, cookie?: string): void {
+  const desktopPath = `/sessions/${encodeURIComponent(runId)}/desktop`;
+  const websocketPath = `sessions/${encodeURIComponent(runId)}/desktop/websockify`;
+  const location = desktopClient === "webtop"
+    ? `${desktopPath}/`
+    : `${desktopPath}/vnc.html?path=${encodeURIComponent(websocketPath)}&autoconnect=1&resize=scale`;
+  response.writeHead(302, {
+    location,
+    ...(cookie ? { "set-cookie": cookie } : {}),
+    "cache-control": "no-store",
+    "content-security-policy": "default-src 'none'",
+  });
+  response.end();
 }
 
 async function exchangeTicket(runId: string, ticket: string): Promise<AuthorizedRun> {

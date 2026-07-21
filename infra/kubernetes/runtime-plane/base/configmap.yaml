@@ -7,6 +7,10 @@ data:
   RUNTIME_MODE: kubevirt
   UBUNTU_DESKTOP_IMAGE: registry.example.invalid/codegate/ubuntu-desktop:replace-with-digest
   KALI_DESKTOP_IMAGE: registry.example.invalid/codegate/kali-desktop:replace-with-digest
+  RANGE_ELASTICSEARCH_IMAGE: registry.example.invalid/codegate/elasticsearch@sha256:replace-with-reviewed-digest
+  RANGE_KIBANA_IMAGE: registry.example.invalid/codegate/kibana@sha256:replace-with-reviewed-digest
+  RANGE_ELASTIC_AGENT_IMAGE: registry.example.invalid/codegate/elastic-agent@sha256:replace-with-reviewed-digest
+  RANGE_SCENARIO_LOG_GENERATOR_IMAGE: registry.example.invalid/codegate/scenario-log-generator@sha256:replace-with-reviewed-digest
   OPENVPN_GATEWAY_IMAGE: registry.example.invalid/codegate/openvpn-gateway@sha256:replace-with-reviewed-digest
   OPENVPN_GATEWAY_BASE_DOMAIN: vpn-runs.example.invalid
   OPENVPN_ALLOWED_CIDR: 10.42.0.0/16

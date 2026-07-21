@@ -44,6 +44,8 @@ spec:
               value: http://codegate-api.codegate-platform.svc.cluster.local:8080
             - name: DESKTOP_UPSTREAM_PORT
               value: "6080"
+            - name: DESKTOP_SESSION_MAX_MINUTES
+              value: "1440"
             - name: DESKTOP_GATEWAY_INTERNAL_TOKEN
               valueFrom:
                 secretKeyRef:

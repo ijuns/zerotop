@@ -139,6 +139,7 @@ services:
       AI_SERVICE_URL: http://ai:8001
       AI_ADAPTER: ${AI_ADAPTER:-local}
       AI_INTERNAL_TOKEN: ${AI_INTERNAL_TOKEN:-ai_service_dev_token_change_me}
+      AI_GENERATION_TIMEOUT_MS: ${AI_GENERATION_TIMEOUT_MS:-1260000}
       RUNTIME_ADAPTER: ${RUNTIME_ADAPTER:-simulator}
       RUNTIME_SERVICE_URL: http://runtime:9000
       RUNTIME_INTERNAL_TOKEN: ${RUNTIME_INTERNAL_TOKEN:-runtime_dev_only_change_me}
@@ -252,15 +253,23 @@ services:
       AI_AUTH_MODE: internal
       AI_INTERNAL_TOKEN: ${AI_INTERNAL_TOKEN:-ai_service_dev_token_change_me}
       # This Compose file is local-only; production manifests require external providers.
+      # This opt-in is only for the local generic CVE simulation path.
       AI_GENERATION_MODE: ${AI_GENERATION_MODE:-dev}
+      AI_ALLOW_UNCURATED_CVE_SIMULATION: ${AI_ALLOW_UNCURATED_CVE_SIMULATION:-false}
       AI_REVIEW_MODE: ${AI_REVIEW_MODE:-dev}
       AI_RUBRIC_MODE: ${AI_RUBRIC_MODE:-dev}
       GENERATION_PROVIDER_URL: ${GENERATION_PROVIDER_URL:-http://model-gateway:9010/v1/generate}
+      GENERATION_PROVIDER_TIMEOUT_SECONDS: ${GENERATION_PROVIDER_TIMEOUT_SECONDS:-1230}
       REVIEW_PROVIDER_URL: ${REVIEW_PROVIDER_URL:-http://model-gateway:9010/v1/review}
       RUBRIC_PROVIDER_URL: ${RUBRIC_PROVIDER_URL:-http://model-gateway:9010/v1/rubric}
       GENERATION_PROVIDER_TOKEN: ${MODEL_GATEWAY_INTERNAL_TOKEN:-model_gateway_dev_only_change_me_000000}
       REVIEW_PROVIDER_TOKEN: ${MODEL_GATEWAY_INTERNAL_TOKEN:-model_gateway_dev_only_change_me_000000}
       RUBRIC_PROVIDER_TOKEN: ${MODEL_GATEWAY_INTERNAL_TOKEN:-model_gateway_dev_only_change_me_000000}
+      AI_TARGET_BASE_IMAGE: ${AI_TARGET_BASE_IMAGE:-registry.example.invalid/codegate/targets/http-v1-base@sha256:0000000000000000000000000000000000000000000000000000000000000000}
+      AI_OUTPUT_REPOSITORY: ${AI_OUTPUT_REPOSITORY:-registry.example.invalid/codegate/targets}
+      # External generation fails closed unless both operator-owned catalogs are supplied.
+      PACKAGE_CATALOG_JSON: ${PACKAGE_CATALOG_JSON:-}
+      ARTIFACT_CATALOG_JSON: ${ARTIFACT_CATALOG_JSON:-}
     ports:
       - "127.0.0.1:8001:8001"
     depends_on:
@@ -294,16 +303,23 @@ services:
         NODE_RUNTIME_IMAGE: ${MODEL_GATEWAY_NODE_IMAGE:-node:24.14.0-bookworm-slim}
     restart: unless-stopped
     environment:
-      PORT: "9010"
-      MODEL_GATEWAY_INTERNAL_TOKEN: ${MODEL_GATEWAY_INTERNAL_TOKEN:-model_gateway_dev_only_change_me_000000}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_BASE_URL: https://api.openai.com/v1
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-sol}
-      OPENAI_GENERATION_TIMEOUT_MS: "40000"
-      OPENAI_REVIEW_TIMEOUT_MS: "25000"
-      OPENAI_RUBRIC_TIMEOUT_MS: "9000"
-      MODEL_GATEWAY_MAX_CONCURRENCY: "2"
-      RUBRIC_CATALOG_JSON: '{"incident-analysis-v1":{"policyVersion":"incident-analysis-2026.07","passThreshold":0.7,"criteria":[{"id":"evidence","description":"Uses concrete evidence from the isolated exercise data.","weight":0.6},{"id":"mitigation","description":"Explains a proportionate detection or mitigation action.","weight":0.4}]}}'
+      - PORT=9010
+      - MODEL_GATEWAY_INTERNAL_TOKEN=${MODEL_GATEWAY_INTERNAL_TOKEN:-model_gateway_dev_only_change_me_000000}
+      - MODEL_PROVIDER=${MODEL_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=https://api.openai.com/v1
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-5.6-sol}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_BASE_URL=https://api.anthropic.com/v1
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+      - ANTHROPIC_VERSION=${ANTHROPIC_VERSION:-2023-06-01}
+      - MODEL_GATEWAY_GENERATION_TIMEOUT_MS=${MODEL_GATEWAY_GENERATION_TIMEOUT_MS:-1200000}
+      - MODEL_GATEWAY_GENERATION_MAX_ATTEMPTS=${MODEL_GATEWAY_GENERATION_MAX_ATTEMPTS:-1}
+      - MODEL_GATEWAY_DEBUG_RAW_RESPONSE_CAPTURE
+      - MODEL_GATEWAY_REVIEW_TIMEOUT_MS=25000
+      - MODEL_GATEWAY_RUBRIC_TIMEOUT_MS=9000
+      - MODEL_GATEWAY_MAX_CONCURRENCY=2
+      - 'RUBRIC_CATALOG_JSON=${RUBRIC_CATALOG_JSON:-{"incident-analysis-v1":{"policyVersion":"incident-analysis-2026.07","passThreshold":0.7,"criteria":[{"id":"evidence","description":"Uses concrete evidence from the isolated exercise data.","weight":0.6},{"id":"mitigation","description":"Explains a proportionate detection or mitigation action.","weight":0.4}]}}}'
     healthcheck:
       test:
         - CMD

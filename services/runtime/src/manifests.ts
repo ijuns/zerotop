@@ -11,6 +11,10 @@ export type KubernetesObject = {
 export interface RuntimeImages {
   ubuntuDesktop: string;
   kaliDesktop: string;
+  elasticsearch?: string;
+  kibana?: string;
+  elasticAgent?: string;
+  scenarioLogGenerator?: string;
 }
 
 export interface OpenVpnRunGateway {
@@ -52,6 +56,7 @@ export function buildRunResources(
     "codegate.ai/expires-at": expiresAt,
     "codegate.ai/readiness-deadline": readinessDeadline,
     "codegate.ai/access-method": request.accessMethod,
+    ...(request.topology?.team ? { "codegate.ai/team": request.topology.team } : {}),
   };
   const desktopImage = request.desktopImage === "ubuntu" ? images.ubuntuDesktop : images.kaliDesktop;
 
@@ -85,14 +90,14 @@ export function buildRunResources(
       metadata: { name: "run-quota", namespace, labels: commonLabels },
       spec: {
         hard: {
-          "requests.cpu": "4",
-          "requests.memory": "10Gi",
-          "limits.cpu": "8",
-          "limits.memory": "16Gi",
-          pods: "12",
-          services: "8",
-          "count/secrets": "4",
-          "count/deployments.apps": "2",
+          "requests.cpu": request.topology?.team === "blue" ? "6" : "4",
+          "requests.memory": request.topology?.team === "blue" ? "14Gi" : "10Gi",
+          "limits.cpu": request.topology?.team === "blue" ? "12" : "8",
+          "limits.memory": request.topology?.team === "blue" ? "24Gi" : "16Gi",
+          pods: request.topology?.team === "blue" ? "18" : "12",
+          services: request.topology?.team === "blue" ? "12" : "8",
+          "count/secrets": "6",
+          "count/deployments.apps": request.topology?.team === "blue" ? "5" : "2",
           "count/virtualmachines.kubevirt.io": "1",
         },
       },
@@ -155,7 +160,9 @@ export function buildRunResources(
           matchExpressions: [{
             key: "codegate.ai/role",
             operator: "In",
-            values: ["workstation", "vpn-gateway"],
+            values: request.topology?.team === "blue"
+              ? ["workstation", "target", "kibana", "vpn-gateway"]
+              : ["workstation", "vpn-gateway"],
           }],
         },
         policyTypes: ["Egress"],
@@ -166,9 +173,13 @@ export function buildRunResources(
       },
     },
     virtualMachine("workstation", namespace, desktopImage, commonLabels, annotations, "4Gi", 2),
-    targetDeployment(request, namespace, commonLabels, annotations),
+    targetDeployment(request, images, namespace, commonLabels, annotations),
     targetService(request, namespace, commonLabels, annotations),
   ];
+
+  if (request.topology?.team === "blue") {
+    resources.push(...blueTeamResources(request, images, namespace, commonLabels, annotations));
+  }
 
   if (request.accessMethod === "browser_desktop" || request.accessMethod === "both") {
     resources.push(gatewayIngressPolicy({
@@ -489,8 +500,175 @@ function virtualMachine(
   };
 }
 
+function blueTeamResources(
+  request: ProvisionRunRequest,
+  images: RuntimeImages,
+  namespace: string,
+  commonLabels: Record<string, string>,
+  annotations: Record<string, string>,
+): KubernetesObject[] {
+  if (request.topology?.team !== "blue" || !request.topology.telemetry) {
+    throw new Error("Blue-team resources require a validated Elastic topology");
+  }
+  const elasticsearchImage = requiredBlueImage(images.elasticsearch, "ELASTICSEARCH_IMAGE");
+  const kibanaImage = requiredBlueImage(images.kibana, "KIBANA_IMAGE");
+  const elasticsearchLabels = { ...commonLabels, "codegate.ai/role": "elasticsearch" };
+  const kibanaLabels = { ...commonLabels, "codegate.ai/role": "kibana" };
+  return [
+    {
+      apiVersion: "apps/v1",
+      kind: "Deployment",
+      metadata: { name: "elasticsearch", namespace, labels: elasticsearchLabels, annotations },
+      spec: {
+        replicas: 1,
+        revisionHistoryLimit: 0,
+        progressDeadlineSeconds: 600,
+        selector: { matchLabels: elasticsearchLabels },
+        template: {
+          metadata: { labels: elasticsearchLabels, annotations },
+          spec: {
+            serviceAccountName: "default",
+            automountServiceAccountToken: false,
+            enableServiceLinks: false,
+            securityContext: { seccompProfile: { type: "RuntimeDefault" } },
+            containers: [{
+              name: "elasticsearch",
+              image: elasticsearchImage,
+              imagePullPolicy: "IfNotPresent",
+              ports: [{ name: "http", containerPort: 9200, protocol: "TCP" }],
+              env: [
+                { name: "discovery.type", value: "single-node" },
+                { name: "xpack.security.enabled", value: "false" },
+                { name: "xpack.ml.enabled", value: "false" },
+                { name: "ES_JAVA_OPTS", value: "-Xms768m -Xmx768m" },
+              ],
+              startupProbe: { httpGet: { path: "/_cluster/health", port: "http" }, periodSeconds: 5, failureThreshold: 120 },
+              readinessProbe: { httpGet: { path: "/_cluster/health", port: "http" }, periodSeconds: 5, failureThreshold: 6 },
+              resources: { requests: { cpu: "500m", memory: "1Gi" }, limits: { cpu: "2", memory: "2Gi" } },
+              securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } },
+              volumeMounts: [{ name: "data", mountPath: "/usr/share/elasticsearch/data" }],
+            }],
+            volumes: [{ name: "data", emptyDir: { sizeLimit: "4Gi" } }],
+          },
+        },
+      },
+    },
+    internalService("elasticsearch", namespace, elasticsearchLabels, annotations, 9200, "http"),
+    {
+      apiVersion: "apps/v1",
+      kind: "Deployment",
+      metadata: { name: "kibana", namespace, labels: kibanaLabels, annotations },
+      spec: {
+        replicas: 1,
+        revisionHistoryLimit: 0,
+        progressDeadlineSeconds: 600,
+        selector: { matchLabels: kibanaLabels },
+        template: {
+          metadata: { labels: kibanaLabels, annotations },
+          spec: {
+            serviceAccountName: "default",
+            automountServiceAccountToken: false,
+            enableServiceLinks: false,
+            securityContext: { seccompProfile: { type: "RuntimeDefault" } },
+            containers: [{
+              name: "kibana",
+              image: kibanaImage,
+              imagePullPolicy: "IfNotPresent",
+              ports: [{ name: "http", containerPort: 5601, protocol: "TCP" }],
+              env: [
+                { name: "ELASTICSEARCH_HOSTS", value: "http://elasticsearch:9200" },
+                { name: "SERVER_HOST", value: "0.0.0.0" },
+                { name: "TELEMETRY_ENABLED", value: "false" },
+              ],
+              startupProbe: { httpGet: { path: "/api/status", port: "http" }, periodSeconds: 5, failureThreshold: 120 },
+              readinessProbe: { httpGet: { path: "/api/status", port: "http" }, periodSeconds: 5, failureThreshold: 6 },
+              resources: { requests: { cpu: "250m", memory: "512Mi" }, limits: { cpu: "1", memory: "1Gi" } },
+              securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"] } },
+            }],
+          },
+        },
+      },
+    },
+    internalService("kibana", namespace, kibanaLabels, annotations, 5601, "http"),
+    roleNetworkPolicy("allow-workstation-to-kibana", namespace, commonLabels, "workstation", "kibana", 5601, "Egress"),
+    roleNetworkPolicy("allow-kibana-from-workstation", namespace, commonLabels, "kibana", "workstation", 5601, "Ingress"),
+    roleNetworkPolicy("allow-kibana-to-elasticsearch", namespace, commonLabels, "kibana", "elasticsearch", 9200, "Egress"),
+    roleNetworkPolicy("allow-target-agent-to-elasticsearch", namespace, commonLabels, "target", "elasticsearch", 9200, "Egress"),
+    roleNetworkPolicy("allow-target-agent-to-kibana", namespace, commonLabels, "target", "kibana", 5601, "Egress"),
+    roleNetworkPolicy("allow-kibana-from-target-agent", namespace, commonLabels, "kibana", "target", 5601, "Ingress"),
+    {
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: { name: "allow-elasticsearch-ingest", namespace, labels: commonLabels },
+      spec: {
+        podSelector: { matchLabels: { "codegate.ai/role": "elasticsearch" } },
+        policyTypes: ["Ingress"],
+        ingress: [{
+          from: ["target", "kibana"].map((role) => ({ podSelector: { matchLabels: { "codegate.ai/role": role } } })),
+          ports: [{ protocol: "TCP", port: 9200 }],
+        }],
+      },
+    },
+  ];
+}
+
+function internalService(
+  name: string,
+  namespace: string,
+  labels: Record<string, string>,
+  annotations: Record<string, string>,
+  port: number,
+  appProtocol: "http",
+): KubernetesObject {
+  return {
+    apiVersion: "v1",
+    kind: "Service",
+    metadata: { name, namespace, labels, annotations },
+    spec: {
+      type: "ClusterIP",
+      selector: labels,
+      ports: [{ name: "http", protocol: "TCP", port, targetPort: "http", appProtocol }],
+    },
+  };
+}
+
+function roleNetworkPolicy(
+  name: string,
+  namespace: string,
+  labels: Record<string, string>,
+  selectedRole: string,
+  peerRole: string,
+  port: number,
+  direction: "Ingress" | "Egress",
+): KubernetesObject {
+  const rule = {
+    ...(direction === "Ingress"
+      ? { from: [{ podSelector: { matchLabels: { "codegate.ai/role": peerRole } } }] }
+      : { to: [{ podSelector: { matchLabels: { "codegate.ai/role": peerRole } } }] }),
+    ports: [{ protocol: "TCP", port }],
+  };
+  return {
+    apiVersion: "networking.k8s.io/v1",
+    kind: "NetworkPolicy",
+    metadata: { name, namespace, labels },
+    spec: {
+      podSelector: { matchLabels: { "codegate.ai/role": selectedRole } },
+      policyTypes: [direction],
+      ...(direction === "Ingress" ? { ingress: [rule] } : { egress: [rule] }),
+    },
+  };
+}
+
+function requiredBlueImage(value: string | undefined, name: string): string {
+  if (!value || !/@sha256:[a-f0-9]{64}$/i.test(value)) {
+    throw new Error(`${name} must be configured as a digest-pinned image for blue-team topology`);
+  }
+  return value;
+}
+
 function targetDeployment(
   request: ProvisionRunRequest,
+  images: RuntimeImages,
   namespace: string,
   commonLabels: Record<string, string>,
   annotations: Record<string, string>,
@@ -502,6 +680,71 @@ function targetDeployment(
     timeoutSeconds: 1,
     periodSeconds: 2,
   };
+  const blue = request.topology?.team === "blue" ? request.topology : undefined;
+  const redExercise = request.topology?.team === "red"
+    ? request.topology.target.exercise
+    : undefined;
+  const targetContainer = {
+    name: "target",
+    image: request.targetImage,
+    imagePullPolicy: "IfNotPresent",
+    ports: [{ name: portName, containerPort: request.targetService.port, protocol: "TCP" }],
+    ...(redExercise ? {
+      env: [{
+        name: "ZEROTOP_RED_EXERCISE_BASE64",
+        value: Buffer.from(JSON.stringify(redExercise), "utf8").toString("base64"),
+      }],
+    } : {}),
+    startupProbe: { ...tcpProbe, failureThreshold: 60 },
+    readinessProbe: { ...tcpProbe, failureThreshold: 3 },
+    resources: {
+      requests: { cpu: "250m", memory: "256Mi" },
+      limits: { cpu: "1", memory: "512Mi" },
+    },
+    securityContext: {
+      allowPrivilegeEscalation: false,
+      readOnlyRootFilesystem: request.targetRuntimeContract.readOnlyRootFilesystem,
+      capabilities: { drop: ["ALL"] },
+    },
+    volumeMounts: [
+      { name: "tmp", mountPath: "/tmp" },
+      ...(blue ? [{ name: "scenario-logs", mountPath: "/var/log/zerotop" }] : []),
+    ],
+  };
+  const sidecars = blue?.telemetry
+    ? [
+        {
+          name: "scenario-log-generator",
+          image: requiredBlueImage(images.scenarioLogGenerator, "SCENARIO_LOG_GENERATOR_IMAGE"),
+          imagePullPolicy: "IfNotPresent",
+          env: [
+            { name: "SCENARIO_EVENTS_BASE64", value: Buffer.from(JSON.stringify(blue.telemetry.events), "utf8").toString("base64") },
+            ...(blue.telemetry.generation
+              ? [{ name: "SCENARIO_GENERATION_BASE64", value: Buffer.from(JSON.stringify(blue.telemetry.generation), "utf8").toString("base64") }]
+              : []),
+            { name: "SCENARIO_LOG_PATH", value: "/var/log/zerotop/scenario.ndjson" },
+          ],
+          readinessProbe: { exec: { command: ["/usr/bin/test", "-s", "/var/log/zerotop/scenario.ndjson"] }, periodSeconds: 2, failureThreshold: 30 },
+          resources: { requests: { cpu: "25m", memory: "32Mi" }, limits: { cpu: "250m", memory: "128Mi" } },
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } },
+          volumeMounts: [{ name: "scenario-logs", mountPath: "/var/log/zerotop" }, { name: "generator-tmp", mountPath: "/tmp" }],
+        },
+        {
+          name: "elastic-agent",
+          image: requiredBlueImage(images.elasticAgent, "ELASTIC_AGENT_IMAGE"),
+          imagePullPolicy: "IfNotPresent",
+          env: [
+            { name: "ELASTICSEARCH_HOST", value: "http://elasticsearch:9200" },
+            { name: "KIBANA_HOST", value: "http://kibana:5601" },
+            { name: "ELASTIC_INDEX", value: telemetryIndexForRun(blue.telemetry.index, request.runId) },
+          ],
+          readinessProbe: { exec: { command: ["/usr/bin/test", "-f", "/tmp/zerotop-agent-ready"] }, periodSeconds: 3, failureThreshold: 60 },
+          resources: { requests: { cpu: "50m", memory: "64Mi" }, limits: { cpu: "500m", memory: "512Mi" } },
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } },
+          volumeMounts: [{ name: "scenario-logs", mountPath: "/var/log/zerotop", readOnly: true }, { name: "agent-tmp", mountPath: "/tmp" }],
+        },
+      ]
+    : [];
   return {
     apiVersion: "apps/v1",
     kind: "Deployment",
@@ -525,25 +768,15 @@ function targetDeployment(
             fsGroup: request.targetRuntimeContract.gid,
             seccompProfile: { type: "RuntimeDefault" },
           },
-          containers: [{
-            name: "target",
-            image: request.targetImage,
-            imagePullPolicy: "IfNotPresent",
-            ports: [{ name: portName, containerPort: request.targetService.port, protocol: "TCP" }],
-            startupProbe: { ...tcpProbe, failureThreshold: 60 },
-            readinessProbe: { ...tcpProbe, failureThreshold: 3 },
-            resources: {
-              requests: { cpu: "250m", memory: "256Mi" },
-              limits: { cpu: "1", memory: "512Mi" },
-            },
-            securityContext: {
-              allowPrivilegeEscalation: false,
-              readOnlyRootFilesystem: request.targetRuntimeContract.readOnlyRootFilesystem,
-              capabilities: { drop: ["ALL"] },
-            },
-            volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
-          }],
-          volumes: [{ name: "tmp", emptyDir: { medium: "Memory", sizeLimit: "64Mi" } }],
+          containers: [targetContainer, ...sidecars],
+          volumes: [
+            { name: "tmp", emptyDir: { medium: "Memory", sizeLimit: "64Mi" } },
+            ...(blue ? [
+              { name: "scenario-logs", emptyDir: { sizeLimit: "128Mi" } },
+              { name: "generator-tmp", emptyDir: { medium: "Memory", sizeLimit: "16Mi" } },
+              { name: "agent-tmp", emptyDir: { medium: "Memory", sizeLimit: "64Mi" } },
+            ] : []),
+          ],
         },
       },
     },
@@ -574,4 +807,10 @@ function targetService(
       }],
     },
   };
+}
+
+function telemetryIndexForRun(pattern: string, runId: string): string {
+  const suffix = runId.toLowerCase().replace(/[^a-z0-9._-]/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+  if (!suffix) throw new Error("runId cannot form a telemetry index suffix");
+  return pattern.replace(/\*$/, suffix);
 }

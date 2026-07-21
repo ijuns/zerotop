@@ -21,12 +21,16 @@ $runtimeDirectory = Join-Path $PSScriptRoot '.runtime'
 $desktopNetwork = 'codegate-local-desktops'
 $desktopGatewayContainer = 'codegate-local-desktop-gateway'
 $desktopGatewayImage = 'codegate/desktop-gateway:local'
+$scenarioLogGeneratorImage = 'codegate/scenario-log-generator:development'
+$elasticAgentImage = 'codegate/elastic-agent:development'
 $runtimeInternalToken = 'local-runtime-token'
 $desktopGatewayInternalToken = 'desktop-gateway-dev-token'
 $desktopSessionSigningKey = 'codegate-local-desktop-session-signing-key-change-me'
 $runtimePort = 9000
 $desktopGatewayPort = 9001
-$localTargetDigest = 'sha256:' + ('0' * 64)
+$localTargetRepository = 'codegate/local-target'
+$localTargetImage = "$localTargetRepository`:development"
+$localTargetDigest = $null
 $dockerBin = 'C:\Program Files\Docker\Docker\resources\bin'
 if ((Test-Path -LiteralPath (Join-Path $dockerBin 'docker.exe')) -and -not (($env:PATH -split ';') -contains $dockerBin)) {
     $env:PATH = "$dockerBin;$env:PATH"
@@ -282,16 +286,31 @@ try {
             }
         }
 
-        Write-Host 'Building the local desktop gateway and connectivity target ...'
+        $elasticsearchImage = if ($env:LOCAL_ELASTICSEARCH_IMAGE) { $env:LOCAL_ELASTICSEARCH_IMAGE } else { 'docker.elastic.co/elasticsearch/elasticsearch:8.17.0' }
+        $kibanaImage = if ($env:LOCAL_KIBANA_IMAGE) { $env:LOCAL_KIBANA_IMAGE } else { 'docker.elastic.co/kibana/kibana:8.17.0' }
+
+        Write-Host 'Building the local desktop gateway, targets, and Blue Team telemetry adapters ...'
         Push-Location $projectRoot
         try {
             & docker build -f services/desktop-gateway/Dockerfile -t $desktopGatewayImage .
             if ($LASTEXITCODE -ne 0) {
                 throw 'Failed to build the local desktop gateway image.'
             }
-            & docker build -f services/local-target/Dockerfile -t codegate/local-target:development .
+            & docker build -f services/local-target/Dockerfile -t $localTargetImage .
             if ($LASTEXITCODE -ne 0) {
                 throw 'Failed to build the local connectivity target image.'
+            }
+            $localTargetDigest = (& docker image inspect $localTargetImage --format '{{.Id}}').Trim().ToLowerInvariant()
+            if ($LASTEXITCODE -ne 0 -or $localTargetDigest -notmatch '^sha256:[a-f0-9]{64}$') {
+                throw 'Failed to resolve the immutable digest of the local connectivity target image.'
+            }
+            & docker build -f services/scenario-log-generator/Dockerfile -t $scenarioLogGeneratorImage .
+            if ($LASTEXITCODE -ne 0) {
+                throw 'Failed to build the local scenario log generator image.'
+            }
+            & docker build -f services/elastic-agent/Dockerfile -t $elasticAgentImage .
+            if ($LASTEXITCODE -ne 0) {
+                throw 'Failed to build the local Elastic collector adapter image.'
             }
         }
         finally {
@@ -347,11 +366,17 @@ try {
                 PORT = [string]$runtimePort
                 RUNTIME_MODE = 'docker'
                 RUNTIME_INTERNAL_TOKEN = $runtimeInternalToken
-                TARGET_IMAGE_REGISTRIES = 'local.codegate.invalid'
+                TARGET_IMAGE_REGISTRIES = 'codegate'
                 LOCAL_DESKTOP_NETWORK = $desktopNetwork
+                LOCAL_DESKTOP_GATEWAY_CONTAINER = $desktopGatewayContainer
                 LOCAL_UBUNTU_DESKTOP_IMAGE = $ubuntuDesktopImage
                 LOCAL_KALI_DESKTOP_IMAGE = $kaliDesktopImage
-                LOCAL_TARGET_IMAGE = 'codegate/local-target:development'
+                LOCAL_TARGET_IMAGE = $localTargetImage
+                LOCAL_TARGET_SOURCE_IMAGE = "$localTargetRepository@$localTargetDigest"
+                LOCAL_ELASTICSEARCH_IMAGE = $elasticsearchImage
+                LOCAL_KIBANA_IMAGE = $kibanaImage
+                LOCAL_ELASTIC_AGENT_IMAGE = $elasticAgentImage
+                LOCAL_SCENARIO_LOG_GENERATOR_IMAGE = $scenarioLogGeneratorImage
                 LOCAL_DESKTOP_PORT = '6080'
             }
     }
@@ -367,8 +392,8 @@ try {
     if ($desktopMode) {
         $apiEnvironment.RUNTIME_SERVICE_URL = "http://localhost:$runtimePort"
         $apiEnvironment.RUNTIME_INTERNAL_TOKEN = $runtimeInternalToken
-        $apiEnvironment.RUNTIME_TARGET_IMAGE = "local.codegate.invalid/codegate/local-target@$localTargetDigest"
-        $apiEnvironment.TARGET_IMAGE_REGISTRIES = 'local.codegate.invalid'
+        $apiEnvironment.RUNTIME_TARGET_IMAGE = "$localTargetRepository@$localTargetDigest"
+        $apiEnvironment.TARGET_IMAGE_REGISTRIES = 'codegate'
         $apiEnvironment.DESKTOP_GATEWAY_PUBLIC_URL = "http://localhost:$desktopGatewayPort"
         $apiEnvironment.DESKTOP_GATEWAY_INTERNAL_TOKEN = $desktopGatewayInternalToken
     }
@@ -419,6 +444,7 @@ try {
             startedAtUtc = $runtimeProcess.StartTime.ToUniversalTime().ToString('O')
         }
         $processMetadata.desktopGatewayContainer = $desktopGatewayContainer
+        $processMetadata.localTargetSourceImage = "$localTargetRepository@$localTargetDigest"
     }
     $processMetadata | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $runtimeDirectory 'processes.json') -Encoding UTF8
 }

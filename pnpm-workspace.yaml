@@ -5,3 +5,6 @@ packages:
 
 allowBuilds:
   sharp: true
+
+minimumReleaseAgeExclude:
+  - '@anthropic-ai/sdk@0.112.5'

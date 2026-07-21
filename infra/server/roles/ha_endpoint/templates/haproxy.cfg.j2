@@ -42,22 +42,26 @@ backend kubernetes_api_nodes
 {% if rke2_ingress_controller == 'traefik' %}
 frontend platform_http
   bind {{ rke2_ha_vip }}:80
+  timeout client 25m
   default_backend ingress_http_nodes
 
 backend ingress_http_nodes
   balance roundrobin
   option tcp-check
+  timeout server 25m
 {% for host in groups['rke2_servers'] %}
   server {{ host }} {{ hostvars[host].ansible_host }}:{{ ingress_http_node_port }} check send-proxy-v2
 {% endfor %}
 
 frontend platform_https
   bind {{ rke2_ha_vip }}:443
+  timeout client 25m
   default_backend ingress_https_nodes
 
 backend ingress_https_nodes
   balance roundrobin
   option tcp-check
+  timeout server 25m
 {% for host in groups['rke2_servers'] %}
   server {{ host }} {{ hostvars[host].ansible_host }}:{{ ingress_https_node_port }} check send-proxy-v2
 {% endfor %}

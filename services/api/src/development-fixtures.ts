@@ -1,4 +1,5 @@
 import { DEV_USER_ID, SECURITY_LAB_ORG_ID } from "./types.ts";
+import { normalizeLabGeneration } from "./input.ts";
 
 export const DEVELOPMENT_FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
 export const DEVELOPMENT_FIXTURE_PASSWORD = "ZeroTOP!2026";
@@ -30,6 +31,8 @@ export interface DevelopmentCapabilityLabFixture {
   teamType: "blue" | "red";
   questionTypes: readonly string[];
   environment: "ubuntu" | "kali";
+  config: ReturnType<typeof normalizeLabGeneration>["config"];
+  gradingQuestions: ReturnType<typeof normalizeLabGeneration>["gradingQuestions"];
 }
 
 export interface DevelopmentCapabilityAttemptFixture {
@@ -334,16 +337,34 @@ export function buildDevelopmentCapabilityFixtures(
   const safeKey = (value: string) => value.replace(/[^a-zA-Z0-9_-]/g, "_");
 
   const labs = cohorts.flatMap((cohort) =>
-    DEVELOPMENT_TRAINING_TEMPLATES.map((template) => ({
-      id: `lab_seed_${safeKey(cohort.key)}_${template.key}`,
-      ownerUserId: cohort.ownerUserId,
-      organizationId: cohort.organizationId,
-      name: `${cohort.name} · ${template.title}`,
-      description: template.description,
-      teamType: template.teamType,
-      questionTypes: template.questionTypes,
-      environment: template.environment,
-    })),
+    DEVELOPMENT_TRAINING_TEMPLATES.map((template) => {
+      const name = `${cohort.name} · ${template.title}`;
+      const generated = normalizeLabGeneration({
+        title: name,
+        prompt: template.description,
+        team: template.teamType,
+        desktopImage: template.environment,
+        accessMethod: "browser_desktop",
+        questionTypes: [...template.questionTypes],
+      });
+      return {
+        id: `lab_seed_${safeKey(cohort.key)}_${template.key}`,
+        ownerUserId: cohort.ownerUserId,
+        organizationId: cohort.organizationId,
+        name,
+        description: template.description,
+        teamType: template.teamType,
+        questionTypes: template.questionTypes,
+        environment: template.environment,
+        config: {
+          ...generated.config,
+          fixture: true,
+          generatedBy: "ZeroTOP development seed",
+          validationMode: "ai-autonomous",
+        },
+        gradingQuestions: generated.gradingQuestions,
+      };
+    }),
   );
 
   const cohortForUser = (user: DevelopmentUserFixture) =>

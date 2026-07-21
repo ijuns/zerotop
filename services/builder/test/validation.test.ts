@@ -10,6 +10,29 @@ test("accepts a strict blue-team build contract", () => {
   assert.equal(parsed.spec.telemetry?.events[0]?.document["@timestamp"], "2026-07-21T10:00:00.000Z");
 });
 
+test("accepts the prompt-generated blue topology and binds it to telemetry events", () => {
+  const input = validBlueInput();
+  input.spec.topology = {
+    schemaVersion: 1,
+    team: "blue",
+    isolation: "per_run",
+    workstation: { role: "soc_analyst", desktopImage: "ubuntu", entrypoint: "kibana" },
+    target: { role: "monitored_target", hostname: "target" },
+    telemetry: {
+      stack: "elastic",
+      collector: "elastic_agent",
+      generator: "scenario_log_generator",
+      index: "zerotop-logs-*",
+      events: structuredClone(input.spec.telemetry?.events ?? []),
+    },
+  };
+  const parsed = parseCreateBuildInput(input);
+  assert.equal(parsed.spec.topology?.workstation.entrypoint, "kibana");
+
+  input.spec.topology.telemetry!.events[0]!.id = "changed-evidence";
+  assert.throws(() => parseCreateBuildInput(input), /must match spec.telemetry.events/);
+});
+
 test("rejects arbitrary commands and Dockerfiles as unknown fields", () => {
   const input = structuredClone(validBlueInput()) as unknown as Record<string, unknown>;
   const spec = input.spec as Record<string, unknown>;

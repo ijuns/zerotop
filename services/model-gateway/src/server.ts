@@ -3,21 +3,23 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { fileURLToPath } from "node:url";
 
 import { loadConfig, type GatewayConfig } from "./config.ts";
+import { AnthropicMessagesClient } from "./anthropic.ts";
 import { OpenAiResponsesClient } from "./openai.ts";
-import { GatewayError, ModelGatewayService } from "./service.ts";
+import { GatewayError, ModelGatewayService, type ModelClient } from "./service.ts";
 
 const MAX_REQUEST_BYTES = 1_000_000;
 
-export function createModelGatewayServer(config: GatewayConfig, service = new ModelGatewayService(config, new OpenAiResponsesClient(config))) {
+export function createModelGatewayServer(config: GatewayConfig, service = new ModelGatewayService(config, providerClient(config))) {
   let activeRequests = 0;
   const server = createServer(async (request, response) => {
     const startedAt = Date.now();
     let status = 500;
+    let errorCode: string | undefined;
     const path = safePath(request.url);
     try {
       if (request.method === "GET" && path === "/health") {
         status = 200;
-        send(response, status, { status: "ok", provider: "openai-responses", modelConfigured: true });
+        send(response, status, { status: "ok", provider: providerLabel(config), modelConfigured: true });
         return;
       }
       if (request.method !== "POST" || !["/v1/generate", "/v1/review", "/v1/rubric"].includes(path)) {
@@ -43,9 +45,16 @@ export function createModelGatewayServer(config: GatewayConfig, service = new Mo
     } catch (error) {
       const failure = error instanceof GatewayError ? error : new GatewayError(500, "internal_error", "The model gateway failed safely");
       status = failure.status;
-      send(response, status, { error: { code: failure.code, message: failure.message } });
+      errorCode = failure.code;
+      send(response, status, {
+        error: {
+          code: failure.code,
+          message: failure.message,
+          ...(failure.details ? { details: failure.details } : {}),
+        },
+      });
     } finally {
-      process.stdout.write(`${JSON.stringify({ level: status >= 500 ? "error" : "info", service: "model-gateway", method: request.method, path, status, durationMs: Date.now() - startedAt })}\n`);
+      process.stdout.write(`${JSON.stringify({ level: status >= 500 ? "error" : "info", service: "model-gateway", method: request.method, path, status, ...(errorCode ? { errorCode } : {}), durationMs: Date.now() - startedAt })}\n`);
     }
   });
   server.requestTimeout = 125_000;
@@ -112,7 +121,17 @@ async function main(): Promise<void> {
     server.once("error", reject);
     server.listen(config.port, "0.0.0.0", resolve);
   });
-  process.stdout.write(`${JSON.stringify({ level: "info", service: "model-gateway", event: "started", port: config.port, provider: "openai-responses" })}\n`);
+  process.stdout.write(`${JSON.stringify({ level: "info", service: "model-gateway", event: "started", port: config.port, provider: providerLabel(config) })}\n`);
+}
+
+function providerClient(config: GatewayConfig): ModelClient {
+  return config.provider === "anthropic"
+    ? new AnthropicMessagesClient(config)
+    : new OpenAiResponsesClient(config);
+}
+
+function providerLabel(config: GatewayConfig): "openai-responses" | "anthropic-messages" {
+  return config.provider === "anthropic" ? "anthropic-messages" : "openai-responses";
 }
 
 if (fileURLToPath(import.meta.url) === process.argv[1]) {

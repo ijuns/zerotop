@@ -13,10 +13,14 @@ export interface RubricDefinition {
 export interface GatewayConfig {
   port: number;
   internalToken: string;
-  openAiApiKey: string;
-  openAiModel: string;
-  responsesEndpoint: string;
+  provider: "openai" | "anthropic";
+  providerApiKey: string;
+  providerModel: string;
+  providerEndpoint: string;
+  anthropicVersion: string | null;
   generationTimeoutMs: number;
+  generationMaxAttempts: number;
+  captureGenerationRawResponse: boolean;
   reviewTimeoutMs: number;
   rubricTimeoutMs: number;
   maxConcurrency: number;
@@ -25,31 +29,79 @@ export interface GatewayConfig {
 
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
-const OFFICIAL_BASE_URL = "https://api.openai.com/v1";
+const OFFICIAL_OPENAI_BASE_URL = "https://api.openai.com/v1";
+const OFFICIAL_ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1";
+const API_VERSION = /^\d{4}-\d{2}-\d{2}$/;
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): GatewayConfig {
   const internalToken = environment.MODEL_GATEWAY_INTERNAL_TOKEN ?? "";
-  const openAiApiKey = environment.OPENAI_API_KEY ?? "";
-  const openAiModel = environment.OPENAI_MODEL ?? "";
   if (internalToken.length < 32 || internalToken.length > 512 || /\s/.test(internalToken)) throw new Error("MODEL_GATEWAY_INTERNAL_TOKEN must contain 32-512 non-whitespace characters");
-  if (openAiApiKey.length < 32 || openAiApiKey.length > 512 || /\s/.test(openAiApiKey)) throw new Error("OPENAI_API_KEY is required and malformed");
-  if (!MODEL_ID.test(openAiModel) || openAiModel.startsWith("ft:")) throw new Error("OPENAI_MODEL must be a Structured Outputs-compatible non-fine-tuned model identifier");
-
-  const baseUrl = (environment.OPENAI_BASE_URL ?? OFFICIAL_BASE_URL).replace(/\/$/, "");
-  if (baseUrl !== OFFICIAL_BASE_URL) throw new Error("OPENAI_BASE_URL must be the official OpenAI API v1 endpoint");
+  const provider = providerKind(environment.MODEL_PROVIDER);
+  const providerConfig = provider === "openai"
+    ? openAiConfig(environment)
+    : anthropicConfig(environment);
 
   return {
     port: boundedInteger(environment.PORT, 9_010, 1, 65_535, "PORT"),
     internalToken,
-    openAiApiKey,
-    openAiModel,
-    responsesEndpoint: `${baseUrl}/responses`,
-    generationTimeoutMs: boundedInteger(environment.OPENAI_GENERATION_TIMEOUT_MS, 40_000, 5_000, 44_000, "OPENAI_GENERATION_TIMEOUT_MS"),
-    reviewTimeoutMs: boundedInteger(environment.OPENAI_REVIEW_TIMEOUT_MS, 25_000, 5_000, 29_000, "OPENAI_REVIEW_TIMEOUT_MS"),
-    rubricTimeoutMs: boundedInteger(environment.OPENAI_RUBRIC_TIMEOUT_MS, 9_000, 2_000, 11_000, "OPENAI_RUBRIC_TIMEOUT_MS"),
+    provider,
+    ...providerConfig,
+    generationTimeoutMs: providerTimeout(environment, provider, "GENERATION", 1_200_000, 5_000, 1_200_000),
+    generationMaxAttempts: boundedInteger(environment.MODEL_GATEWAY_GENERATION_MAX_ATTEMPTS, 1, 1, 2, "MODEL_GATEWAY_GENERATION_MAX_ATTEMPTS"),
+    captureGenerationRawResponse: generationRawResponseCapture(environment.MODEL_GATEWAY_DEBUG_RAW_RESPONSE_CAPTURE),
+    reviewTimeoutMs: providerTimeout(environment, provider, "REVIEW", 25_000, 5_000, 29_000),
+    rubricTimeoutMs: providerTimeout(environment, provider, "RUBRIC", 9_000, 2_000, 11_000),
     maxConcurrency: boundedInteger(environment.MODEL_GATEWAY_MAX_CONCURRENCY, 8, 1, 64, "MODEL_GATEWAY_MAX_CONCURRENCY"),
     rubrics: Object.freeze(parseRubrics(environment.RUBRIC_CATALOG_JSON)),
   };
+}
+
+function generationRawResponseCapture(raw: string | undefined): boolean {
+  if (raw === undefined) return false;
+  if (raw === "local-explicit") return true;
+  throw new Error("MODEL_GATEWAY_DEBUG_RAW_RESPONSE_CAPTURE must be unset or exactly local-explicit");
+}
+
+function providerKind(raw: string | undefined): "openai" | "anthropic" {
+  const value = (raw ?? "openai").toLowerCase();
+  if (value !== "openai" && value !== "anthropic") throw new Error("MODEL_PROVIDER must be openai or anthropic");
+  return value;
+}
+
+function openAiConfig(environment: NodeJS.ProcessEnv): Pick<GatewayConfig, "providerApiKey" | "providerModel" | "providerEndpoint" | "anthropicVersion"> {
+  const apiKey = requiredSecret(environment.OPENAI_API_KEY, "OPENAI_API_KEY");
+  const model = environment.OPENAI_MODEL ?? "";
+  if (!MODEL_ID.test(model) || model.startsWith("ft:")) throw new Error("OPENAI_MODEL must be a Structured Outputs-compatible non-fine-tuned model identifier");
+  const baseUrl = officialBaseUrl(environment.OPENAI_BASE_URL, OFFICIAL_OPENAI_BASE_URL, "OPENAI_BASE_URL", "OpenAI");
+  return { providerApiKey: apiKey, providerModel: model, providerEndpoint: `${baseUrl}/responses`, anthropicVersion: null };
+}
+
+function anthropicConfig(environment: NodeJS.ProcessEnv): Pick<GatewayConfig, "providerApiKey" | "providerModel" | "providerEndpoint" | "anthropicVersion"> {
+  const apiKey = requiredSecret(environment.ANTHROPIC_API_KEY, "ANTHROPIC_API_KEY");
+  const model = environment.ANTHROPIC_MODEL ?? "";
+  if (!MODEL_ID.test(model)) throw new Error("ANTHROPIC_MODEL must be a Structured Outputs-compatible model identifier");
+  const baseUrl = officialBaseUrl(environment.ANTHROPIC_BASE_URL, OFFICIAL_ANTHROPIC_BASE_URL, "ANTHROPIC_BASE_URL", "Anthropic");
+  const version = environment.ANTHROPIC_VERSION ?? "2023-06-01";
+  if (!API_VERSION.test(version)) throw new Error("ANTHROPIC_VERSION must use YYYY-MM-DD format");
+  return { providerApiKey: apiKey, providerModel: model, providerEndpoint: `${baseUrl}/messages`, anthropicVersion: version };
+}
+
+function requiredSecret(raw: string | undefined, name: string): string {
+  const value = raw ?? "";
+  if (value.length < 32 || value.length > 512 || /\s/.test(value)) throw new Error(`${name} is required and malformed`);
+  return value;
+}
+
+function officialBaseUrl(raw: string | undefined, fallback: string, name: string, provider: string): string {
+  const value = (raw ?? fallback).replace(/\/$/, "");
+  if (value !== fallback) throw new Error(`${name} must be the official ${provider} API v1 endpoint`);
+  return value;
+}
+
+function providerTimeout(environment: NodeJS.ProcessEnv, provider: "openai" | "anthropic", operation: "GENERATION" | "REVIEW" | "RUBRIC", fallback: number, minimum: number, maximum: number): number {
+  const neutralName = `MODEL_GATEWAY_${operation}_TIMEOUT_MS`;
+  const legacyName = `${provider.toUpperCase()}_${operation}_TIMEOUT_MS`;
+  return boundedInteger(environment[neutralName] ?? environment[legacyName], fallback, minimum, maximum, neutralName);
 }
 
 function parseRubrics(raw: string | undefined): Record<string, RubricDefinition> {

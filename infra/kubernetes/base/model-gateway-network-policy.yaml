@@ -40,7 +40,7 @@ spec:
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
-  name: model-gateway-openai-egress
+  name: model-gateway-provider-egress
 spec:
   endpointSelector:
     matchLabels:

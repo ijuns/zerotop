@@ -90,7 +90,10 @@ async def generate(request: GenerateRequest) -> dict[str, Any]:
         return await generate_lab(request.model_dump())
     except (DomainError, GenerationError) as exc:
         status = exc.status if isinstance(exc, GenerationError) else 422
-        raise HTTPException(status_code=status, detail=str(exc)) from exc
+        detail: str | dict[str, Any] = str(exc)
+        if isinstance(exc, GenerationError) and exc.details:
+            detail = {"message": str(exc), "debug": exc.details}
+        raise HTTPException(status_code=status, detail=detail) from exc
 
 
 @app.post("/v1/validate", dependencies=[Depends(require_internal_authorization)])

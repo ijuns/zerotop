@@ -7,14 +7,26 @@ interface SessionPayload {
   exp: number;
 }
 
-export function createSessionToken(
+export interface DesktopSession {
+  token: string;
+  expiresAt: string;
+}
+
+const defaultMaximumLifetimeMs = 4 * 60 * 60 * 1000;
+
+export function createDesktopSession(
   run: AuthorizedRun & { expiresAt?: string },
   signingKey: string,
   now = Date.now(),
-): string {
+  maximumLifetimeMs = defaultMaximumLifetimeMs,
+): DesktopSession {
+  if (!Number.isFinite(maximumLifetimeMs) || maximumLifetimeMs <= 0) {
+    throw new Error("Desktop session maximum lifetime is invalid");
+  }
   const runExpiry = run.expiresAt ? Date.parse(run.expiresAt) : Number.NaN;
-  const maximum = now + 4 * 60 * 60 * 1000;
-  const expiresAt = Number.isFinite(runExpiry) ? Math.min(runExpiry, maximum) : maximum;
+  const maximum = now + maximumLifetimeMs;
+  const rawExpiresAt = Number.isFinite(runExpiry) ? Math.min(runExpiry, maximum) : maximum;
+  const expiresAt = Math.floor(rawExpiresAt / 1000) * 1000;
   if (expiresAt <= now) throw new Error("Run is already expired");
   const payload: SessionPayload = {
     runId: run.runId,
@@ -22,7 +34,35 @@ export function createSessionToken(
     exp: Math.floor(expiresAt / 1000),
   };
   const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
-  return `${body}.${signature(body, signingKey)}`;
+  return {
+    token: `${body}.${signature(body, signingKey)}`,
+    expiresAt: new Date(expiresAt).toISOString(),
+  };
+}
+
+export function createSessionToken(
+  run: AuthorizedRun & { expiresAt?: string },
+  signingKey: string,
+  now = Date.now(),
+): string {
+  return createDesktopSession(run, signingKey, now).token;
+}
+
+export function desktopSessionCookie(
+  name: string,
+  token: string,
+  path: string,
+  expiresAt: string,
+  secure: boolean,
+  now = Date.now(),
+): string {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) throw new Error("Desktop session cookie name is invalid");
+  if (!path.startsWith("/") || /[;\r\n]/.test(path)) throw new Error("Desktop session cookie path is invalid");
+  const expiry = Date.parse(expiresAt);
+  if (!Number.isFinite(expiry) || expiry <= now) throw new Error("Desktop session cookie expiry is invalid");
+  const maxAge = Math.max(1, Math.floor((expiry - now) / 1000));
+  const secureFlag = secure ? "; Secure" : "";
+  return `${name}=${encodeURIComponent(token)}; Path=${path}; Max-Age=${maxAge}; Expires=${new Date(expiry).toUTCString()}; HttpOnly${secureFlag}; SameSite=Strict`;
 }
 
 export function verifySessionToken(

@@ -5,7 +5,24 @@ import {
   aiGenerationTimeoutFromEnvironment,
   HttpAiLabGenerator,
 } from "../src/ai.ts";
+import { ApiError } from "../src/errors.ts";
 import { normalizeLabGeneration } from "../src/input.ts";
+
+function normalizedBlueRequest(cveIds: string[] = []) {
+  return normalizeLabGeneration({
+    title: "AI generated blue lab",
+    prompt: "Investigate authentication anomalies using correlated ELK evidence.",
+    team: "blue",
+    desktopImage: "ubuntu",
+    accessMethod: "both",
+    questionTypes: ["elk_search", "mitre_attack"],
+    cveIds,
+    target: {
+      imageRef: "registry.codegate.internal/ranges/identity-lab",
+      imageDigest: `sha256:${"c".repeat(64)}`,
+    },
+  });
+}
 
 test("HTTP AI generator authenticates, validates and merges a server LabSpec", async () => {
   const calls: string[] = [];
@@ -110,18 +127,7 @@ test("HTTP AI generator authenticates, validates and merges a server LabSpec", a
       });
     },
   });
-  const normalized = normalizeLabGeneration({
-    title: "AI generated blue lab",
-    prompt: "Investigate authentication anomalies using correlated ELK evidence.",
-    team: "blue",
-    desktopImage: "ubuntu",
-    accessMethod: "both",
-    questionTypes: ["elk_search", "mitre_attack"],
-    target: {
-      imageRef: "registry.codegate.internal/ranges/identity-lab",
-      imageDigest: `sha256:${"c".repeat(64)}`,
-    },
-  });
+  const normalized = normalizedBlueRequest();
 
   const result = await generator.generate(normalized);
   assert.deepEqual(calls, [
@@ -146,19 +152,188 @@ test("HTTP AI generator authenticates, validates and merges a server LabSpec", a
 });
 
 test("AI generation timeout uses a bounded validated environment contract", () => {
-  assert.equal(aiGenerationTimeoutFromEnvironment({}), 90_000);
+  assert.equal(aiGenerationTimeoutFromEnvironment({}), 1_260_000);
   assert.equal(
     aiGenerationTimeoutFromEnvironment({ AI_GENERATION_TIMEOUT_MS: "30000" }),
     30_000,
   );
   assert.equal(
-    aiGenerationTimeoutFromEnvironment({ AI_GENERATION_TIMEOUT_MS: "180000" }),
-    180_000,
+    aiGenerationTimeoutFromEnvironment({ AI_GENERATION_TIMEOUT_MS: "1800000" }),
+    1_800_000,
   );
-  for (const invalid of ["29999", "180001", "90000.5", " 90000", "unlimited"]) {
+  for (const invalid of ["29999", "1800001", "1260000.5", " 1260000", "unlimited"]) {
     assert.throws(
       () => aiGenerationTimeoutFromEnvironment({ AI_GENERATION_TIMEOUT_MS: invalid }),
       /AI_GENERATION_TIMEOUT_MS/,
     );
   }
+});
+
+test("HTTP AI generator distinguishes an empty curated CVE catalog", async () => {
+  const generator = new HttpAiLabGenerator({
+    serviceUrl: "http://codegate-ai:8001",
+    internalToken: "ai-internal-secret",
+    fetchImpl: async () => Response.json(
+      { detail: "External CVE generation requires a non-empty curated package or artifact catalog" },
+      { status: 503 },
+    ),
+  });
+
+  await assert.rejects(
+    () => generator.generate(normalizedBlueRequest(["CVE-2026-12345"])),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 409);
+      assert.equal(error.code, "AI_CVE_CATALOG_EMPTY");
+      assert.match(error.message, /검증된 패키지 또는 아티팩트/);
+      assert.deepEqual(error.details, {
+        upstreamStatus: 503,
+        reason: "cve_catalog_empty",
+      });
+      return true;
+    },
+  );
+});
+
+test("HTTP AI generator reports non-CVE generation configuration separately", async () => {
+  const generator = new HttpAiLabGenerator({
+    serviceUrl: "http://codegate-ai:8001",
+    internalToken: "ai-internal-secret",
+    fetchImpl: async () => Response.json(
+      { detail: "External generation provider is not configured" },
+      { status: 503 },
+    ),
+  });
+
+  await assert.rejects(
+    () => generator.generate(normalizedBlueRequest()),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 503);
+      assert.equal(error.code, "AI_GENERATION_NOT_CONFIGURED");
+      assert.match(error.message, /Claude 연결 및 생성 모드/);
+      assert.deepEqual(error.details, {
+        upstreamStatus: 503,
+        reason: "generation_not_configured",
+      });
+      return true;
+    },
+  );
+});
+
+test("HTTP AI generator never forwards an unknown upstream body", async () => {
+  const upstreamSecret = "sk-ant-secret-must-not-leak";
+  const generator = new HttpAiLabGenerator({
+    serviceUrl: "http://codegate-ai:8001",
+    internalToken: "ai-internal-secret",
+    fetchImpl: async () => Response.json(
+      {
+        detail: `unexpected provider response: ${upstreamSecret}`,
+        traceback: `authorization=${upstreamSecret}`,
+      },
+      { status: 500 },
+    ),
+  });
+
+  await assert.rejects(
+    () => generator.generate(normalizedBlueRequest()),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 502);
+      assert.equal(error.code, "AI_SERVICE_REJECTED_REQUEST");
+      assert.doesNotMatch(error.message, /sk-ant|unexpected provider response/);
+      assert.deepEqual(error.details, {
+        upstreamStatus: 500,
+        reason: "unclassified_rejection",
+      });
+      assert.doesNotMatch(JSON.stringify(error.details), /sk-ant|authorization/);
+      return true;
+    },
+  );
+});
+
+test("HTTP AI generator exposes only allowlisted provider diagnostics when explicitly enabled", async () => {
+  const secret = "sk-ant-secret-must-not-leak";
+  const generator = new HttpAiLabGenerator({
+    serviceUrl: "http://codegate-ai:8001",
+    internalToken: "ai-internal-secret",
+    exposeDebugErrors: true,
+    fetchImpl: async () => Response.json(
+      {
+        detail: {
+          message: "Generation provider returned HTTP 504: Anthropic response exceeded timeout",
+          debug: {
+            stage: "model_gateway",
+            providerStage: "anthropic",
+            upstreamStatus: 504,
+            upstreamCode: "model_provider_timeout",
+            upstreamMessage: `Anthropic response exceeded timeout ${secret}`,
+            providerStatus: 504,
+            providerErrorType: "timeout_error",
+            providerRequestId: "req_debug_123",
+            providerResponseId: "msg_debug_123",
+            timeoutMs: 1_200_000,
+            generationAttempts: 2,
+            payloadBytes: 65_432,
+            payloadDigest: "sha256:abcdef0123456789",
+            parseKind: "syntax_error",
+            parseOffset: 321,
+            rawBody: secret,
+            stack: secret,
+          },
+        },
+      },
+      { status: 504 },
+    ),
+  });
+
+  await assert.rejects(
+    () => generator.generate(normalizedBlueRequest()),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 504);
+      assert.equal(error.code, "AI_PROVIDER_TIMEOUT");
+      assert.match(error.message, /Claude/);
+      const serialized = JSON.stringify(error.details);
+      assert.match(serialized, /model_provider_timeout/);
+      assert.match(serialized, /req_debug_123/);
+      assert.match(serialized, /msg_debug_123/);
+      assert.match(serialized, /sha256:abcdef0123456789/);
+      assert.match(serialized, /syntax_error/);
+      assert.match(serialized, /\[REDACTED\]/);
+      assert.doesNotMatch(serialized, /secret-must-not-leak|rawBody|stack/);
+      return true;
+    },
+  );
+});
+
+test("HTTP AI generator reports its outer generation deadline with safe diagnostics", async () => {
+  const timeout = new Error("request aborted");
+  timeout.name = "AbortError";
+  const generator = new HttpAiLabGenerator({
+    serviceUrl: "http://codegate-ai:8001",
+    internalToken: "ai-internal-secret",
+    generationTimeoutMs: 1_260_000,
+    exposeDebugErrors: true,
+    fetchImpl: async () => { throw timeout; },
+  });
+
+  await assert.rejects(
+    () => generator.generate(normalizedBlueRequest()),
+    (error: unknown) => {
+      assert.ok(error instanceof ApiError);
+      assert.equal(error.status, 504);
+      assert.equal(error.code, "AI_SERVICE_TIMEOUT");
+      assert.deepEqual(error.details, {
+        reason: "api_timeout",
+        debug: {
+          status: 504,
+          code: "AI_SERVICE_TIMEOUT",
+          stage: "api",
+          timeoutMs: 1_260_000,
+        },
+      });
+      return true;
+    },
+  );
 });

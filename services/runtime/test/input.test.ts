@@ -83,3 +83,50 @@ test("rejects unsafe identifiers and excessive TTL", () => {
     /invalid or unsupported/,
   );
 });
+
+test("accepts a bounded blue-team ELK topology and rejects role mismatches", () => {
+  const topology = {
+    schemaVersion: 1,
+    team: "blue",
+    isolation: "per_run",
+    workstation: { role: "soc_analyst", desktopImage: "ubuntu", entrypoint: "kibana" },
+    target: { role: "monitored_target", hostname: "target" },
+    telemetry: {
+      stack: "elastic",
+      collector: "elastic_agent",
+      generator: "scenario_log_generator",
+      index: "zerotop-logs-*",
+      generation: {
+        schemaVersion: 1,
+        profile: "powershell_rce_exfiltration",
+        totalEvents: 1_200,
+        timeRangeMinutes: 60,
+        seed: "test-seed",
+        timelineAnchor: "2026-07-22T00:00:00.000Z",
+      },
+      events: [{
+        id: "evidence-1",
+        document: {
+          "@timestamp": "2026-07-22T00:00:00.000Z",
+          event: { dataset: "zerotop.endpoint" },
+          threat: { technique: { id: ["T1059.001"] } },
+        },
+      }],
+    },
+  };
+  const blueRequest = { ...request, desktopImage: "ubuntu", accessMethod: "browser_desktop", topology };
+  const result = validateProvisionRequest(blueRequest, {
+    runtimeMode: "kubevirt",
+    allowedTargetRegistries: ["registry.codegate.internal"],
+  });
+  assert.equal(result.topology?.team, "blue");
+  assert.equal(result.topology?.telemetry?.events[0]?.id, "evidence-1");
+  assert.equal(result.topology?.telemetry?.generation?.totalEvents, 1_200);
+  assert.throws(
+    () => validateProvisionRequest({
+      ...blueRequest,
+      topology: { ...topology, workstation: { ...topology.workstation, role: "attack_operator" } },
+    }, { runtimeMode: "kubevirt", allowedTargetRegistries: ["registry.codegate.internal"] }),
+    /roles do not match/,
+  );
+});

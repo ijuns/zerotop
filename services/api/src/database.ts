@@ -136,6 +136,15 @@ function labFromRow(row: Row | undefined): JsonValue | null {
     typeof config.scenario === "object" && config.scenario !== null
       ? (config.scenario as Record<string, unknown>)
       : {};
+  const learning =
+    typeof config.learning === "object" && config.learning !== null
+      ? config.learning
+      : undefined;
+  const target =
+    typeof config.target === "object" && config.target !== null
+      ? config.target
+      : undefined;
+  const questions = Array.isArray(config.questions) ? config.questions : undefined;
   const accessMethod =
     accessModes.includes("browser_desktop") && accessModes.includes("openvpn")
       ? "both"
@@ -159,12 +168,19 @@ function labFromRow(row: Row | undefined): JsonValue | null {
     status: canonicalStatus,
     network: { egress: "deny", isolation: "per_run" },
     scenario: {
-      summary: scenario.objective ?? row.description,
-      logSources: row.team_type === "blue" ? ["elasticsearch", "endpoint"] : [],
-      attackChain: Array.isArray(scenario.mitreTechniques)
-        ? scenario.mitreTechniques.map((id) => ({ id, name: id, tactic: "unknown" }))
-        : [],
+      summary: scenario.summary ?? scenario.objective ?? row.description,
+      logSources: Array.isArray(scenario.logSources)
+        ? scenario.logSources
+        : row.team_type === "blue" ? ["elasticsearch", "endpoint"] : [],
+      attackChain: Array.isArray(scenario.attackChain)
+        ? scenario.attackChain
+        : Array.isArray(scenario.mitreTechniques)
+          ? scenario.mitreTechniques.map((id) => ({ id, name: id, tactic: "unknown" }))
+          : [],
     },
+    ...(learning ? { learning } : {}),
+    ...(target ? { target } : {}),
+    ...(questions ? { questions } : {}),
     // Compatibility aliases for the pre-contract web client.
     name: row.name,
     description: row.description,
@@ -705,7 +721,6 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       for (const lab of fixtures.labs) {
-        const primaryQuestionType = lab.questionTypes[0] ?? "free_text";
         labInsert.run(
           lab.id,
           lab.ownerUserId,
@@ -716,21 +731,8 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
           JSON.stringify(lab.questionTypes),
           lab.environment,
           JSON.stringify(["browser_desktop"]),
-          JSON.stringify({
-            fixture: true,
-            generatedBy: "ZeroTOP development seed",
-            validationMode: "ai-autonomous",
-          }),
-          JSON.stringify({
-            questions: [
-              {
-                id: "fixture-q1",
-                type: primaryQuestionType,
-                prompt: "실습 환경에서 핵심 공격 또는 탐지 근거를 식별하세요.",
-                maxPoints: 100,
-              },
-            ],
-          }),
+          JSON.stringify(lab.config),
+          JSON.stringify({ questions: lab.gradingQuestions }),
           DEVELOPMENT_FIXTURE_CREATED_AT,
           seedTime.toISOString(),
         );

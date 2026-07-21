@@ -767,6 +767,22 @@ function buildStateOf(value: unknown): LabBuildState | null {
 function labOf(value: unknown): Lab {
   const item = isRecord(value) ? value : {};
   const rawConfig = isRecord(item.config) ? item.config : {};
+  const rawLearning = item.learning ?? rawConfig.learning;
+  const learning = isRecord(rawLearning)
+    ? {
+        ...rawLearning,
+        sections: arrayValue(rawLearning.sections)
+          .filter(isRecord)
+          .map((section) => ({
+            ...section,
+            bodyMarkdown: typeof section.bodyMarkdown === "string"
+              ? section.bodyMarkdown
+              : typeof section.markdown === "string"
+                ? section.markdown
+                : "",
+          })),
+      }
+    : undefined;
   const rawQuestions = item.questions ?? rawConfig.questions;
   const questions = arrayValue(rawQuestions)
     .map(publicQuestionOf)
@@ -780,7 +796,7 @@ function labOf(value: unknown): Lab {
   const sanitized: Record<string, unknown> = {
     ...item,
     config,
-    learning: item.learning ?? rawConfig.learning,
+    learning,
     target: item.target ?? rawConfig.target,
     questions,
   };
@@ -1281,8 +1297,67 @@ export const api = {
     ),
 };
 
+function safeDebugRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function safeDebugValue(record: Record<string, unknown>, key: string): string | null {
+  const descriptor = Object.getOwnPropertyDescriptor(record, key);
+  if (!descriptor || !("value" in descriptor)) return null;
+
+  const value = descriptor.value;
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? String(value) : null;
+  }
+  if (typeof value !== "string") return null;
+
+  const normalized = value
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) return null;
+  return normalized.length <= 160 ? normalized : `${normalized.slice(0, 157)}...`;
+}
+
+function apiDebugSuffix(error: ApiError): string {
+  const details = safeDebugRecord(error.details);
+  const debug = details ? safeDebugRecord(details.debug) : null;
+  if (!debug) return "";
+
+  const fields: Array<[string, string | null]> = [
+    ["status", safeDebugValue(debug, "status") ?? String(error.status)],
+    ["code", safeDebugValue(debug, "code") ?? error.code ?? null],
+    ["stage", safeDebugValue(debug, "stage")],
+    ["providerStage", safeDebugValue(debug, "providerStage")],
+    ["upstreamStatus", safeDebugValue(debug, "upstreamStatus")],
+    ["upstreamCode", safeDebugValue(debug, "upstreamCode")],
+    ["upstreamMessage", safeDebugValue(debug, "upstreamMessage")],
+    ["providerStatus", safeDebugValue(debug, "providerStatus")],
+    ["providerErrorType", safeDebugValue(debug, "providerErrorType")],
+    ["providerRequestId", safeDebugValue(debug, "providerRequestId")],
+    ["providerResponseId", safeDebugValue(debug, "providerResponseId")],
+    ["providerMessage", safeDebugValue(debug, "providerMessage")],
+    ["generationAttempts", safeDebugValue(debug, "generationAttempts")],
+    ["payloadBytes", safeDebugValue(debug, "payloadBytes")],
+    ["payloadDigest", safeDebugValue(debug, "payloadDigest")],
+    ["parseKind", safeDebugValue(debug, "parseKind")],
+    ["parseOffset", safeDebugValue(debug, "parseOffset")],
+    ["timeoutMs", safeDebugValue(debug, "timeoutMs")],
+  ];
+  const summary = fields
+    .filter((entry): entry is [string, string] => entry[1] !== null)
+    .map(([key, value]) => `${key}=${value}`)
+    .join(", ");
+
+  return summary ? `\n디버그 정보: ${summary}` : "";
+}
+
 export function errorMessage(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
+  if (error instanceof ApiError) return `${error.message}${apiDebugSuffix(error)}`;
   if (error instanceof Error) return error.message;
   return "알 수 없는 오류가 발생했습니다.";
 }

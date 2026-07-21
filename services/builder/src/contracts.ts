@@ -80,6 +80,38 @@ export interface TelemetryEvent {
   document: { [key: string]: JsonValue };
 }
 
+export interface TelemetryGenerationPlan {
+  schemaVersion: 1;
+  profile: "powershell_rce_exfiltration" | "credential_abuse" | "ransomware" | "webshell" | "generic_intrusion" | "generic_endpoint_activity";
+  totalEvents: number;
+  timeRangeMinutes: number;
+  seed: string;
+  timelineAnchor: string;
+}
+
+export interface LabRuntimeTopology {
+  schemaVersion: 1;
+  team: Team;
+  isolation: "per_run";
+  workstation: {
+    role: "soc_analyst" | "attack_operator";
+    desktopImage: "ubuntu" | "kali";
+    entrypoint: "kibana" | "target";
+  };
+  target: {
+    role: "monitored_target" | "vulnerable_target";
+    hostname: "target";
+  };
+  telemetry?: {
+    stack: "elastic";
+    collector: "elastic_agent";
+    generator: "scenario_log_generator";
+    index: string;
+    events: TelemetryEvent[];
+    generation?: TelemetryGenerationPlan;
+  };
+}
+
 export interface LearningSection {
   id: string;
   title: string;
@@ -121,6 +153,8 @@ export interface EnvironmentBuildSpec {
     fixtures?: TelemetryFixture[];
     events: TelemetryEvent[];
   };
+  /** Optional only so stored pre-topology LabSpecs remain rebuildable. */
+  topology?: LabRuntimeTopology;
   learning: {
     title: string;
     summary: string;
@@ -201,6 +235,7 @@ export interface ConsumableBuildPayload {
   };
   scenario: EnvironmentBuildSpec["scenario"];
   telemetry?: EnvironmentBuildSpec["telemetry"];
+  topology?: EnvironmentBuildSpec["topology"];
   learning: EnvironmentBuildSpec["learning"];
   questions: GeneratedQuestion[];
   grading: EnvironmentBuildSpec["grading"];

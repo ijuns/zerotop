@@ -1,16 +1,20 @@
 import type { GatewayConfig } from "./config.ts";
+import { longRunningProviderFetch } from "./provider-fetch.ts";
 
 export class ModelProviderError extends Error {
   readonly status: number;
   readonly code: string;
+  readonly details?: Readonly<Record<string, string | number>>;
   constructor(
     status: number,
     code: string,
     message: string,
+    details?: Readonly<Record<string, string | number>>,
   ) {
     super(message);
     this.status = status;
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -33,24 +37,24 @@ export class OpenAiResponsesClient {
   private readonly fetchImpl: typeof fetch;
   constructor(
     config: GatewayConfig,
-    fetchImpl: typeof fetch = fetch,
+    fetchImpl: typeof fetch = longRunningProviderFetch,
   ) {
     this.config = config;
     this.fetchImpl = fetchImpl;
   }
 
   async createStructured(request: StructuredRequest): Promise<StructuredResponse> {
-    const response = await this.fetchImpl(this.config.responsesEndpoint, {
+    const response = await this.fetchImpl(this.config.providerEndpoint, {
       method: "POST",
       redirect: "error",
       headers: {
-        authorization: `Bearer ${this.config.openAiApiKey}`,
+        authorization: `Bearer ${this.config.providerApiKey}`,
         "content-type": "application/json",
         accept: "application/json",
         "user-agent": "CODEGATE-Model-Gateway/1.0",
       },
       body: JSON.stringify({
-        model: this.config.openAiModel,
+        model: this.config.providerModel,
         instructions: request.instructions,
         input: JSON.stringify(request.input),
         text: {
