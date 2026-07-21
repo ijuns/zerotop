@@ -1,5 +1,6 @@
 import {
   createHash,
+  createHmac,
   randomBytes,
   scryptSync,
   timingSafeEqual,
@@ -116,4 +117,62 @@ export function needsPasswordRehash(stored: string | null | undefined): boolean 
     Number(parts[2]) < SCRYPT_BLOCK_SIZE ||
     Number(parts[3]) < SCRYPT_PARALLELISM
   );
+}
+
+/**
+ * Stateless session tokens for password login.
+ *
+ * A token is `base64url(payload).base64url(hmac)`, where payload is
+ * `{ sub, exp }`. Signing statelessly avoids a sessions table, which keeps the
+ * free single-container deployment simple; the trade-off is that a token cannot
+ * be revoked before it expires, so the lifetime is kept short.
+ */
+const SESSION_TOKEN_TTL_SECONDS = 12 * 60 * 60;
+
+function b64url(input: Buffer | string): string {
+  return Buffer.from(input).toString("base64url");
+}
+
+function sign(payload: string, secret: string): string {
+  return createHmac("sha256", secret).update(payload).digest("base64url");
+}
+
+export function createSessionToken(
+  userId: string,
+  secret: string,
+  ttlSeconds: number = SESSION_TOKEN_TTL_SECONDS,
+): string {
+  const payload = b64url(
+    JSON.stringify({ sub: userId, exp: Math.floor(Date.now() / 1000) + ttlSeconds }),
+  );
+  return `${payload}.${sign(payload, secret)}`;
+}
+
+/** Returns the user id if the token is well-formed, unexpired and correctly signed. */
+export function verifySessionToken(
+  token: string | undefined,
+  secret: string,
+): string | null {
+  if (!token || !secret) return null;
+  const [payload, signature] = token.split(".");
+  if (!payload || !signature) return null;
+  const expected = sign(payload, secret);
+  const provided = Buffer.from(signature);
+  const wanted = Buffer.from(expected);
+  if (provided.length !== wanted.length || !timingSafeEqual(provided, wanted)) {
+    return null;
+  }
+  try {
+    const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (
+      typeof decoded?.sub !== "string" ||
+      typeof decoded?.exp !== "number" ||
+      decoded.exp <= Math.floor(Date.now() / 1000)
+    ) {
+      return null;
+    }
+    return decoded.sub;
+  } catch {
+    return null;
+  }
 }

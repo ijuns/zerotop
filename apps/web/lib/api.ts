@@ -533,6 +533,25 @@ export function setAccessTokenProvider(provider: AccessTokenProvider | null) {
   accessTokenProvider = provider;
 }
 
+// Password-session token (AUTH_MODE=local). Kept in localStorage so a returning
+// visitor stays signed in, and mirrored in memory for synchronous requests.
+const SESSION_STORAGE_KEY = "zerotop.sessionToken";
+let sessionToken: string | null =
+  typeof window !== "undefined"
+    ? window.localStorage.getItem(SESSION_STORAGE_KEY)
+    : null;
+
+export function getSessionToken() {
+  return sessionToken;
+}
+
+function storeSessionToken(token: string | null) {
+  sessionToken = token;
+  if (typeof window === "undefined") return;
+  if (token) window.localStorage.setItem(SESSION_STORAGE_KEY, token);
+  else window.localStorage.removeItem(SESSION_STORAGE_KEY);
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Accept", "application/json");
@@ -541,7 +560,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers.set("Content-Type", "application/json");
   }
 
-  const token = await accessTokenProvider?.();
+  const token = (await accessTokenProvider?.()) ?? sessionToken;
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   } else if (developmentIdentityEnabled) {
@@ -1173,7 +1192,7 @@ function organizationJoinCodeResultOf(value: unknown): OrganizationJoinCodeResul
 export const api = {
   health: () => request<HealthResponse>("/health"),
 
-  register: async (input: RegistrationRequest, authMode: "dev" | "oidc") => {
+  register: async (input: RegistrationRequest, authMode: "dev" | "oidc" | "local") => {
     const body =
       authMode === "oidc"
         ? {
@@ -1193,6 +1212,11 @@ export const api = {
       ),
     );
     const data = isRecord(payload) ? payload : {};
+    // In local mode registration signs the visitor straight in.
+    const session = isRecord(data.session) ? data.session : null;
+    if (session && typeof session.token === "string") {
+      storeSessionToken(session.token);
+    }
     return {
       user: (data.user ?? data) as UserContext,
       developmentAuth: isRecord(data.developmentAuth)
@@ -1200,6 +1224,26 @@ export const api = {
         : null,
       alreadyOnboarded: data.alreadyOnboarded === true,
     } satisfies RegistrationResult;
+  },
+
+  login: async (email: string, password: string): Promise<UserContext> => {
+    const payload = dataOf(
+      await request("/v1/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email, password }),
+      }),
+    );
+    const data = isRecord(payload) ? payload : {};
+    const session = isRecord(data.session) ? data.session : null;
+    if (!session || typeof session.token !== "string") {
+      throw new ApiError("로그인 응답에 세션 토큰이 없습니다.", 500);
+    }
+    storeSessionToken(session.token);
+    return (data.user ?? data) as UserContext;
+  },
+
+  logout: () => {
+    storeSessionToken(null);
   },
 
   me: async (): Promise<{ user: UserContext; consentRequired: boolean }> => {

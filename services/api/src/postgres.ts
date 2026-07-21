@@ -610,6 +610,29 @@ export class PostgresRepository implements PlatformRepository {
     return userFromRow(result.rows[0]);
   }
 
+  async getLoginCredentials(
+    email: string,
+  ): Promise<{ user: unknown; passwordHash: string | null } | null> {
+    const found = await this.pool.query(
+      "SELECT id, password_hash FROM users WHERE lower(email) = lower($1)",
+      [email],
+    );
+    if (found.rowCount === 0) return null;
+    const user = await this.getUser(String(found.rows[0].id));
+    if (!user) return null;
+    return {
+      user,
+      passwordHash: (found.rows[0].password_hash as string | null) ?? null,
+    };
+  }
+
+  async setPasswordHash(userId: string, password: string): Promise<void> {
+    await this.pool.query(
+      "UPDATE users SET password_hash = $1 WHERE id = $2",
+      [hashPassword(password), userId],
+    );
+  }
+
   async getUserByExternalSubject(subject: string): Promise<unknown | null> {
     const result = await this.pool.query(
       `SELECT u.*, m.role AS organization_role,

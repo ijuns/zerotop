@@ -5274,3 +5274,46 @@ body {
   accent-color: var(--green-dark);
   cursor: pointer;
 }
+
+/* ---- Password-session auth screen ---- */
+.auth-shell {
+  display: grid;
+  place-items: center;
+  min-height: 100vh;
+  padding: 40px 20px;
+  background: var(--surface-soft, #f6f8f6);
+}
+
+.auth-shell__inner {
+  width: 100%;
+  max-width: 520px;
+}
+
+.auth-shell__brand {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.auth-shell__brand .brand__mark img {
+  width: 44px;
+  height: 44px;
+}
+
+.auth-shell__brand h1 {
+  margin: 2px 0 0;
+  font-size: 22px;
+}
+
+.auth-shell__switch {
+  margin: 14px 2px 0;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.auth-shell__switch .text-button {
+  font-size: 11px;
+  font-weight: 800;
+}

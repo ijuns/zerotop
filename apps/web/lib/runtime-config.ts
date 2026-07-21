@@ -1,5 +1,8 @@
+export type WebAuthMode = "dev" | "local" | "oidc";
+
 export interface WebRuntimeConfig {
   apiUrl: string;
+  authMode: WebAuthMode;
   keycloakUrl: string;
   keycloakRealm: string;
   keycloakClientId: string;
@@ -16,13 +19,25 @@ export function webRuntimeConfig(
 ): WebRuntimeConfig {
   const developmentIdentityEnabled =
     environment.CODEGATE_WEB_DEVELOPMENT_IDENTITY === "true";
+  const rawAuthMode = environment.CODEGATE_WEB_AUTH_MODE?.trim();
+  // Password-session mode is explicit; otherwise dev identity implies dev, and
+  // its absence implies OIDC, preserving the previous behaviour.
+  const authMode: WebAuthMode =
+    rawAuthMode === "local"
+      ? "local"
+      : rawAuthMode === "oidc"
+        ? "oidc"
+        : rawAuthMode === "dev" || developmentIdentityEnabled
+          ? "dev"
+          : "oidc";
   const keycloakUrl = environment.CODEGATE_WEB_KEYCLOAK_URL?.trim() || "";
-  if (!developmentIdentityEnabled && !keycloakUrl) {
+  if (authMode === "oidc" && !keycloakUrl) {
     throw new Error(
       "CODEGATE_WEB_KEYCLOAK_URL is required when development identity is disabled",
     );
   }
   return {
+    authMode,
     apiUrl: publicEndpoint(
       "CODEGATE_WEB_API_URL",
       environment.CODEGATE_WEB_API_URL?.trim() || "/api",

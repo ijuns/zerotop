@@ -1007,6 +1007,24 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
     return userFromRow(row);
   }
 
+  getLoginCredentials(
+    email: string,
+  ): { user: JsonValue; passwordHash: string | null } | null {
+    const found = this.database
+      .prepare("SELECT id, password_hash FROM users WHERE email = ? COLLATE NOCASE")
+      .get(email) as Row | undefined;
+    if (!found) return null;
+    const user = this.getUser(String(found.id));
+    if (!user) return null;
+    return { user, passwordHash: (found.password_hash as string | null) ?? null };
+  }
+
+  setPasswordHash(userId: string, password: string): void {
+    this.database
+      .prepare("UPDATE users SET password_hash = ? WHERE id = ?")
+      .run(hashPassword(password), userId);
+  }
+
   getUserByExternalSubject(subject: string): JsonValue | null {
     const row = this.database
       .prepare(

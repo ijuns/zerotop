@@ -56,8 +56,12 @@ import {
   type EnvironmentBuilder,
 } from "./environment-builder.ts";
 import {
+  createSessionToken,
   generateOrganizationJoinCode,
   hashOrganizationJoinCode,
+  needsPasswordRehash,
+  verifyPassword,
+  verifySessionToken,
 } from "./security.ts";
 import { parseTargetRuntimeContract } from "./target-runtime-contract.ts";
 import {
@@ -113,6 +117,8 @@ interface ApplicationOptions {
   runSweepIntervalMs?: number;
   /** Honour X-Forwarded-For for audit source addresses. Only behind a trusted proxy. */
   trustProxyHeaders?: boolean;
+  /** HMAC secret for password-session tokens (AUTH_MODE=local). */
+  sessionSecret?: string;
 }
 
 interface HandlerContext {
@@ -125,6 +131,7 @@ interface HandlerContext {
   environmentBuilder: EnvironmentBuilder;
   authMode: string;
   oidcVerifier?: OidcVerifier;
+  sessionSecret: string;
   desktopGatewayInternalToken: string;
   desktopGatewayPublicUrl: string;
   openVpnDownloadInternalToken: string;
@@ -1138,12 +1145,36 @@ async function resolveActor(
     };
   }
 
+  // Password sessions: a signed Bearer token names the user. Roles come from
+  // the stored record, exactly as in dev mode, so authorization is identical.
+  if (context.authMode === "local") {
+    const userId = verifySessionToken(bearerToken(request), context.sessionSecret);
+    if (!userId) {
+      throw new ApiError(
+        401,
+        "AUTHENTICATION_REQUIRED",
+        "A valid session is required. Sign in to continue.",
+      );
+    }
+    const user = await context.repository.getUser(userId);
+    if (!user) {
+      throw new ApiError(401, "SESSION_USER_MISSING", "The session user no longer exists.");
+    }
+    rejectSuspendedAccount(user);
+    return actorFromDatabaseUser(user);
+  }
+
   const id = requestedUserId?.trim() || DEV_USER_ID;
   const user = await context.repository.getUser(id);
   if (!user) {
     throw new ApiError(401, "UNKNOWN_DEV_USER", "The development user does not exist.");
   }
   rejectSuspendedAccount(user);
+  return actorFromDatabaseUser(user);
+}
+
+/** Builds an actor with roles derived from the stored user (dev and local modes). */
+function actorFromDatabaseUser(user: unknown): RequestActor {
   const organization = actorOrganization(user);
   const roles = [
     ...(organization ? ["org_member"] : ["individual"]),
@@ -1152,7 +1183,15 @@ async function resolveActor(
       : []),
     ...(field(user, "platformRole") === "platform_admin" ? ["platform_admin"] : []),
   ];
-  return { id, user, roles };
+  return { id: stringField(user, "id") as string, user, roles };
+}
+
+function bearerToken(request: IncomingMessage): string | undefined {
+  const header = request.headers["authorization"];
+  const value = Array.isArray(header) ? header[0] : header;
+  if (!value) return undefined;
+  const match = value.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : undefined;
 }
 
 async function route(
@@ -1189,12 +1228,45 @@ async function route(
   }
 
   if (method === "POST" && path === "/v1/auth/register") {
-    if (context.authMode !== "dev") {
+    // Password registration serves both local development (X-User-Id) and the
+    // password-session deployment; OIDC uses /v1/auth/onboarding instead.
+    if (context.authMode !== "dev" && context.authMode !== "local") {
       throw new ApiError(
         403,
         "PASSWORD_REGISTRATION_DISABLED",
         "Password registration is disabled; authenticate with OIDC and use /v1/auth/onboarding.",
       );
+    }
+    if (context.authMode === "local") {
+      const preview = await readJson(request);
+      if (!isObject(preview) || typeof preview.password !== "string" || preview.password.length < 8) {
+        throw new ApiError(
+          400,
+          "PASSWORD_REQUIRED",
+          "A password of at least 8 characters is required to register.",
+        );
+      }
+      const input = await withResolvedHandle(context, normalizeRegistration(preview));
+      const user = await context.repository.register(input);
+      const userId = stringField(user, "id") as string;
+      await context.repository.recordAudit({
+        actorIp,
+        actorUserId: userId,
+        action: "auth.user_registered",
+        resourceType: "user",
+        resourceId: userId,
+        metadata: {
+          accountType: input.accountType,
+          termsVersion: TERMS_VERSION,
+          privacyVersion: PRIVACY_POLICY_VERSION,
+        },
+      });
+      // Registration signs the visitor straight in, so the required flow is
+      // register → session → use, with an explicit login available on return.
+      sendJson(response, 201, {
+        data: { user, session: { token: createSessionToken(userId, context.sessionSecret) } },
+      });
+      return;
     }
     const input = await withResolvedHandle(
       context,
@@ -1217,10 +1289,52 @@ async function route(
     sendJson(response, 201, {
       data: {
         user,
-        developmentAuth:
-          context.authMode === "dev"
-            ? { header: "X-User-Id", value: userId }
-            : null,
+        developmentAuth: { header: "X-User-Id", value: userId },
+      },
+    });
+    return;
+  }
+
+  if (method === "POST" && path === "/v1/auth/login") {
+    if (context.authMode !== "local") {
+      throw new ApiError(
+        404,
+        "ROUTE_NOT_FOUND",
+        "Password login is only available when AUTH_MODE=local.",
+      );
+    }
+    const body = await readJson(request);
+    const email = isObject(body) && typeof body.email === "string"
+      ? body.email.trim().toLowerCase()
+      : "";
+    const password = isObject(body) && typeof body.password === "string" ? body.password : "";
+    // A single generic error for a missing account or a wrong password avoids
+    // revealing which emails are registered.
+    const invalid = () =>
+      new ApiError(401, "INVALID_CREDENTIALS", "The email or password is incorrect.");
+    if (!email || !password) throw invalid();
+    const credentials = await context.repository.getLoginCredentials(email);
+    if (!credentials || !verifyPassword(password, credentials.passwordHash)) {
+      throw invalid();
+    }
+    rejectSuspendedAccount(credentials.user);
+    const userId = stringField(credentials.user, "id") as string;
+    // The stored hash is transparently upgraded to the current scrypt cost once
+    // the plaintext is in hand, which is the only time it is available.
+    if (needsPasswordRehash(credentials.passwordHash)) {
+      await context.repository.setPasswordHash(userId, password);
+    }
+    await context.repository.recordAudit({
+      actorIp,
+      actorUserId: userId,
+      action: "auth.login",
+      resourceType: "user",
+      resourceId: userId,
+    });
+    sendJson(response, 200, {
+      data: {
+        user: credentials.user,
+        session: { token: createSessionToken(userId, context.sessionSecret) },
       },
     });
     return;
@@ -2899,18 +3013,38 @@ export function createApplication(options: ApplicationOptions = {}) {
   const configuredAuthMode = options.authMode ?? process.env.AUTH_MODE ?? "oidc";
   const authMode = configuredAuthMode === "production" ? "oidc" : configuredAuthMode;
   const productionMode = configuredAuthMode === "production" || (authMode === "oidc" && process.env.NODE_ENV === "production");
-  if (authMode !== "dev" && authMode !== "oidc") {
+  if (authMode !== "dev" && authMode !== "oidc" && authMode !== "local") {
     throw new RepositoryError(
       "INVALID_AUTH_MODE",
-      "AUTH_MODE must be 'dev' or 'oidc'.",
+      "AUTH_MODE must be 'dev', 'local' or 'oidc'.",
       500,
     );
   }
+  // Password sessions are signed with this secret. It must be provided in a
+  // deployment; a random per-process fallback keeps local runs working but
+  // invalidates every session on restart, which is fine for development.
+  const sessionSecret =
+    options.sessionSecret ??
+    process.env.SESSION_SIGNING_SECRET ??
+    (authMode === "local" && process.env.NODE_ENV === "production"
+      ? ""
+      : randomBytes(32).toString("hex"));
+  if (authMode === "local" && !sessionSecret) {
+    throw new RepositoryError(
+      "SESSION_SECRET_REQUIRED",
+      "SESSION_SIGNING_SECRET must be set when AUTH_MODE=local in production.",
+      500,
+    );
+  }
+  // Local password mode is a self-contained deployment: it uses the same
+  // in-process simulators as dev for the runtime, AI, grader and gateways, so
+  // no external services are required.
+  const devInfra = authMode === "dev" || authMode === "local";
   const repositoryMode =
     options.repositoryMode ??
     (process.env.REPOSITORY_MODE === "sqlite" || process.env.REPOSITORY_MODE === "postgres"
       ? process.env.REPOSITORY_MODE
-      : authMode === "dev"
+      : devInfra
         ? "sqlite"
         : "postgres");
   const repository =
@@ -2931,7 +3065,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       : process.env.RUNTIME_ADAPTER === "simulator" ||
           process.env.RUNTIME_MODE === "simulator"
         ? "simulator"
-        : authMode === "dev"
+        : devInfra
           ? "simulator"
           : "http");
   if (
@@ -2954,17 +3088,17 @@ export function createApplication(options: ApplicationOptions = {}) {
             process.env.RUNTIME_SERVICE_URL ?? "http://codegate-runtime:9000",
           internalToken:
             process.env.RUNTIME_INTERNAL_TOKEN ??
-            (authMode === "dev" ? "local-runtime-token" : ""),
+            (devInfra ? "local-runtime-token" : ""),
           targetImage:
             process.env.RUNTIME_TARGET_IMAGE ??
-            (authMode === "dev" ? "codegate/local-target:development" : ""),
+            (devInfra ? "codegate/local-target:development" : ""),
           allowedTargetRegistries: (
             process.env.TARGET_IMAGE_REGISTRIES ?? "registry.codegate.internal"
           )
             .split(",")
             .map((item) => item.trim())
             .filter(Boolean),
-          allowTemplateFallback: authMode === "dev",
+          allowTemplateFallback: devInfra,
           desktopPublicUrl: process.env.DESKTOP_GATEWAY_PUBLIC_URL,
         }));
   const configuredLabGeneratorMode =
@@ -2975,7 +3109,7 @@ export function createApplication(options: ApplicationOptions = {}) {
           process.env.AI_ADAPTER === "http" ||
           process.env.AI_ADAPTER === "service"
         ? "http"
-        : authMode === "dev"
+        : devInfra
           ? "local"
           : "http");
   if (
@@ -2997,7 +3131,7 @@ export function createApplication(options: ApplicationOptions = {}) {
           serviceUrl: process.env.AI_SERVICE_URL ?? "http://codegate-ai:8001",
           internalToken:
             process.env.AI_INTERNAL_TOKEN ??
-            (authMode === "dev" ? "ai-service-dev-token" : ""),
+            (devInfra ? "ai-service-dev-token" : ""),
           generationTimeoutMs: aiGenerationTimeoutFromEnvironment(),
         }));
   const configuredEvidenceGraderMode =
@@ -3010,7 +3144,7 @@ export function createApplication(options: ApplicationOptions = {}) {
           process.env.GRADER_ADAPTER === "http" ||
           process.env.GRADER_ADAPTER === "service"
         ? "http"
-        : authMode === "dev"
+        : devInfra
           ? "mock"
           : "http");
   if (
@@ -3033,7 +3167,7 @@ export function createApplication(options: ApplicationOptions = {}) {
             process.env.GRADER_SERVICE_URL ?? "http://codegate-grader:9002",
           internalToken:
             process.env.GRADER_INTERNAL_TOKEN ??
-            (authMode === "dev" ? "grader-service-dev-token" : ""),
+            (devInfra ? "grader-service-dev-token" : ""),
         }));
   const configuredLabValidatorMode =
     options.labValidatorMode ??
@@ -3042,7 +3176,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       : process.env.LAB_VALIDATOR_ADAPTER === "http" ||
           process.env.LAB_VALIDATOR_ADAPTER === "service"
         ? "http"
-        : authMode === "dev"
+        : devInfra
           ? "development"
           : "http");
   if (
@@ -3071,7 +3205,7 @@ export function createApplication(options: ApplicationOptions = {}) {
             process.env.VALIDATOR_SERVICE_URL ?? "http://codegate-validator:9003",
           internalToken:
             process.env.VALIDATOR_INTERNAL_TOKEN ??
-            (authMode === "dev" ? "validator-service-dev-token" : ""),
+            (devInfra ? "validator-service-dev-token" : ""),
         }));
   const configuredTelemetryGatewayMode =
     options.telemetryGatewayMode ??
@@ -3079,7 +3213,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       ? "development"
       : process.env.TELEMETRY_ADAPTER === "http" || process.env.TELEMETRY_ADAPTER === "service"
         ? "http"
-        : authMode === "dev"
+        : devInfra
           ? "development"
           : "http");
   if (
@@ -3098,7 +3232,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       ? new DevelopmentTelemetryGateway()
       : new HttpTelemetryGateway({
           url: process.env.TELEMETRY_SERVICE_URL ?? "http://codegate-telemetry:9201",
-          token: process.env.TELEMETRY_INTERNAL_TOKEN ?? (authMode === "dev" ? "telemetry-service-dev-token" : ""),
+          token: process.env.TELEMETRY_INTERNAL_TOKEN ?? (devInfra ? "telemetry-service-dev-token" : ""),
         }));
   const configuredEnvironmentBuilderMode =
     options.environmentBuilderMode ??
@@ -3107,7 +3241,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       : process.env.ENVIRONMENT_BUILDER_ADAPTER === "http" ||
           process.env.ENVIRONMENT_BUILDER_ADAPTER === "service"
         ? "http"
-        : authMode === "dev"
+        : devInfra
           ? "development"
           : "http");
   if (
@@ -3127,7 +3261,7 @@ export function createApplication(options: ApplicationOptions = {}) {
       ? new DevelopmentEnvironmentBuilder()
       : new HttpEnvironmentBuilder({
           url: process.env.BUILDER_SERVICE_URL ?? "http://codegate-builder:9004",
-          token: process.env.BUILDER_INTERNAL_TOKEN ?? (authMode === "dev" ? "builder-service-dev-token" : ""),
+          token: process.env.BUILDER_INTERNAL_TOKEN ?? (devInfra ? "builder-service-dev-token" : ""),
         }));
   const oidcVerifier =
     authMode === "oidc" ? options.oidcVerifier ?? environmentOidcVerifier() : undefined;
@@ -3135,27 +3269,27 @@ export function createApplication(options: ApplicationOptions = {}) {
     options.allowedOrigins ??
     (process.env.ALLOWED_ORIGINS
       ? process.env.ALLOWED_ORIGINS.split(",").map((item) => item.trim()).filter(Boolean)
-      : authMode === "dev"
+      : devInfra
         ? ["http://localhost:3000", "http://127.0.0.1:3000"]
         : []);
   const allowedOrigins = new Set(configuredOrigins);
   const desktopGatewayInternalToken =
     options.desktopGatewayInternalToken ??
     process.env.DESKTOP_GATEWAY_INTERNAL_TOKEN ??
-    (authMode === "dev" ? "desktop-gateway-dev-token" : "");
+    (devInfra ? "desktop-gateway-dev-token" : "");
   const desktopGatewayPublicUrl = (
     options.desktopGatewayPublicUrl ??
     process.env.DESKTOP_GATEWAY_PUBLIC_URL ??
-    (authMode === "dev" ? "http://localhost:9001" : "https://desktop.codegate.invalid")
+    (devInfra ? "http://localhost:9001" : "https://desktop.codegate.invalid")
   ).replace(/\/$/, "");
   const openVpnDownloadInternalToken =
     options.openVpnDownloadInternalToken ??
     process.env.OPENVPN_DOWNLOAD_INTERNAL_TOKEN ??
-    (authMode === "dev" ? "openvpn-download-dev-token" : "");
+    (devInfra ? "openvpn-download-dev-token" : "");
   const openVpnDownloadPublicUrl = (
     options.openVpnDownloadPublicUrl ??
     process.env.OPENVPN_DOWNLOAD_PUBLIC_URL ??
-    (authMode === "dev" ? "http://localhost:9100" : "https://vpn.codegate.invalid")
+    (devInfra ? "http://localhost:9100" : "https://vpn.codegate.invalid")
   ).replace(/\/$/, "");
   if (productionMode) {
     validateProductionEdgeConfiguration({
@@ -3180,6 +3314,7 @@ export function createApplication(options: ApplicationOptions = {}) {
     environmentBuilder,
     authMode,
     oidcVerifier,
+    sessionSecret,
     desktopGatewayInternalToken,
     desktopGatewayPublicUrl,
     openVpnDownloadInternalToken,

@@ -49,6 +49,12 @@ export interface PlatformRepository {
   close(): MaybePromise<void>;
   getUser(userId: string): MaybePromise<unknown | null>;
   getUserByExternalSubject(subject: string): MaybePromise<unknown | null>;
+  /** Credentials for password login: the user plus its stored password hash. */
+  getLoginCredentials(
+    email: string,
+  ): MaybePromise<{ user: unknown; passwordHash: string | null } | null>;
+  /** Replaces the stored password hash, e.g. to upgrade it on login. */
+  setPasswordHash(userId: string, password: string): MaybePromise<void>;
   register(input: ResolvedRegistrationInput): MaybePromise<unknown>;
   onboardIdentity(input: IdentityOnboardingInput): MaybePromise<unknown>;
   createLab(userId: string, input: LabGenerationInput): MaybePromise<unknown>;

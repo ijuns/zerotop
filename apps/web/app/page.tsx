@@ -15,6 +15,7 @@ import {
   DEV_USER_ID,
   api,
   errorMessage,
+  getSessionToken,
   isDevelopmentIdentityEnabled,
   labBuildIsPending,
   labBuildState,
@@ -579,6 +580,12 @@ export default function HomePage() {
   const [signupState, setSignupState] = useState<DataState>("idle");
   const [signupError, setSignupError] = useState<string | null>(null);
   const [signupResult, setSignupResult] = useState<RegistrationResult | null>(null);
+  // Local password-session auth screen: null = app, "login"/"signup" = gated.
+  const [authScreen, setAuthScreen] = useState<"login" | "signup" | null>(null);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
+  const [loginState, setLoginState] = useState<DataState>("idle");
+  const [loginError, setLoginError] = useState<string | null>(null);
 
   const [title, setTitle] = useState("");
   const [prompt, setPrompt] = useState("");
@@ -636,11 +643,23 @@ export default function HomePage() {
         if (cancelled) return;
         setUser(profile.user);
         setConsentRequired(profile.consentRequired);
+        setAuthScreen(null);
       })
       .catch((error) => {
         if (cancelled) return;
         if (error instanceof ApiError && error.code === "ONBOARDING_REQUIRED") {
           setActiveView("signup");
+          setUserError(null);
+          return;
+        }
+        // In password-session mode an unauthenticated visitor lands on the
+        // login screen rather than an error.
+        if (
+          getSessionToken() === null &&
+          error instanceof ApiError &&
+          (error.status === 401 || error.status === 403)
+        ) {
+          setAuthScreen("login");
           setUserError(null);
           return;
         }
@@ -801,14 +820,19 @@ export default function HomePage() {
   const selectedValidationPassed = validationPassed(validation, selectedLab);
   const checks = validationChecks(validation);
   const connection = connectionOf(run);
-  const authMode: "dev" | "oidc" =
+  const authMode: "dev" | "oidc" | "local" =
     healthInfo?.authMode === "dev"
       ? "dev"
-      : healthInfo?.authMode === "oidc"
-        ? "oidc"
-        : isDevelopmentIdentityEnabled()
-          ? "dev"
-          : "oidc";
+      : healthInfo?.authMode === "local"
+        ? "local"
+        : healthInfo?.authMode === "oidc"
+          ? "oidc"
+          : isDevelopmentIdentityEnabled()
+            ? "dev"
+            : "oidc";
+  // The signup form collects email + password for both dev and local (password)
+  // modes; OIDC takes those from the verified token instead.
+  const passwordSignup = authMode === "dev" || authMode === "local";
   const signupConsentComplete = signupTermsAgreed && signupPrivacyAgreed;
   const signupValid =
     signupDisplayName.trim().length > 0 &&
@@ -1180,6 +1204,37 @@ export default function HomePage() {
     }
   };
 
+  const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (loginState === "loading") return;
+    setLoginState("loading");
+    setLoginError(null);
+    try {
+      const account = await api.login(loginEmail.trim(), loginPassword);
+      setUser(account);
+      setUserError(null);
+      setConsentRequired(false);
+      setAuthScreen(null);
+      setActiveView("home");
+      setLoginPassword("");
+      setLoginState("ready");
+      await refreshLabs(false);
+    } catch (error) {
+      setLoginError(errorMessage(error));
+      setLoginState("error");
+    }
+  };
+
+  const handleLogout = () => {
+    api.logout();
+    setUser(null);
+    setConsentRequired(false);
+    setAuthScreen("login");
+    setActiveView("home");
+    setLoginEmail("");
+    setLoginPassword("");
+  };
+
   const handleSignup = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!signupValid || signupState === "loading") return;
@@ -1193,7 +1248,7 @@ export default function HomePage() {
           displayName: signupDisplayName.trim(),
           affiliation: signupAffiliation.trim(),
           consent: { terms: signupTermsAgreed, privacy: signupPrivacyAgreed },
-          ...(authMode === "dev" ? { password: signupPassword } : {}),
+          ...(passwordSignup ? { password: signupPassword } : {}),
           accountType: signupAccountType,
           ...(signupAccountType === "organization"
             ? { organizationJoinCode: signupJoinCode.trim().toUpperCase() }
@@ -1204,9 +1259,12 @@ export default function HomePage() {
       if (authMode === "dev" && result.developmentAuth?.value) {
         setDevelopmentUserId(result.developmentAuth.value);
       }
+      // In local mode api.register stored the session token; the visitor is now
+      // signed in, so drop the auth screen and show the app.
       setSignupResult(result);
       setUser(result.user);
       setUserError(null);
+      setAuthScreen(null);
       setSignupState("ready");
       await refreshLabs(false);
     } catch (error) {
@@ -2135,12 +2193,12 @@ export default function HomePage() {
           <div className="signup-success" role="status"><span aria-hidden="true">✓</span><div><strong>{signupResult.alreadyOnboarded ? "이미 온보딩된 계정입니다" : "계정 준비가 완료되었습니다"}</strong><p>{signupResult.user.displayName || signupResult.user.handle} 님의 사용자 컨텍스트가 적용되었습니다.</p><button className="primary-button" type="button" onClick={() => chooseView("builder")}>Lab 설계 시작</button></div></div>
         ) : (
           <form className="signup-form" onSubmit={handleSignup}>
-            {authMode === "dev" && <div className="form-group"><label htmlFor="signup-email">이메일</label><input id="signup-email" type="email" value={signupEmail} onChange={(event) => setSignupEmail(event.target.value)} autoComplete="email" placeholder="name@example.com" required /></div>}
+            {passwordSignup && <div className="form-group"><label htmlFor="signup-email">이메일</label><input id="signup-email" type="email" value={signupEmail} onChange={(event) => setSignupEmail(event.target.value)} autoComplete="email" placeholder="name@example.com" required /></div>}
             <div className="signup-form__columns">
               <div className="form-group"><label htmlFor="signup-display-name">이름</label><input id="signup-display-name" type="text" value={signupDisplayName} onChange={(event) => setSignupDisplayName(event.target.value)} autoComplete="name" maxLength={80} placeholder="홍길동" required /></div>
               <div className="form-group"><label htmlFor="signup-affiliation">소속</label><input id="signup-affiliation" type="text" value={signupAffiliation} onChange={(event) => setSignupAffiliation(event.target.value)} autoComplete="organization" maxLength={80} placeholder="한빛금융 보안관제팀" required /><FieldHint>학교, 회사 또는 소속 팀을 입력하세요.</FieldHint></div>
             </div>
-            {authMode === "dev" && <div className="form-group"><label htmlFor="signup-password">비밀번호</label><input id="signup-password" type="password" value={signupPassword} onChange={(event) => setSignupPassword(event.target.value)} autoComplete="new-password" minLength={8} placeholder="8자 이상 입력" required /><FieldHint>로컬 개발 등록에서만 사용됩니다. 운영 환경은 OIDC 인증을 사용합니다.</FieldHint></div>}
+            {passwordSignup && <div className="form-group"><label htmlFor="signup-password">비밀번호</label><input id="signup-password" type="password" value={signupPassword} onChange={(event) => setSignupPassword(event.target.value)} autoComplete="new-password" minLength={8} placeholder="8자 이상 입력" required /><FieldHint>로컬 개발 등록에서만 사용됩니다. 운영 환경은 OIDC 인증을 사용합니다.</FieldHint></div>}
             {signupAccountType === "organization" && <div className="form-group"><label htmlFor="signup-join-code">조직 가입 코드</label><input id="signup-join-code" type="text" value={signupJoinCode} onChange={(event) => setSignupJoinCode(event.target.value.toUpperCase())} autoCapitalize="characters" placeholder="SECURITY-LAB" required /><FieldHint>조직 관리자로부터 받은 단일 조직 가입 코드를 입력하세요.</FieldHint></div>}
             <fieldset className="consent-block">
               <legend>개인정보 수집 및 이용 동의</legend>
@@ -2271,7 +2329,7 @@ export default function HomePage() {
       case "report-organization": return renderReport("organization");
       case "report-platform": return renderReport("platform");
       case "ranking": return renderRanking();
-      case "admin": return <AdminConsole roles={roles} organizationName={user?.organization?.name || user?.organizationName} currentUserId={user?.id} organizationRole={user?.organization?.role} organizationRankingOptIn={user?.organization?.rankingOptIn} authMode={authentication.mode} />;
+      case "admin": return <AdminConsole roles={roles} organizationName={user?.organization?.name || user?.organizationName} currentUserId={user?.id} organizationRole={user?.organization?.role} organizationRankingOptIn={user?.organization?.rankingOptIn} authMode={authentication.mode === "local" ? "dev" : authentication.mode} />;
       case "signup": return renderSignup();
     }
   };
@@ -2279,6 +2337,42 @@ export default function HomePage() {
   const displayName = user?.displayName || user?.name || user?.handle || "개발 사용자";
   const displaySecondary = user?.email || user?.organization?.name || user?.organizationName || (isDevelopmentIdentityEnabled() ? DEV_USER_ID : "사용자 정보 확인 중");
   const roleSummary = roles.length > 0 ? roles.map((role) => ROLE_LABELS[role]).join(" · ") : "역할 확인 중";
+
+  // Password-session gate: shown before the app shell until the visitor logs in
+  // or registers. Registration and login both store a session token and clear
+  // this screen.
+  if (authScreen) {
+    return (
+      <main className="auth-shell">
+        <div className="auth-shell__inner">
+          <div className="auth-shell__brand">
+            <span className="brand__mark" aria-hidden="true"><img src="/zerotop-logo.png" alt="" /></span>
+            <div>
+              <div className="eyebrow">ZeroTOP · Zero-day Training Orchestration Platform</div>
+              <h1>실전형 사이버 레인지</h1>
+            </div>
+          </div>
+          {authScreen === "login" ? (
+            <section className="panel signup-form-panel">
+              <div className="panel-heading"><div><span className="panel-kicker">SIGN IN</span><h2>로그인</h2></div></div>
+              <form className="signup-form" onSubmit={handleLogin}>
+                <div className="form-group"><label htmlFor="login-email">이메일</label><input id="login-email" type="email" value={loginEmail} onChange={(event) => setLoginEmail(event.target.value)} autoComplete="email" placeholder="name@example.com" required /></div>
+                <div className="form-group"><label htmlFor="login-password">비밀번호</label><input id="login-password" type="password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} autoComplete="current-password" required /></div>
+                {loginError && <div className="alert alert--error" role="alert"><strong>로그인하지 못했습니다.</strong><span>{loginError}</span></div>}
+                <button className="primary-button primary-button--wide" type="submit" disabled={loginState === "loading" || !loginEmail.trim() || !loginPassword}>{loginState === "loading" ? <><span className="spinner" aria-hidden="true" /> 확인 중</> : "로그인"}</button>
+              </form>
+              <p className="auth-shell__switch">계정이 없으신가요? <button type="button" className="text-button" onClick={() => { setAuthScreen("signup"); setActiveView("signup"); }}>회원가입</button></p>
+            </section>
+          ) : (
+            <>
+              {renderSignup()}
+              <p className="auth-shell__switch">이미 계정이 있으신가요? <button type="button" className="text-button" onClick={() => setAuthScreen("login")}>로그인</button></p>
+            </>
+          )}
+        </div>
+      </main>
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -2337,6 +2431,8 @@ export default function HomePage() {
             )}
             {authentication.mode === "dev" ? (
               <button className="signup-button" type="button" onClick={() => chooseView("signup")}>회원가입</button>
+            ) : authentication.mode === "local" ? (
+              <button className="signup-button" type="button" onClick={handleLogout}>로그아웃</button>
             ) : (
               <button className="signup-button" type="button" onClick={() => void authentication.logout()}>로그아웃</button>
             )}
