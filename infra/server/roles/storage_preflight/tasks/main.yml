@@ -1,0 +1,69 @@
+---
+- name: Inspect the declared Longhorn data path
+  ansible.builtin.stat:
+    path: "{{ longhorn_data_path }}"
+  register: longhorn_path
+
+- name: Require a pre-created Longhorn directory
+  ansible.builtin.assert:
+    that:
+      - longhorn_path.stat.exists
+      - longhorn_path.stat.isdir
+    fail_msg: >-
+      Mount and persist a dedicated Longhorn filesystem at
+      {{ longhorn_data_path }}. This playbook never formats disks automatically.
+
+- name: Resolve the Longhorn filesystem source
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --output, SOURCE, --target, "{{ longhorn_data_path }}"]
+  register: longhorn_mount_source
+  changed_when: false
+  check_mode: false
+
+- name: Resolve the root filesystem source
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --output, SOURCE, --target, /]
+  register: root_mount_source
+  changed_when: false
+  check_mode: false
+
+- name: Measure free Longhorn capacity in GiB
+  ansible.builtin.command:
+    argv: [df, --output=avail, --block-size=1G, "{{ longhorn_data_path }}"]
+  register: longhorn_free_space
+  changed_when: false
+  check_mode: false
+
+- name: Enforce dedicated, sufficiently sized storage
+  ansible.builtin.assert:
+    that:
+      - not longhorn_require_dedicated_mount | bool or longhorn_mount_source.stdout | trim != root_mount_source.stdout | trim
+      - (longhorn_free_space.stdout_lines | last | trim | int) >= longhorn_min_free_gb | int
+    fail_msg: >-
+      Longhorn requires a non-root filesystem with at least
+      {{ longhorn_min_free_gb }} GiB free on every node.
+
+- name: Ensure Longhorn owns only its declared data directory
+  ansible.builtin.file:
+    path: "{{ longhorn_data_path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Check NFSv4.1 kernel support required for RWX VM volumes
+  ansible.builtin.command:
+    argv: [grep, -Eq, '^CONFIG_NFS_V4_1=(y|m)$', "/boot/config-{{ ansible_kernel }}"]
+  register: nfsv41_check
+  changed_when: false
+  failed_when: nfsv41_check.rc != 0
+  check_mode: false
+
+- name: Check iSCSI initiator service state
+  ansible.builtin.command:
+    argv: [systemctl, is-active, iscsid]
+  register: iscsid_state
+  changed_when: false
+  failed_when: iscsid_state.stdout | trim != 'active'
+  check_mode: false
+  when: not ansible_check_mode

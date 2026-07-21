@@ -1,0 +1,393 @@
+# The runtime controller owns short-lived namespaces with a privileged Pod
+# Security exception for KubeVirt. Namespace-prefix RBAC alone is not enough:
+# a compromised controller must not be able to turn that exception into a
+# host-level Deployment or an arbitrary device-passthrough VM.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: codegate-runtime-workload-shape
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces", "resourcequotas", "serviceaccounts", "services", "secrets", "pods"]
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["jobs"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["networkpolicies"]
+      - apiGroups: ["kubevirt.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["virtualmachines"]
+  matchConditions:
+    - name: runtime-controller-only
+      expression: request.userInfo.username == 'system:serviceaccount:codegate-runtime-system:codegate-runtime'
+  validations:
+    - expression: >-
+        has(params.data)
+          && 'TARGET_IMAGE_REGISTRIES' in params.data
+          && params.data['TARGET_IMAGE_REGISTRIES'].matches('^[a-z0-9.-]+(?::[0-9]+)?(,[a-z0-9.-]+(?::[0-9]+)?)*$')
+          && 'UBUNTU_DESKTOP_IMAGE' in params.data
+          && params.data['UBUNTU_DESKTOP_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
+          && 'KALI_DESKTOP_IMAGE' in params.data
+          && params.data['KALI_DESKTOP_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
+          && 'OPENVPN_GATEWAY_IMAGE' in params.data
+          && params.data['OPENVPN_GATEWAY_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
+          && 'SANDBOX_PROBE_IMAGE' in params.data
+          && params.data['SANDBOX_PROBE_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
+      message: Runtime workload admission requires a complete, digest-pinned operator image policy ConfigMap.
+    - expression: >-
+        request.resource.resource == 'namespaces'
+          ? (has(object.metadata.labels)
+              && 'app.kubernetes.io/managed-by' in object.metadata.labels
+              && object.metadata.labels['app.kubernetes.io/managed-by'] == 'codegate-runtime'
+              && 'codegate.ai/lab-id' in object.metadata.labels
+              && (object.metadata.name.startsWith('range-')
+                ? ('codegate.ai/run-id' in object.metadata.labels
+                  && object.metadata.labels['pod-security.kubernetes.io/enforce'] == 'privileged')
+                : (object.metadata.name.startsWith('validation-')
+                  && 'codegate.ai/validation-id' in object.metadata.labels
+                  && object.metadata.labels['pod-security.kubernetes.io/enforce'] == 'restricted'))
+              && object.metadata.labels['pod-security.kubernetes.io/audit'] == 'restricted'
+              && object.metadata.labels['pod-security.kubernetes.io/warn'] == 'restricted')
+          : ((request.namespace.startsWith('range-')
+                || request.namespace.startsWith('validation-'))
+              && has(object.metadata.labels)
+              && 'app.kubernetes.io/managed-by' in object.metadata.labels
+              && object.metadata.labels['app.kubernetes.io/managed-by'] == 'codegate-runtime'
+              && 'codegate.ai/lab-id' in object.metadata.labels
+              && (request.namespace.startsWith('range-')
+                ? 'codegate.ai/run-id' in object.metadata.labels
+                : 'codegate.ai/validation-id' in object.metadata.labels))
+      message: Runtime-managed objects require the immutable ownership, lab, run or validation labels and the approved Pod Security level.
+    - expression: >-
+        request.resource.resource != 'resourcequotas'
+          || (has(object.spec.hard)
+            && (request.namespace.startsWith('range-')
+              ? (object.metadata.name == 'run-quota'
+                && object.spec.hard.size() == 9
+                && object.spec.hard['requests.cpu'] == '4'
+                && object.spec.hard['requests.memory'] == '10Gi'
+                && object.spec.hard['limits.cpu'] == '8'
+                && object.spec.hard['limits.memory'] == '16Gi'
+                && object.spec.hard['pods'] == '12'
+                && object.spec.hard['services'] == '8'
+                && object.spec.hard['count/secrets'] == '4'
+                && object.spec.hard['count/deployments.apps'] == '2'
+                && object.spec.hard['count/virtualmachines.kubevirt.io'] == '1')
+              : (object.metadata.name == 'validation-quota'
+                && object.spec.hard.size() == 8
+                && object.spec.hard['requests.cpu'] == '1'
+                && object.spec.hard['requests.memory'] == '1Gi'
+                && object.spec.hard['limits.cpu'] == '2'
+                && object.spec.hard['limits.memory'] == '2Gi'
+                && object.spec.hard['pods'] == '4'
+                && object.spec.hard['services'] == '2'
+                && object.spec.hard['count/jobs.batch'] == '1'
+                && object.spec.hard['count/deployments.apps'] == '1')))
+      message: The runtime may create only the fixed run or validation ResourceQuota.
+    - expression: >-
+        request.resource.resource != 'serviceaccounts'
+          || (object.metadata.name == 'default'
+            && has(object.automountServiceAccountToken)
+            && object.automountServiceAccountToken == false)
+      message: Runtime namespaces may use only a token-less default ServiceAccount.
+    - expression: request.resource.resource != 'pods'
+      message: The runtime controller may not create or update Pods directly; Jobs, Deployments and KubeVirt own Pod creation.
+    - expression: >-
+        request.resource.resource != 'secrets'
+          || (request.namespace.startsWith('range-')
+            && object.metadata.name in ['workstation-cloud-init', 'openvpn-gateway-bootstrap']
+            && object.type == 'Opaque')
+      message: The runtime may create only the two approved run-scoped Opaque Secrets.
+    - expression: >-
+        request.resource.resource != 'services'
+          || ((!has(object.spec.externalIPs) || object.spec.externalIPs.size() == 0)
+            && !has(object.spec.externalName)
+            && (!has(object.spec.ports) || object.spec.ports.all(p, !has(p.nodePort) || p.nodePort == 0))
+            && ((object.metadata.name == 'openvpn-gateway')
+              ? (request.namespace.startsWith('range-')
+                && object.spec.type == 'LoadBalancer'
+                && has(object.spec.allocateLoadBalancerNodePorts)
+                && object.spec.allocateLoadBalancerNodePorts == false
+                && object.spec.ports.size() == 1
+                && object.spec.ports[0].protocol == 'UDP'
+                && object.spec.ports[0].port == 1194)
+              : (object.metadata.name in ['target', 'desktop']
+                && object.spec.type == 'ClusterIP'
+                && object.spec.ports.size() == 1
+                && (object.metadata.name != 'desktop'
+                  || (request.namespace.startsWith('range-')
+                    && object.spec.ports[0].protocol == 'TCP'
+                    && object.spec.ports[0].port == 6080)))))
+      message: Runtime Services are limited to the internal target/desktop endpoints and the non-NodePort UDP VPN load balancer.
+    - expression: >-
+        request.resource.resource != 'deployments'
+          || (object.spec.replicas == 1
+            && has(object.metadata.labels)
+            && 'codegate.ai/role' in object.metadata.labels
+            && object.metadata.labels['codegate.ai/role'] in ['target', 'validation-target', 'vpn-gateway']
+            && ((request.namespace.startsWith('range-')
+                && ((object.metadata.name == 'target' && object.metadata.labels['codegate.ai/role'] == 'target')
+                  || (object.metadata.name == 'openvpn-gateway' && object.metadata.labels['codegate.ai/role'] == 'vpn-gateway')))
+              || (request.namespace.startsWith('validation-')
+                && object.metadata.name == 'target'
+                && object.metadata.labels['codegate.ai/role'] == 'validation-target'))
+            && object.spec.template.spec.serviceAccountName == 'default'
+            && has(object.spec.template.spec.automountServiceAccountToken)
+            && object.spec.template.spec.automountServiceAccountToken == false
+            && (!has(object.spec.template.spec.hostNetwork) || object.spec.template.spec.hostNetwork == false)
+            && (!has(object.spec.template.spec.hostPID) || object.spec.template.spec.hostPID == false)
+            && (!has(object.spec.template.spec.hostIPC) || object.spec.template.spec.hostIPC == false)
+            && (!has(object.spec.template.spec.shareProcessNamespace) || object.spec.template.spec.shareProcessNamespace == false)
+            && has(object.spec.template.spec.securityContext)
+            && has(object.spec.template.spec.securityContext.seccompProfile)
+            && object.spec.template.spec.securityContext.seccompProfile.type == 'RuntimeDefault'
+            && (!has(object.spec.template.spec.initContainers) || object.spec.template.spec.initContainers.size() == 0)
+            && object.spec.template.spec.containers.size() == 1
+            && object.spec.template.spec.containers.all(c,
+              c.image.matches('^.+@sha256:[a-f0-9]{64}$')
+              && (object.metadata.labels['codegate.ai/role'] == 'vpn-gateway'
+                ? c.image == params.data['OPENVPN_GATEWAY_IMAGE']
+                : params.data['TARGET_IMAGE_REGISTRIES'].split(',').exists(registry,
+                    c.image.startsWith(registry + '/')))
+              && (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))
+              && has(c.securityContext)
+              && has(c.securityContext.allowPrivilegeEscalation)
+              && c.securityContext.allowPrivilegeEscalation == false
+              && (!has(c.securityContext.privileged) || c.securityContext.privileged == false)
+              && has(c.securityContext.readOnlyRootFilesystem)
+              && c.securityContext.readOnlyRootFilesystem == true
+              && has(c.securityContext.capabilities)
+              && has(c.securityContext.capabilities.drop)
+              && 'ALL' in c.securityContext.capabilities.drop
+              && has(c.resources)
+              && has(c.resources.requests)
+              && has(c.resources.limits))
+            && (!has(object.spec.template.spec.volumes)
+              || object.spec.template.spec.volumes.all(v, has(v.emptyDir)))
+            && (object.metadata.labels['codegate.ai/role'] == 'vpn-gateway'
+              ? (object.spec.template.spec.containers.all(c,
+                  has(c.securityContext.runAsUser)
+                  && c.securityContext.runAsUser == 0
+                  && has(c.securityContext.capabilities.add)
+                  && c.securityContext.capabilities.add == ['NET_ADMIN']
+                  && c.resources.requests['cpu'] == '100m'
+                  && c.resources.requests['memory'] == '128Mi'
+                  && c.resources.requests['devices.kubevirt.io/tun'] == '1'
+                  && c.resources.limits['cpu'] == '1'
+                  && c.resources.limits['memory'] == '512Mi'
+                  && c.resources.limits['devices.kubevirt.io/tun'] == '1'))
+              : (has(object.spec.template.spec.securityContext.runAsNonRoot)
+                && object.spec.template.spec.securityContext.runAsNonRoot == true
+                && object.spec.template.spec.securityContext.runAsUser == 65532
+                && object.spec.template.spec.securityContext.runAsGroup == 65532
+                && object.spec.template.spec.containers.all(c,
+                  (!has(c.securityContext.capabilities.add)
+                    || c.securityContext.capabilities.add.size() == 0)
+                  && c.resources.requests['cpu'] == '250m'
+                  && c.resources.requests['memory'] == '256Mi'
+                  && c.resources.limits['cpu'] == '1'
+                  && c.resources.limits['memory'] == '512Mi'))))
+      message: Runtime Deployments must match the restricted target or NET_ADMIN-only VPN gateway shape; host namespaces, host ports, host paths and privileged containers are forbidden.
+    - expression: >-
+        request.resource.resource != 'jobs'
+          || (request.namespace.startsWith('validation-')
+            && object.metadata.name == 'sandbox-probe'
+            && object.spec.backoffLimit == 0
+            && object.spec.activeDeadlineSeconds >= 30
+            && object.spec.activeDeadlineSeconds <= 900
+            && object.spec.template.spec.serviceAccountName == 'default'
+            && has(object.spec.template.spec.automountServiceAccountToken)
+            && object.spec.template.spec.automountServiceAccountToken == false
+            && (!has(object.spec.template.spec.hostNetwork) || object.spec.template.spec.hostNetwork == false)
+            && (!has(object.spec.template.spec.hostPID) || object.spec.template.spec.hostPID == false)
+            && (!has(object.spec.template.spec.hostIPC) || object.spec.template.spec.hostIPC == false)
+            && has(object.spec.template.spec.securityContext.runAsNonRoot)
+            && object.spec.template.spec.securityContext.runAsNonRoot == true
+            && object.spec.template.spec.securityContext.seccompProfile.type == 'RuntimeDefault'
+            && (!has(object.spec.template.spec.initContainers) || object.spec.template.spec.initContainers.size() == 0)
+            && (!has(object.spec.template.spec.volumes) || object.spec.template.spec.volumes.size() == 0)
+            && object.spec.template.spec.containers.size() == 1
+            && object.spec.template.spec.containers[0].name == 'probe'
+            && object.spec.template.spec.containers[0].image == params.data['SANDBOX_PROBE_IMAGE']
+            && has(object.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation)
+            && object.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation == false
+            && has(object.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem)
+            && object.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem == true
+            && (!has(object.spec.template.spec.containers[0].securityContext.privileged)
+              || object.spec.template.spec.containers[0].securityContext.privileged == false)
+            && 'ALL' in object.spec.template.spec.containers[0].securityContext.capabilities.drop
+            && (!has(object.spec.template.spec.containers[0].securityContext.capabilities.add)
+              || object.spec.template.spec.containers[0].securityContext.capabilities.add.size() == 0))
+      message: The runtime may create only the digest-pinned, token-less and restricted validation probe Job.
+    - expression: >-
+        request.resource.resource != 'virtualmachines'
+          || (request.namespace.startsWith('range-')
+            && object.metadata.name == 'workstation'
+            && object.metadata.labels['codegate.ai/role'] == 'workstation'
+            && object.spec.running == true
+            && (!has(object.spec.dataVolumeTemplates) || object.spec.dataVolumeTemplates.size() == 0)
+            && object.spec.template.spec.domain.cpu.cores == 2
+            && object.spec.template.spec.domain.resources.requests.memory == '4Gi'
+            && (!has(object.spec.template.spec.domain.devices.hostDevices)
+              || object.spec.template.spec.domain.devices.hostDevices.size() == 0)
+            && (!has(object.spec.template.spec.domain.devices.gpus)
+              || object.spec.template.spec.domain.devices.gpus.size() == 0)
+            && (!has(object.spec.template.spec.domain.devices.filesystems)
+              || object.spec.template.spec.domain.devices.filesystems.size() == 0)
+            && !has(object.spec.template.spec.domain.devices.clientPassthrough)
+            && object.spec.template.spec.domain.devices.interfaces.size() == 1
+            && object.spec.template.spec.domain.devices.interfaces[0].name == 'default'
+            && has(object.spec.template.spec.domain.devices.interfaces[0].masquerade)
+            && object.spec.template.spec.networks.size() == 1
+            && object.spec.template.spec.networks[0].name == 'default'
+            && has(object.spec.template.spec.networks[0].pod)
+            && object.spec.template.spec.volumes.size() == 2
+            && object.spec.template.spec.volumes.all(v, v.name in ['root', 'cloudinit'])
+            && object.spec.template.spec.volumes.exists(v,
+              v.name == 'root'
+                && has(v.containerDisk)
+                && v.containerDisk.image in [params.data['UBUNTU_DESKTOP_IMAGE'], params.data['KALI_DESKTOP_IMAGE']])
+            && object.spec.template.spec.volumes.exists(v,
+              v.name == 'cloudinit'
+                && has(v.cloudInitNoCloud)
+                && v.cloudInitNoCloud.secretRef.name == 'workstation-cloud-init'))
+      message: Runtime VirtualMachines are limited to the fixed, digest-pinned workstation shape without host disks, host devices, GPUs or passthrough filesystems.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || ((request.namespace.startsWith('range-')
+              && object.metadata.name in ['default-deny', 'allow-target-from-clients', 'allow-workstation-to-target', 'allow-vpn-to-target', 'allow-dns', 'allow-desktop-gateway', 'allow-vpn-public', 'allow-vpn-bootstrap'])
+            || (request.namespace.startsWith('validation-')
+              && object.metadata.name in ['default-deny', 'allow-probe-target', 'allow-probe-dns', 'allow-target-from-probe']))
+      message: The runtime may create only the approved run and validation NetworkPolicies.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || object.metadata.name != 'default-deny'
+          || (object.spec.policyTypes.size() == 2
+            && 'Ingress' in object.spec.policyTypes
+            && 'Egress' in object.spec.policyTypes
+            && (!has(object.spec.ingress) || object.spec.ingress.size() == 0)
+            && (!has(object.spec.egress) || object.spec.egress.size() == 0))
+      message: Runtime default-deny policies may not contain allow rules.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || object.metadata.name in ['default-deny', 'allow-vpn-public']
+          || ((!has(object.spec.ingress)
+              || object.spec.ingress.all(rule,
+                has(rule.from)
+                  && rule.from.size() > 0
+                  && rule.from.all(peer, has(peer.podSelector))))
+            && (!has(object.spec.egress)
+              || object.spec.egress.all(rule,
+                has(rule.to)
+                  && rule.to.size() > 0
+                  && rule.to.all(peer, has(peer.podSelector)))))
+      message: Runtime allow policies require explicit Pod peers; empty all-source or all-destination rules are forbidden.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || object.metadata.name != 'allow-vpn-public'
+          || (request.namespace.startsWith('range-')
+            && object.spec.policyTypes == ['Ingress']
+            && object.spec.podSelector.matchLabels.size() == 1
+            && object.spec.podSelector.matchLabels['codegate.ai/role'] == 'vpn-gateway'
+            && (!has(object.spec.podSelector.matchExpressions)
+              || object.spec.podSelector.matchExpressions.size() == 0)
+            && object.spec.ingress.size() == 1
+            && !has(object.spec.ingress[0].from)
+            && object.spec.ingress[0].ports == [{'protocol': 'UDP', 'port': 1194}]
+            && (!has(object.spec.egress) || object.spec.egress.size() == 0))
+      message: Public runtime ingress is limited to UDP 1194 on the per-run VPN gateway.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || !(object.metadata.name in ['allow-dns', 'allow-probe-dns'])
+          || (object.spec.policyTypes == ['Egress']
+            && object.spec.egress.size() == 1
+            && object.spec.egress[0].to.size() == 1
+            && object.spec.egress[0].to[0].namespaceSelector.matchLabels.size() == 1
+            && object.spec.egress[0].to[0].namespaceSelector.matchLabels['kubernetes.io/metadata.name'] == 'kube-system'
+            && object.spec.egress[0].to[0].podSelector.matchLabels.size() == 1
+            && object.spec.egress[0].to[0].podSelector.matchLabels['k8s-app'] == 'kube-dns'
+            && object.spec.egress[0].ports.size() == 2
+            && object.spec.egress[0].ports.all(p,
+              p.port == 53 && p.protocol in ['TCP', 'UDP']))
+      message: Runtime DNS egress is limited to cluster DNS on TCP/UDP 53.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || object.metadata.name != 'allow-desktop-gateway'
+          || (request.namespace.startsWith('range-')
+            && object.spec.policyTypes == ['Ingress']
+            && object.spec.podSelector.matchLabels.size() == 1
+            && object.spec.podSelector.matchLabels['codegate.ai/role'] == 'workstation'
+            && object.spec.ingress.size() == 1
+            && object.spec.ingress[0].from.size() == 1
+            && object.spec.ingress[0].from[0].namespaceSelector.matchLabels.size() == 1
+            && object.spec.ingress[0].from[0].namespaceSelector.matchLabels['kubernetes.io/metadata.name'] == 'codegate-desktop-system'
+            && object.spec.ingress[0].from[0].podSelector.matchLabels.size() == 1
+            && object.spec.ingress[0].from[0].podSelector.matchLabels['app.kubernetes.io/name'] == 'codegate-desktop-gateway'
+            && object.spec.ingress[0].ports == [{'protocol': 'TCP', 'port': 6080}])
+      message: Browser desktop ingress is limited to the trusted gateway on TCP 6080.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || object.metadata.name != 'allow-vpn-bootstrap'
+          || (request.namespace.startsWith('range-')
+            && object.spec.policyTypes == ['Egress']
+            && object.spec.podSelector.matchLabels.size() == 1
+            && object.spec.podSelector.matchLabels['codegate.ai/role'] == 'vpn-gateway'
+            && object.spec.egress.size() == 1
+            && object.spec.egress[0].to.size() == 1
+            && object.spec.egress[0].to[0].namespaceSelector.matchLabels.size() == 1
+            && object.spec.egress[0].to[0].namespaceSelector.matchLabels['kubernetes.io/metadata.name'] == 'codegate-vpn-system'
+            && object.spec.egress[0].to[0].podSelector.matchLabels.size() == 1
+            && object.spec.egress[0].to[0].podSelector.matchLabels['app.kubernetes.io/name'] == 'codegate-openvpn-issuer'
+            && object.spec.egress[0].ports == [{'protocol': 'TCP', 'port': 9100}])
+      message: VPN bootstrap egress is limited to the trusted issuer on TCP 9100.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || ((!has(object.spec.ingress)
+              || object.spec.ingress.all(rule,
+                !has(rule.from)
+                  || rule.from.all(peer, !has(peer.ipBlock))))
+            && (!has(object.spec.egress)
+              || object.spec.egress.all(rule,
+                !has(rule.to)
+                  || rule.to.all(peer, !has(peer.ipBlock))))
+            && (!has(object.spec.ingress)
+              || object.spec.ingress.all(rule,
+                !has(rule.from)
+                  || rule.from.all(peer,
+                    !has(peer.namespaceSelector)
+                      || object.metadata.name == 'allow-desktop-gateway')))
+            && (!has(object.spec.egress)
+              || object.spec.egress.all(rule,
+                !has(rule.to)
+                  || rule.to.all(peer,
+                    !has(peer.namespaceSelector)
+                      || object.metadata.name in ['allow-dns', 'allow-probe-dns', 'allow-vpn-bootstrap']))))
+      message: Runtime NetworkPolicies may not use IP blocks or arbitrary cross-namespace selectors.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: codegate-runtime-workload-shape
+spec:
+  policyName: codegate-runtime-workload-shape
+  paramRef:
+    name: codegate-runtime-config
+    namespace: codegate-runtime-system
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]

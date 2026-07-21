@@ -1,0 +1,41 @@
+global_defs {
+  enable_script_security
+  script_user root
+}
+
+vrrp_script chk_haproxy {
+  script "/usr/bin/pgrep haproxy"
+  interval 2
+  timeout 2
+  fall 3
+  rise 2
+}
+
+vrrp_instance VI_CODEGATE_RKE2 {
+  state BACKUP
+  interface {{ rke2_ha_interface }}
+  virtual_router_id {{ keepalived_virtual_router_id }}
+  priority {{ 150 - (groups['rke2_servers'].index(inventory_hostname) * 10) }}
+  advert_int 1
+
+  authentication {
+    auth_type PASS
+    auth_pass {{ keepalived_auth_pass }}
+  }
+
+  unicast_src_ip {{ ansible_host }}
+  unicast_peer {
+{% for host in groups['rke2_servers'] if host != inventory_hostname %}
+    {{ hostvars[host].ansible_host }}
+{% endfor %}
+  }
+
+  virtual_ipaddress {
+    {{ rke2_ha_vip }}/{{ rke2_ha_vip_prefix }} dev {{ rke2_ha_interface }}
+  }
+
+  track_script {
+    chk_haproxy
+  }
+}
+

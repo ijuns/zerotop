@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codegate-telemetry
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-telemetry
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: codegate-telemetry
+    spec:
+      serviceAccountName: codegate-telemetry
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: telemetry
+          image: ghcr.io/replace-me/codegate-telemetry:replace-with-digest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9201
+          env:
+            - name: PORT
+              value: "9201"
+            - name: TELEMETRY_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-telemetry-secrets
+                  key: TELEMETRY_INTERNAL_TOKEN
+            - name: ELASTICSEARCH_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: codegate-platform-config
+                  key: ELASTICSEARCH_URL
+            - name: ELASTICSEARCH_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-telemetry-secrets
+                  key: ELASTICSEARCH_API_KEY
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: temporary
+          emptyDir:
+            medium: Memory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codegate-telemetry
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: codegate-telemetry
+  ports:
+    - name: http
+      port: 9201
+      targetPort: http

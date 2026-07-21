@@ -1,0 +1,34 @@
+# RKE2 is pinned to Cilium in infra/server. Standard NetworkPolicy cannot
+# express an FQDN allowlist, so the AI service receives a second, Cilium-native
+# policy for its fixed NVD dependency. Model generation/review/rubric requests
+# use the in-cluster model-gateway Service and its separate NetworkPolicy; the
+# AI Pod never receives general provider egress.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: ai-approved-external-egress
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-ai
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              # DNS responses must be observed by Cilium for toFQDNs identity
+              # updates. Network reachability remains limited to the fixed
+              # name below on TCP 443.
+              - matchPattern: "*"
+    - toFQDNs:
+        - matchName: services.nvd.nist.gov
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP

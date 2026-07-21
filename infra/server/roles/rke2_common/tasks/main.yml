@@ -1,0 +1,127 @@
+---
+- name: Create RKE2 bootstrap directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: /usr/local/src/codegate-rke2, mode: "0700" }
+    - { path: /etc/rancher/rke2, mode: "0700" }
+
+- name: Inspect an existing RKE2 binary
+  ansible.builtin.stat:
+    path: /usr/local/bin/rke2
+  register: rke2_binary
+
+- name: Read the installed RKE2 version
+  ansible.builtin.command: /usr/local/bin/rke2 --version
+  register: installed_rke2_version
+  changed_when: false
+  failed_when: false
+  when: rke2_binary.stat.exists
+  check_mode: false
+
+- name: Decide whether the pinned RKE2 build is required
+  ansible.builtin.set_fact:
+    rke2_install_required: >-
+      {{ not rke2_binary.stat.exists or
+         rke2_version not in (installed_rke2_version.stdout | default('')) }}
+    normalized_rke2_installer_checksum: >-
+      sha256:{{ rke2_install_script_checksum | regex_replace('^sha256:', '') }}
+
+- name: Download the reviewed RKE2 installer
+  ansible.builtin.get_url:
+    url: "{{ rke2_install_script_url }}"
+    dest: /usr/local/src/codegate-rke2/install.sh
+    owner: root
+    group: root
+    mode: "0700"
+    checksum: "{{ normalized_rke2_installer_checksum }}"
+  when:
+    - rke2_install_required | bool
+    - not ansible_check_mode
+
+- name: Install the pinned RKE2 node type
+  ansible.builtin.command: /usr/local/src/codegate-rke2/install.sh
+  environment:
+    INSTALL_RKE2_TYPE: "{{ rke2_node_type }}"
+    INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+  register: rke2_install
+  changed_when: true
+  when:
+    - rke2_install_required | bool
+    - not ansible_check_mode
+
+- name: Confirm the expected systemd unit was installed
+  ansible.builtin.stat:
+    path: "/etc/systemd/system/rke2-{{ rke2_node_type }}.service"
+  register: rke2_systemd_unit
+
+- name: Require the RKE2 systemd unit outside check mode
+  ansible.builtin.assert:
+    that:
+      - rke2_systemd_unit.stat.exists
+    fail_msg: The RKE2 installer did not create the expected systemd unit.
+  when: not ansible_check_mode
+
+- name: Install the private registry TLS CA
+  ansible.builtin.template:
+    src: private-registry-ca.crt.j2
+    dest: "{{ private_registry_ca_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart RKE2 node
+  when: private_registry_enabled | bool
+
+- name: Install the protected RKE2 private registry configuration
+  ansible.builtin.template:
+    src: registries.yaml.j2
+    dest: /etc/rancher/rke2/registries.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart RKE2 node
+  when: private_registry_enabled | bool
+
+- name: Inspect the RKE2 CIS kernel policy
+  ansible.builtin.stat:
+    path: /usr/local/share/rke2/rke2-cis-sysctl.conf
+  register: rke2_cis_sysctl
+  when:
+    - rke2_cis_profile | bool
+    - not ansible_check_mode
+
+- name: Require the pinned RKE2 CIS kernel policy
+  ansible.builtin.assert:
+    that:
+      - rke2_cis_sysctl.stat.exists
+    fail_msg: The pinned RKE2 package did not provide its CIS sysctl policy.
+  when:
+    - rke2_cis_profile | bool
+    - not ansible_check_mode
+
+- name: Persist the RKE2 CIS kernel policy
+  ansible.builtin.copy:
+    src: /usr/local/share/rke2/rke2-cis-sysctl.conf
+    dest: /etc/sysctl.d/90-rke2-cis.conf
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  register: rke2_cis_sysctl_copy
+  when:
+    - rke2_cis_profile | bool
+    - not ansible_check_mode
+
+- name: Apply the RKE2 CIS kernel policy before service startup
+  ansible.builtin.command: sysctl --system
+  changed_when: true
+  when:
+    - rke2_cis_profile | bool
+    - rke2_cis_sysctl_copy.changed | default(false)
+    - not ansible_check_mode

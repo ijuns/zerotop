@@ -1,0 +1,40 @@
+---
+- name: Inspect the KVM character device
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: kvm_device
+
+- name: Read CPU flags for hardware virtualization
+  ansible.builtin.slurp:
+    src: /proc/cpuinfo
+  register: kvm_cpuinfo
+
+- name: Require hardware-backed KVM on every workload node
+  ansible.builtin.assert:
+    that:
+      - kvm_device.stat.exists
+      - kvm_device.stat.ischr | default(false)
+      - >-
+        ' vmx ' in (' ' ~ (kvm_cpuinfo.content | b64decode | regex_replace('\n', ' ')) ~ ' ')
+        or ' svm ' in (' ' ~ (kvm_cpuinfo.content | b64decode | regex_replace('\n', ' ')) ~ ' ')
+    fail_msg: >-
+      /dev/kvm and Intel VMX or AMD SVM are mandatory. Enable virtualization in
+      firmware (and nested virtualization on a hosting hypervisor) before retrying.
+  when: require_hardware_virtualization | bool
+
+- name: Verify the selected KVM module is loaded
+  ansible.builtin.command:
+    argv: [lsmod]
+  register: loaded_modules
+  changed_when: false
+  check_mode: false
+
+- name: Confirm base and vendor KVM modules
+  ansible.builtin.assert:
+    that:
+      - "'kvm' in loaded_modules.stdout"
+      - kvm_vendor_module in loaded_modules.stdout
+    fail_msg: The KVM kernel modules did not load successfully.
+  when:
+    - require_hardware_virtualization | bool
+    - not ansible_check_mode

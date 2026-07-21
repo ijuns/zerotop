@@ -1,0 +1,25 @@
+---
+# RFC 5737 documentation addresses only. This inventory is blocked from deploys
+# by deployment_confirmed=false and must be copied to the ignored inventory.yml.
+all:
+  vars:
+    ansible_user: ubuntu
+    ansible_become: true
+    # Set this only in inventory.yml or your SSH agent; never commit a real path.
+    # ansible_ssh_private_key_file: /secure/path/to/private-key
+  children:
+    rke2_cluster:
+      children:
+        rke2_servers:
+          hosts:
+            codegate-cp-01:
+              ansible_host: 192.0.2.11
+            codegate-cp-02:
+              ansible_host: 192.0.2.12
+            codegate-cp-03:
+              ansible_host: 192.0.2.13
+        # Optional scale-out workers. The recommended initial topology is three
+        # server nodes; add agents here when workload capacity is separated.
+        rke2_agents:
+          hosts: {}
+

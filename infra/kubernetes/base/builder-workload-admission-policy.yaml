@@ -1,0 +1,284 @@
+# The builder has cluster-scoped create/patch rights only because every build
+# receives a fresh namespace. This policy constrains that identity to the
+# rootless BuildKit shape emitted by services/builder and rejects alternate
+# Pods, host mounts, privileged jobs, broad egress and mutable credentials.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: codegate-builder-workload-shape
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["namespaces", "resourcequotas", "limitranges", "serviceaccounts", "configmaps", "secrets", "pods"]
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["jobs"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["networkpolicies"]
+  matchConditions:
+    - name: builder-controller-only
+      expression: request.userInfo.username == 'system:serviceaccount:codegate-platform:codegate-builder'
+  validations:
+    - expression: >-
+        has(params.data)
+          && 'BUILDKIT_IMAGE' in params.data
+          && params.data['BUILDKIT_IMAGE'].matches('^.+@sha256:[a-f0-9]{64}$')
+          && 'BUILD_REGISTRY_TARGET_SECRET' in params.data
+          && params.data['BUILD_REGISTRY_TARGET_SECRET'].matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+          && 'BUILD_EGRESS_CIDRS' in params.data
+          && params.data['BUILD_EGRESS_CIDRS'].matches('^[0-9a-fA-F.:]+/[0-9]+(,[0-9a-fA-F.:]+/[0-9]+)*$')
+          && 'BUILD_EGRESS_PORTS' in params.data
+          && params.data['BUILD_EGRESS_PORTS'] == '443'
+      message: Builder workload admission requires a complete, digest-pinned operator build policy ConfigMap.
+    - expression: >-
+        request.resource.resource == 'namespaces'
+          ? (object.metadata.name.startsWith('cg-build-')
+            && has(object.metadata.labels)
+            && object.metadata.labels['app.kubernetes.io/name'] == 'codegate-builder'
+            && 'codegate.ai/build-id' in object.metadata.labels
+            && object.metadata.labels['pod-security.kubernetes.io/enforce'] == 'restricted'
+            && object.metadata.labels['pod-security.kubernetes.io/audit'] == 'restricted'
+            && object.metadata.labels['pod-security.kubernetes.io/warn'] == 'restricted'
+            && has(object.metadata.annotations)
+            && object.metadata.annotations['codegate.ai/owner-service'] == 'builder')
+          : (request.namespace.startsWith('cg-build-')
+            && has(object.metadata.labels)
+            && object.metadata.labels['app.kubernetes.io/name'] == 'codegate-builder'
+            && (request.resource.resource == 'secrets'
+              || 'codegate.ai/build-id' in object.metadata.labels))
+      message: Builder-managed objects require the approved namespace prefix, ownership labels and Restricted Pod Security level.
+    - expression: request.resource.resource != 'pods'
+      message: The builder controller may not create or update Pods directly; the approved Job owns Pod creation.
+    - expression: >-
+        request.resource.resource != 'resourcequotas'
+          || (object.metadata.name == 'build-quota'
+            && object.spec.hard.size() == 7
+            && object.spec.hard['pods'] == '2'
+            && object.spec.hard['requests.cpu'] == '2'
+            && object.spec.hard['limits.cpu'] == '2'
+            && object.spec.hard['requests.memory'] == '4Gi'
+            && object.spec.hard['limits.memory'] == '4Gi'
+            && object.spec.hard['requests.ephemeral-storage'] == '12Gi'
+            && object.spec.hard['limits.ephemeral-storage'] == '12Gi')
+      message: Build namespaces require the fixed production ResourceQuota.
+    - expression: >-
+        request.resource.resource != 'limitranges'
+          || (object.metadata.name == 'build-limits'
+            && object.spec.limits.size() == 1
+            && object.spec.limits[0].type == 'Container'
+            && object.spec.limits[0].defaultRequest['cpu'] == '500m'
+            && object.spec.limits[0].defaultRequest['memory'] == '1Gi'
+            && object.spec.limits[0].default['cpu'] == '2'
+            && object.spec.limits[0].default['memory'] == '4Gi'
+            && object.spec.limits[0].default['ephemeral-storage'] == '12Gi')
+      message: Build namespaces require the fixed production LimitRange.
+    - expression: >-
+        request.resource.resource != 'serviceaccounts'
+          || (object.metadata.name == 'buildkit'
+            && has(object.automountServiceAccountToken)
+            && object.automountServiceAccountToken == false)
+      message: The builder may create only the token-less buildkit ServiceAccount.
+    - expression: >-
+        request.resource.resource != 'secrets'
+          || ((object.metadata.name == params.data['BUILD_REGISTRY_TARGET_SECRET']
+              && object.type == 'kubernetes.io/dockerconfigjson'
+              && has(object.immutable)
+              && object.immutable == true
+              && has(object.data)
+              && object.data.size() == 1
+              && '.dockerconfigjson' in object.data)
+            || (object.metadata.name == 'codegate-private-registry-ca'
+              && object.type == 'Opaque'
+              && has(object.immutable)
+              && object.immutable == true
+              && has(object.data)
+              && object.data.size() == 1
+              && 'ca.crt' in object.data))
+      message: The builder may copy only the immutable, build-scoped registry credential and private CA bundle.
+    - expression: >-
+        request.resource.resource != 'configmaps'
+          || (object.metadata.name == 'controlled-build-context'
+            && has(object.immutable)
+            && object.immutable == true
+            && has(object.data)
+            && object.data.size() == 3
+            && 'Dockerfile' in object.data
+            && object.data['Dockerfile'].size() <= 65536
+            && 'codegate-component-policy.json' in object.data
+            && object.data['codegate-component-policy.json'].size() <= 65536
+            && object.data['codegate-component-policy.json'].startsWith('{"schemaVersion":"codegate-component-policy/v1","components":[')
+            && object.data['codegate-component-policy.json'].endsWith(']}\n')
+            && '.codegate-empty' in object.data
+            && object.data['.codegate-empty'] == 'controlled context\n'
+            && (!has(object.binaryData) || object.binaryData.size() == 0))
+      message: The builder may create only the bounded, immutable controlled build context.
+    - expression: >-
+        request.resource.resource != 'jobs'
+          || (object.metadata.name == 'environment-build'
+            && object.spec.backoffLimit == 0
+            && object.spec.activeDeadlineSeconds >= 60
+            && object.spec.activeDeadlineSeconds <= 3600
+            && object.spec.ttlSecondsAfterFinished >= 60
+            && object.spec.ttlSecondsAfterFinished <= 86400
+            && object.spec.template.spec.serviceAccountName == 'buildkit'
+            && has(object.spec.template.spec.automountServiceAccountToken)
+            && object.spec.template.spec.automountServiceAccountToken == false
+            && object.spec.template.spec.restartPolicy == 'Never'
+            && has(object.spec.template.spec.enableServiceLinks)
+            && object.spec.template.spec.enableServiceLinks == false
+            && (!has(object.spec.template.spec.hostNetwork) || object.spec.template.spec.hostNetwork == false)
+            && (!has(object.spec.template.spec.hostPID) || object.spec.template.spec.hostPID == false)
+            && (!has(object.spec.template.spec.hostIPC) || object.spec.template.spec.hostIPC == false)
+            && (!has(object.spec.template.spec.shareProcessNamespace) || object.spec.template.spec.shareProcessNamespace == false)
+            && object.spec.template.spec.securityContext.runAsNonRoot == true
+            && object.spec.template.spec.securityContext.runAsUser == 1000
+            && object.spec.template.spec.securityContext.runAsGroup == 1000
+            && object.spec.template.spec.securityContext.fsGroup == 1000
+            && object.spec.template.spec.securityContext.seccompProfile.type == 'RuntimeDefault'
+            && (!has(object.spec.template.spec.initContainers) || object.spec.template.spec.initContainers.size() == 0)
+            && object.spec.template.spec.containers.size() == 1
+            && object.spec.template.spec.containers[0].name == 'buildkit'
+            && object.spec.template.spec.containers[0].image == params.data['BUILDKIT_IMAGE']
+            && object.spec.template.spec.containers[0].command == ['buildctl-daemonless.sh']
+            && object.spec.template.spec.containers[0].args.size() == 8
+            && object.spec.template.spec.containers[0].args[0] == 'build'
+            && object.spec.template.spec.containers[0].args[1] == '--frontend=dockerfile.v0'
+            && object.spec.template.spec.containers[0].args[2] == '--local=context=/workspace/context'
+            && object.spec.template.spec.containers[0].args[3] == '--local=dockerfile=/workspace/dockerfile'
+            && object.spec.template.spec.containers[0].args[4] == '--opt=filename=Dockerfile'
+            && object.spec.template.spec.containers[0].args[5].matches('^--output=type=image,name=.+:build-[a-f0-9-]{36},push=true$')
+            && object.spec.template.spec.containers[0].args[6] == '--metadata-file=/dev/stdout'
+            && object.spec.template.spec.containers[0].args[7] == '--progress=plain'
+            && object.spec.template.spec.containers[0].env.size() == 6
+            && object.spec.template.spec.containers[0].env.all(e,
+              e.name in ['HOME', 'DOCKER_CONFIG', 'BUILDKITD_FLAGS', 'SOURCE_DATE_EPOCH', 'SSL_CERT_DIR', 'SSL_CERT_FILE']
+                && has(e.value)
+                && ((e.name == 'HOME' && e.value == '/home/user')
+                  || (e.name == 'DOCKER_CONFIG' && e.value == '/home/user/.docker')
+                  || (e.name == 'BUILDKITD_FLAGS' && e.value == '--oci-worker-snapshotter=native --oci-worker-gc=true')
+                  || (e.name == 'SOURCE_DATE_EPOCH' && e.value.matches('^[0-9]{10}$'))
+                  || (e.name == 'SSL_CERT_DIR' && e.value == '/etc/ssl/certs')
+                  || (e.name == 'SSL_CERT_FILE' && e.value == '/etc/codegate/registry-ca/ca.crt')))
+            && has(object.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation)
+            && object.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation == false
+            && has(object.spec.template.spec.containers[0].securityContext.privileged)
+            && object.spec.template.spec.containers[0].securityContext.privileged == false
+            && object.spec.template.spec.containers[0].securityContext.runAsNonRoot == true
+            && object.spec.template.spec.containers[0].securityContext.seccompProfile.type == 'RuntimeDefault'
+            && 'ALL' in object.spec.template.spec.containers[0].securityContext.capabilities.drop
+            && (!has(object.spec.template.spec.containers[0].securityContext.capabilities.add)
+              || object.spec.template.spec.containers[0].securityContext.capabilities.add.size() == 0)
+            && (!has(object.spec.template.spec.containers[0].ports)
+              || object.spec.template.spec.containers[0].ports.all(p, !has(p.hostPort) || p.hostPort == 0))
+            && object.spec.template.spec.containers[0].resources.requests['cpu'] == '500m'
+            && object.spec.template.spec.containers[0].resources.requests['memory'] == '1Gi'
+            && object.spec.template.spec.containers[0].resources.requests['ephemeral-storage'] == '2Gi'
+            && object.spec.template.spec.containers[0].resources.limits['cpu'] == '2'
+            && object.spec.template.spec.containers[0].resources.limits['memory'] == '4Gi'
+            && object.spec.template.spec.containers[0].resources.limits['ephemeral-storage'] == '12Gi'
+            && object.spec.template.spec.containers[0].volumeMounts.size() == 6
+            && object.spec.template.spec.containers[0].volumeMounts.all(m,
+              (m.name == 'dockerfile'
+                && m.mountPath == '/workspace/dockerfile'
+                && has(m.readOnly) && m.readOnly == true)
+                || (m.name == 'empty-context'
+                  && m.mountPath == '/workspace/context'
+                  && has(m.readOnly) && m.readOnly == true)
+                || (m.name == 'buildkit-state'
+                  && m.mountPath == '/home/user/.local/share/buildkit'
+                  && (!has(m.readOnly) || m.readOnly == false))
+                || (m.name == 'temporary'
+                  && m.mountPath == '/tmp'
+                  && (!has(m.readOnly) || m.readOnly == false))
+                || (m.name == 'registry-auth'
+                  && m.mountPath == '/home/user/.docker'
+                  && has(m.readOnly) && m.readOnly == true)
+                || (m.name == 'registry-ca'
+                  && m.mountPath == '/etc/codegate/registry-ca'
+                  && has(m.readOnly) && m.readOnly == true))
+            && object.spec.template.spec.volumes.size() == 6
+            && object.spec.template.spec.volumes.all(v,
+              (v.name == 'dockerfile'
+                && has(v.configMap)
+                && v.configMap.name == 'controlled-build-context'
+                && v.configMap.items == [{'key': 'Dockerfile', 'path': 'Dockerfile'}])
+                || (v.name == 'empty-context'
+                  && has(v.configMap)
+                  && v.configMap.name == 'controlled-build-context'
+                  && v.configMap.items.size() == 2
+                  && v.configMap.items.exists(i,
+                    i.key == '.codegate-empty' && i.path == '.codegate-empty')
+                  && v.configMap.items.exists(i,
+                    i.key == 'codegate-component-policy.json' && i.path == 'codegate-component-policy.json'))
+                || (v.name in ['buildkit-state', 'temporary'] && has(v.emptyDir))
+                || (v.name == 'registry-auth'
+                  && has(v.secret)
+                  && v.secret.secretName == params.data['BUILD_REGISTRY_TARGET_SECRET'])
+                || (v.name == 'registry-ca'
+                  && has(v.secret)
+                  && v.secret.secretName == 'codegate-private-registry-ca')))
+      message: Builder Jobs must match the bounded rootless BuildKit invocation; host namespaces, host ports, host paths, extra exporters and privileged containers are forbidden.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || object.metadata.name in ['default-deny', 'allow-dns', 'allow-build-dependencies']
+      message: The builder may create only the three approved NetworkPolicies.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || (object.metadata.name != 'default-deny'
+            || (object.spec.policyTypes.size() == 2
+              && 'Ingress' in object.spec.policyTypes
+              && 'Egress' in object.spec.policyTypes
+              && (!has(object.spec.ingress) || object.spec.ingress.size() == 0)
+              && (!has(object.spec.egress) || object.spec.egress.size() == 0)))
+      message: The build default-deny policy may not contain allow rules.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || (object.metadata.name != 'allow-dns'
+            || (object.spec.policyTypes == ['Egress']
+              && object.spec.egress.size() == 1
+              && object.spec.egress[0].to.size() == 1
+              && object.spec.egress[0].to[0].namespaceSelector.matchLabels['kubernetes.io/metadata.name'] == 'kube-system'
+              && object.spec.egress[0].to[0].podSelector.matchLabels['k8s-app'] == 'kube-dns'
+              && object.spec.egress[0].ports.size() == 2
+              && object.spec.egress[0].ports.all(p, p.port == 53 && p.protocol in ['TCP', 'UDP'])))
+      message: Build DNS egress is limited to cluster DNS on TCP/UDP 53.
+    - expression: >-
+        request.resource.resource != 'networkpolicies'
+          || (object.metadata.name != 'allow-build-dependencies'
+            || (object.spec.policyTypes == ['Egress']
+              && object.spec.egress.size() == 1
+              && object.spec.egress[0].to.size() == params.data['BUILD_EGRESS_CIDRS'].split(',').size()
+              && object.spec.egress[0].to.all(peer,
+                has(peer.ipBlock)
+                  && isCIDR(peer.ipBlock.cidr)
+                  && !has(peer.ipBlock.except)
+                  && peer.ipBlock.cidr in params.data['BUILD_EGRESS_CIDRS'].split(',')
+                  && (cidr(peer.ipBlock.cidr).ip().family() == 4
+                    ? cidr(peer.ipBlock.cidr).prefixLength() >= 16
+                    : cidr(peer.ipBlock.cidr).prefixLength() >= 32))
+              && object.spec.egress[0].ports.size() == 1
+              && object.spec.egress[0].ports[0].protocol == 'TCP'
+              && object.spec.egress[0].ports[0].port == 443))
+      message: Build dependency egress requires canonical bounded CIDRs and TCP 443 only; default routes are forbidden.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: codegate-builder-workload-shape
+spec:
+  policyName: codegate-builder-workload-shape
+  paramRef:
+    name: codegate-platform-config
+    namespace: codegate-platform
+    parameterNotFoundAction: Deny
+  validationActions: [Deny]

@@ -1,0 +1,22 @@
+---
+- name: Restart RKE2 server after protected configuration changes
+  ansible.builtin.service:
+    name: rke2-server
+    enabled: true
+    state: restarted
+  listen: Restart RKE2 node
+  when:
+    - rke2_node_type == 'server'
+    - not ansible_check_mode
+    - rke2_systemd_unit.stat.exists | default(false)
+
+- name: Restart RKE2 agent after protected configuration changes
+  ansible.builtin.service:
+    name: rke2-agent
+    enabled: true
+    state: restarted
+  listen: Restart RKE2 node
+  when:
+    - rke2_node_type == 'agent'
+    - not ansible_check_mode
+    - rke2_systemd_unit.stat.exists | default(false)

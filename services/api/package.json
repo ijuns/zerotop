@@ -1,0 +1,28 @@
+{
+  "name": "@codegate/api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "dev": "node --watch src/index.ts",
+    "start": "node src/index.ts",
+    "seed:development": "node scripts/seed-development-data.ts",
+    "test": "node --test test/*.test.ts",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@codegate/auth": "workspace:*",
+    "@codegate/contracts": "workspace:*",
+    "@codegate/grading": "workspace:*",
+    "@codegate/reporting": "workspace:*",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.15.5",
+    "typescript": "^5.9.0"
+  }
+}

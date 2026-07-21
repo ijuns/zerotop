@@ -1,0 +1,132 @@
+---
+- name: Build the declared cluster address list
+  ansible.builtin.set_fact:
+    declared_cluster_addresses: >-
+      {{ groups['rke2_cluster']
+         | map('extract', hostvars, 'ansible_host')
+         | list }}
+
+- name: Refuse example or incomplete deployment input
+  ansible.builtin.assert:
+    that:
+      - deployment_confirmed | bool
+      - platform_environment == 'production'
+      - platform_base_domain is not match('^REQUIRED_')
+      - management_cidr is not match('^REQUIRED_')
+      - rke2_ha_vip is not match('^REQUIRED_')
+      - rke2_ha_interface is not match('^REQUIRED_')
+      - rke2_registration_name is not match('^REQUIRED_')
+      - ansible_host is not match('^192\.0\.2\.')
+      - rke2_ha_vip not in declared_cluster_addresses
+      - declared_cluster_addresses | unique | length == declared_cluster_addresses | length
+    fail_msg: >-
+      Deployment is blocked. Copy inventory.example.yml to the ignored
+      inventory.yml, replace every documentation value, and set
+      deployment_confirmed=true in a private override.
+
+- name: Validate the three-server HA topology
+  ansible.builtin.assert:
+    that:
+      - groups['rke2_servers'] | length >= 3
+      - groups['rke2_servers'] | length % 2 == 1
+      - groups['rke2_servers'][0] is defined
+    fail_msg: RKE2 embedded-etcd HA requires an odd number of at least three servers.
+
+- name: Validate the target operating system and capacity
+  ansible.builtin.assert:
+    that:
+      - ansible_distribution == 'Ubuntu'
+      - ansible_distribution_release == 'noble'
+      - ansible_architecture in ['x86_64', 'amd64']
+      - ansible_processor_vcpus | int >= minimum_node_vcpus | int
+      - ansible_memtotal_mb | int >= minimum_node_memory_mb | int
+      - inventory_hostname not in groups['rke2_servers'] or rke2_ha_interface in ansible_interfaces
+    fail_msg: >-
+      Each node must be Ubuntu 24.04 amd64 with the required CPU/RAM and the
+      declared HA network interface.
+
+- name: Ensure encrypted deployment variables were supplied
+  ansible.builtin.assert:
+    that:
+      - rke2_token is defined
+      - keepalived_auth_pass is defined
+      - etcd_s3_access_key is defined
+      - etcd_s3_secret_key is defined
+      - private_registry_pull_username is defined
+      - private_registry_pull_password is defined
+      - private_registry_ca_pem is defined
+    fail_msg: Load an encrypted vars/vault.yml copied from vars/vault.example.yml.
+  no_log: true
+
+- name: Reject placeholder or malformed secrets
+  ansible.builtin.assert:
+    that:
+      - rke2_token | length >= 32
+      - rke2_token is not match('^REQUIRED_')
+      - keepalived_auth_pass | length == 8
+      - keepalived_auth_pass is not match('^REQUIRED_')
+      - etcd_s3_access_key is not match('^REQUIRED_')
+      - etcd_s3_secret_key is not match('^REQUIRED_')
+      - private_registry_pull_username | length >= 1
+      - private_registry_pull_username is not match('^REQUIRED_')
+      - private_registry_pull_password | length >= 16
+      - private_registry_pull_password is not match('^REQUIRED_')
+      - private_registry_ca_pem is search('-----BEGIN CERTIFICATE-----')
+      - private_registry_ca_pem is search('-----END CERTIFICATE-----')
+      - private_registry_ca_pem is not search('PRIVATE KEY')
+      - "'REQUIRED_' not in private_registry_ca_pem"
+    fail_msg: Vault values are placeholders or do not meet the minimum format.
+  no_log: true
+
+- name: Validate the private registry endpoint contract
+  ansible.builtin.assert:
+    that:
+      - private_registry_enabled | bool
+      - private_registry_host is match('^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?(?::[0-9]{1,5})?$')
+      - private_registry_host is not match('^REQUIRED_')
+      - private_registry_endpoint == 'https://' ~ private_registry_host
+      - private_registry_ca_path == '/etc/rancher/rke2/private-registry-ca.crt'
+    fail_msg: >-
+      Production requires one explicit HTTPS private registry host, a fixed CA
+      path, and Vault-supplied pull credentials. Plaintext or wildcard registry
+      endpoints are not accepted.
+  no_log: true
+
+- name: Require reviewed artifact hashes
+  ansible.builtin.assert:
+    that:
+      - item is match('^[a-fA-F0-9]{64}$')
+      - item is not match('^0{64}$')
+    fail_msg: Every downloaded bootstrap artifact requires a reviewed SHA-256.
+  loop:
+    - "{{ rke2_install_script_checksum | regex_replace('^sha256:', '') }}"
+    - "{{ kubevirt_operator_sha256 }}"
+    - "{{ kubevirt_cr_sha256 }}"
+    - "{{ cdi_operator_sha256 }}"
+    - "{{ cdi_cr_sha256 }}"
+
+- name: Validate production backup variables
+  ansible.builtin.assert:
+    that:
+      - etcd_s3_enabled | bool
+      - etcd_s3_endpoint is not match('^REQUIRED_')
+      - etcd_s3_region is not match('^REQUIRED_')
+      - etcd_s3_bucket is not match('^REQUIRED_')
+      - longhorn_backup_target_required | bool
+      - longhorn_backup_target is not match('^REQUIRED_')
+      - longhorn_backup_schedule == '0 */6 * * *'
+      - longhorn_backup_retention | int >= 28
+      - longhorn_backup_concurrency | int >= 1
+      - longhorn_backup_concurrency | int <= 4
+    fail_msg: Off-node etcd and Longhorn backup targets are mandatory for production.
+  no_log: true
+
+- name: Require the supported Traefik edge controller
+  ansible.builtin.assert:
+    that:
+      - rke2_ingress_controller == 'traefik'
+      - not install_ingress_nginx | bool
+    fail_msg: >-
+      New production clusters require the supported RKE2 Traefik controller.
+      The retired community ingress-nginx controller is not accepted by this
+      production baseline.

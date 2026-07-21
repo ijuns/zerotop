@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: codegate-runtime
+  namespace: codegate-runtime-system
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: codegate-runtime-controller
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create", "patch", "delete"]
+  # Server-side apply needs create+patch. Keep Secret reads out of this
+  # cluster-scoped controller role: otherwise a compromised runtime could read
+  # platform, identity, or infrastructure credentials from any namespace.
+  - apiGroups: [""]
+    resources: ["resourcequotas", "serviceaccounts", "secrets"]
+    verbs: ["create", "patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "create", "patch"]
+  - apiGroups: [""]
+    resources: ["endpoints", "pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "create", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "create", "patch"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstances"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: codegate-runtime-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: codegate-runtime-controller
+subjects:
+  - kind: ServiceAccount
+    name: codegate-runtime
+    namespace: codegate-runtime-system
+---
+# ValidatingAdmissionPolicy parameter authorization requires the submitting
+# identity to be able to read the referenced parameter object. Keep this grant
+# namespace-scoped and resource-name-scoped rather than widening the controller
+# ClusterRole to read ConfigMaps globally.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: codegate-runtime-policy-parameter-reader
+  namespace: codegate-runtime-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["codegate-runtime-config"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: codegate-runtime-policy-parameter-reader
+  namespace: codegate-runtime-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: codegate-runtime-policy-parameter-reader
+subjects:
+  - kind: ServiceAccount
+    name: codegate-runtime
+    namespace: codegate-runtime-system

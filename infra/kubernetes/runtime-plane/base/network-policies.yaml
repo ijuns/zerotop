@@ -1,0 +1,266 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: codegate-runtime-system
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runtime-from-platform-api
+  namespace: codegate-runtime-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-runtime
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-platform
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-api
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-platform
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-validator
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runtime-to-kubernetes-api
+  namespace: codegate-runtime-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-runtime
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        # RKE2's first Service CIDR address. Change this together with
+        # rke2_service_cidr when using a non-default service network.
+        - ipBlock:
+            cidr: 10.43.0.1/32
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runtime-dns-and-issuer
+  namespace: codegate-runtime-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-runtime
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-vpn-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-openvpn-issuer
+      ports:
+        - protocol: TCP
+          port: 9100
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: runtime-to-elasticsearch
+  namespace: codegate-runtime-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-runtime
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: elasticsearch
+      ports:
+        - protocol: TCP
+          port: 9200
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: codegate-desktop-system
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: desktop-from-traefik
+  namespace: codegate-desktop-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-desktop-gateway
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: desktop-to-platform-api-and-labs
+  namespace: codegate-desktop-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-desktop-gateway
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-platform
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-api
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: codegate-runtime
+          podSelector:
+            matchLabels:
+              codegate.ai/role: workstation
+      ports:
+        - protocol: TCP
+          port: 6080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: codegate-vpn-system
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openvpn-issuer-ingress
+  namespace: codegate-vpn-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-openvpn-issuer
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-runtime-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-runtime
+        - namespaceSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: codegate-runtime
+          podSelector:
+            matchLabels:
+              codegate.ai/role: vpn-gateway
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 9100
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openvpn-issuer-dns
+  namespace: codegate-vpn-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-openvpn-issuer
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-platform
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-api
+      ports:
+        - { protocol: TCP, port: 8080 }
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - { protocol: TCP, port: 5432 }

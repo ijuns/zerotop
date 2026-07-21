@@ -1,0 +1,20 @@
+---
+- name: Verify node-level production prerequisites
+  hosts: rke2_cluster
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - validation_node
+
+- name: Verify cluster-level services once
+  hosts: rke2_servers
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Run cluster validation on one server
+      ansible.builtin.include_role:
+        name: validation_cluster
+      run_once: true
+

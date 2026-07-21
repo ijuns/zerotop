@@ -1,0 +1,74 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    deployment:
+      kind: DaemonSet
+    ingressClass:
+      enabled: true
+      isDefaultClass: true
+      name: traefik
+    providers:
+      kubernetesIngress:
+        enabled: true
+        ingressClass: traefik
+        allowExternalNameServices: false
+        allowEmptyServices: false
+      kubernetesCRD:
+        enabled: false
+      kubernetesGateway:
+        enabled: false
+    ports:
+      web:
+        hostPort: null
+        nodePort: {{ ingress_http_node_port }}
+        http:
+          redirections:
+            entryPoint:
+              to: websecure
+              scheme: https
+              permanent: true
+        proxyProtocol:
+          trustedIPs:
+{% for host in groups['rke2_servers'] %}
+            - {{ (hostvars[host].ansible_host ~ '/32') | to_json }}
+{% endfor %}
+          insecure: false
+      websecure:
+        hostPort: null
+        nodePort: {{ ingress_https_node_port }}
+        proxyProtocol:
+          trustedIPs:
+{% for host in groups['rke2_servers'] %}
+            - {{ (hostvars[host].ansible_host ~ '/32') | to_json }}
+{% endfor %}
+          insecure: false
+        transport:
+          respondingTimeouts:
+            readTimeout: 3600s
+            writeTimeout: 3600s
+            idleTimeout: 3600s
+    service:
+      spec:
+        type: NodePort
+        externalTrafficPolicy: Local
+    global:
+      checkNewVersion: false
+      sendAnonymousUsage: false
+    logs:
+      general:
+        level: INFO
+      access:
+        # Session/bootstrap tickets can be carried in URLs; keep edge access
+        # logs off until a tested field-redaction policy is supplied.
+        enabled: false
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi

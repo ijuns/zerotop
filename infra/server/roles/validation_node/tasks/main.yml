@@ -1,0 +1,107 @@
+---
+- name: Select the expected RKE2 service
+  ansible.builtin.set_fact:
+    expected_rke2_service: >-
+      {{ 'rke2-server' if inventory_hostname in groups['rke2_servers'] else 'rke2-agent' }}
+
+- name: Read the expected RKE2 service state
+  ansible.builtin.command:
+    argv: [systemctl, is-active, "{{ expected_rke2_service }}"]
+  register: rke2_service_state
+  changed_when: false
+  check_mode: false
+
+- name: Read active swap devices
+  ansible.builtin.command:
+    argv: [swapon, --noheadings, --show=NAME]
+  register: active_swap
+  changed_when: false
+  check_mode: false
+
+- name: Inspect protected private registry files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: private_registry_files
+  no_log: true
+  loop:
+    - /etc/rancher/rke2/registries.yaml
+    - "{{ private_registry_ca_path }}"
+
+- name: Validate private registry file ownership and permissions
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists | default(false)
+      - item.stat.isreg | default(false)
+      - item.stat.pw_name == 'root'
+      - item.stat.gr_name == 'root'
+      - item.stat.mode == '0600'
+    fail_msg: RKE2 private registry material is missing or not root-only.
+  no_log: true
+  loop: "{{ private_registry_files.results }}"
+
+- name: Verify the private registry credential and CA trust
+  ansible.builtin.uri:
+    url: "{{ private_registry_endpoint }}/v2/"
+    method: GET
+    url_username: "{{ private_registry_pull_username }}"
+    url_password: "{{ private_registry_pull_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    ca_path: "{{ private_registry_ca_path }}"
+    return_content: false
+    status_code: 200
+    timeout: 20
+  register: private_registry_probe
+  changed_when: false
+  no_log: true
+  when: private_registry_enabled | bool
+
+- name: Inspect KVM and dedicated storage
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: production_paths
+  loop:
+    - /dev/kvm
+    - "{{ longhorn_data_path }}"
+
+- name: Read the Longhorn filesystem source
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --output, SOURCE, --target, "{{ longhorn_data_path }}"]
+  register: validation_longhorn_mount
+  changed_when: false
+  check_mode: false
+
+- name: Read the root filesystem source
+  ansible.builtin.command:
+    argv: [findmnt, --noheadings, --output, SOURCE, --target, /]
+  register: validation_root_mount
+  changed_when: false
+  check_mode: false
+
+- name: Validate node runtime and isolation prerequisites
+  ansible.builtin.assert:
+    that:
+      - rke2_service_state.stdout | trim == 'active'
+      - active_swap.stdout | trim == ''
+      - production_paths.results[0].stat.ischr | default(false)
+      - production_paths.results[1].stat.isdir | default(false)
+      - validation_longhorn_mount.stdout | trim != validation_root_mount.stdout | trim
+    fail_msg: The node failed an RKE2, swap, KVM, or dedicated-storage check.
+
+- name: Verify time synchronization
+  ansible.builtin.command:
+    argv: [chronyc, waitsync, "10", "0.1"]
+  register: chrony_validation
+  changed_when: false
+  check_mode: false
+
+- name: Validate the local HA services on server nodes
+  ansible.builtin.command:
+    argv: [systemctl, is-active, "{{ item }}"]
+  register: ha_service_state
+  changed_when: false
+  check_mode: false
+  loop:
+    - haproxy
+    - keepalived
+  when: inventory_hostname in groups['rke2_servers']

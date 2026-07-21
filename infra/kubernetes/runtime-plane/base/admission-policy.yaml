@@ -1,0 +1,56 @@
+# Runtime controller RBAC is necessarily cluster-scoped because every run and
+# validation receives a fresh namespace. This admission boundary prevents that
+# identity from mutating any long-lived platform or infrastructure namespace.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: codegate-runtime-namespace-boundary
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["namespaces", "resourcequotas", "serviceaccounts", "services", "secrets"]
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["deployments"]
+      - apiGroups: ["batch"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["jobs"]
+      - apiGroups: ["networking.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["networkpolicies"]
+      - apiGroups: ["kubevirt.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["virtualmachines"]
+  matchConditions:
+    - name: runtime-controller-only
+      expression: request.userInfo.username == 'system:serviceaccount:codegate-runtime-system:codegate-runtime'
+  validations:
+    - expression: >-
+        request.resource.resource == 'namespaces'
+          ? (request.operation == 'DELETE'
+              ? ((oldObject.metadata.name.startsWith('range-') || oldObject.metadata.name.startsWith('validation-'))
+                && has(oldObject.metadata.labels)
+                && oldObject.metadata.labels['app.kubernetes.io/managed-by'] == 'codegate-runtime'
+                && 'codegate.ai/lab-id' in oldObject.metadata.labels
+                && (oldObject.metadata.name.startsWith('range-')
+                  ? 'codegate.ai/run-id' in oldObject.metadata.labels
+                  : 'codegate.ai/validation-id' in oldObject.metadata.labels))
+              : (object.metadata.name.startsWith('range-') || object.metadata.name.startsWith('validation-')))
+          : (request.namespace.startsWith('range-') || request.namespace.startsWith('validation-'))
+      message: The Codegate runtime may mutate only range-* and validation-* namespaces.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: codegate-runtime-namespace-boundary
+spec:
+  policyName: codegate-runtime-namespace-boundary
+  validationActions: [Deny]

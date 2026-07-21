@@ -1,0 +1,227 @@
+---
+- name: Require the initial RKE2 server for add-on installation
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname == groups['rke2_servers'][0]
+    fail_msg: Platform add-ons must be installed from the initial server.
+
+- name: Create the RKE2 static manifest directory
+  ansible.builtin.file:
+    path: "{{ rke2_data_dir }}/server/manifests"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Install pinned platform operator chart definitions
+  ansible.builtin.template:
+    src: platform-addons.yaml.j2
+    dest: "{{ rke2_data_dir }}/server/manifests/codegate-platform-addons.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+  register: platform_addons_manifest
+
+- name: Wait for RKE2 Helm controller to create add-on namespaces
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - get
+      - namespace
+      - "{{ item }}"
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: addon_namespace
+  changed_when: false
+  retries: 60
+  delay: 10
+  until: addon_namespace.rc == 0
+  loop:
+    - longhorn-system
+    - cert-manager
+    - external-secrets
+    - kube-system
+  when: not ansible_check_mode
+
+- name: Wait for Longhorn manager rollout
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace
+      - longhorn-system
+      - rollout
+      - status
+      - daemonset/longhorn-manager
+      - "--timeout={{ addon_ready_timeout_seconds }}s"
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: longhorn_rollout
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Install the recurring off-node Longhorn volume backup
+  ansible.builtin.template:
+    src: longhorn-recurring-backup.yaml.j2
+    dest: "{{ rke2_data_dir }}/server/manifests/codegate-longhorn-recurring-backup.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+  register: longhorn_recurring_backup_manifest
+
+- name: Wait for the recurring Longhorn backup contract
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace
+      - longhorn-system
+      - get
+      - recurringjob.longhorn.io/codegate-volume-backup
+      - -o
+      - json
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: longhorn_recurring_backup
+  changed_when: false
+  retries: 30
+  delay: 5
+  until: longhorn_recurring_backup.rc == 0
+  when: not ansible_check_mode
+
+- name: Wait for cert-manager controllers
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace
+      - cert-manager
+      - rollout
+      - status
+      - "deployment/{{ item }}"
+      - "--timeout={{ addon_ready_timeout_seconds }}s"
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: cert_manager_rollout
+  changed_when: false
+  loop:
+    - cert-manager
+    - cert-manager-cainjector
+    - cert-manager-webhook
+  when: not ansible_check_mode
+
+- name: Wait for External Secrets controllers
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace
+      - external-secrets
+      - rollout
+      - status
+      - "deployment/{{ item }}"
+      - "--timeout={{ addon_ready_timeout_seconds }}s"
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: external_secrets_rollout
+  changed_when: false
+  loop:
+    - external-secrets
+    - external-secrets-cert-controller
+    - external-secrets-webhook
+  when: not ansible_check_mode
+
+- name: Inspect the bundled local-path StorageClass
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - get
+      - storageclass
+      - local-path
+      - -o
+      - json
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: local_path_storage_class
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Remove the default annotation from local-path storage
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - annotate
+      - storageclass
+      - local-path
+      - storageclass.kubernetes.io/is-default-class=false
+      - --overwrite
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: local_path_default_removed
+  changed_when: true
+  when:
+    - not ansible_check_mode
+    - local_path_storage_class.rc == 0
+    - >-
+      (local_path_storage_class.stdout | from_json).metadata.annotations['storageclass.kubernetes.io/is-default-class']
+      | default('false') != 'false'
+
+- name: Verify the Longhorn StorageClass is the default
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - get
+      - storageclass
+      - longhorn
+      - -o
+      - json
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: longhorn_storage_class
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Assert the Longhorn default-class contract
+  ansible.builtin.assert:
+    that:
+      - >-
+        (longhorn_storage_class.stdout | from_json).metadata.annotations['storageclass.kubernetes.io/is-default-class']
+        == 'true'
+      - >-
+        (longhorn_storage_class.stdout | from_json).parameters.numberOfReplicas
+        | int == longhorn_default_replica_count | int
+      - >-
+        ((longhorn_storage_class.stdout | from_json).parameters.recurringJobSelector | from_json)
+        == [{'name': 'codegate-volume-backup', 'isGroup': false}]
+      - (longhorn_recurring_backup.stdout | from_json).spec.task == 'backup'
+      - (longhorn_recurring_backup.stdout | from_json).spec.cron == longhorn_backup_schedule
+      - >-
+        (longhorn_recurring_backup.stdout | from_json).spec.retain
+        | int == longhorn_backup_retention | int
+    fail_msg: Longhorn was not installed with the required replica and recurring off-node backup policy.
+  when: not ansible_check_mode
+
+- name: List all explicitly default StorageClasses
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - get
+      - storageclass
+      - -o
+      - 'jsonpath={range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{"\n"}{end}'
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: default_storage_classes
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Require Longhorn to be the only explicit default StorageClass
+  ansible.builtin.assert:
+    that:
+      - default_storage_classes.stdout_lines == ['longhorn']
+    fail_msg: More than one default StorageClass exists, or Longhorn is not the default.
+  when: not ansible_check_mode
+
+- name: Remind the operator that no provider SecretStore is guessed
+  ansible.builtin.debug:
+    msg: >-
+      External Secrets is installed, but no SecretStore is created until a
+      reviewed provider-specific overlay sets external_secrets_provider_configured=true.
+  when: not external_secrets_provider_configured | bool

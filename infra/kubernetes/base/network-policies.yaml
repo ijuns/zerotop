@@ -1,0 +1,445 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-web
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+      ports:
+        - protocol: TCP
+          port: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: traefik
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-web
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-desktop-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-desktop-gateway
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-vpn-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-openvpn-issuer
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-ai
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-grader
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-validator
+      ports:
+        - protocol: TCP
+          port: 8001
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: validator-from-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-validator
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-api
+      ports:
+        - protocol: TCP
+          port: 9003
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grader-from-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-grader
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-api
+      ports:
+        - protocol: TCP
+          port: 9002
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: telemetry-from-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-telemetry
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-api
+      ports:
+        - protocol: TCP
+          port: 9201
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: builder-from-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-builder
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-api
+      ports:
+        - protocol: TCP
+          port: 9004
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-to-validator
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-validator
+      ports:
+        - protocol: TCP
+          port: 9003
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-to-runtime
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-runtime-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-runtime
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-to-grader
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-grader
+      ports:
+        - protocol: TCP
+          port: 9002
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-to-telemetry
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-telemetry
+      ports:
+        - protocol: TCP
+          port: 9201
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-to-builder
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-builder
+      ports:
+        - protocol: TCP
+          port: 9004
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: builder-to-control-plane-and-postgres
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-builder
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        # RKE2's first Service CIDR address. Keep this aligned with
+        # rke2_service_cidr in the server inventory.
+        - ipBlock:
+            cidr: 10.43.0.1/32
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: validator-to-ai-and-runtime
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-validator
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-ai
+      ports:
+        - protocol: TCP
+          port: 8001
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-runtime-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-runtime
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+# BuildKit jobs receive the same CIDR list from BUILD_EGRESS_CIDRS. This
+# platform-namespace rule is separately required because the builder performs
+# Cosign sign+verify and the validator performs Cosign/crane/Syft/Trivy reads
+# after the build Job exits. A production overlay must replace this
+# documentation CIDR with the private registry's stable routed CIDR(s).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: builder-and-validator-to-private-registry
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - codegate-builder
+          - codegate-validator
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 192.0.2.10/32
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grader-to-ai-and-elasticsearch
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-grader
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-ai
+      ports:
+        - protocol: TCP
+          port: 8001
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: elasticsearch
+      ports:
+        - protocol: TCP
+          port: 9200
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: telemetry-to-elasticsearch
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-telemetry
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: codegate-data
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: elasticsearch
+      ports:
+        - protocol: TCP
+          port: 9200
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-to-ai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-api
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-ai
+      ports:
+        - protocol: TCP
+          port: 8001

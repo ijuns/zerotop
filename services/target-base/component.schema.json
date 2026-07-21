@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codegate.ai/schemas/target-component-v1.json",
+  "title": "Codegate declarative target component",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "componentId", "findings", "routes"],
+  "properties": {
+    "schemaVersion": { "const": "codegate-component/v1" },
+    "kind": { "enum": ["declarative-http-v1", "signed-node-handler-v1"] },
+    "componentId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$"
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 40,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$"
+      }
+    },
+    "handler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "const": "handler.mjs" },
+        "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "routes": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["method", "path", "response"],
+        "properties": {
+          "method": { "enum": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] },
+          "path": {
+            "type": "string",
+            "pattern": "^/[A-Za-z0-9._~!$&'()*+,;=:@%/-]{0,255}$"
+          },
+          "operation": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$"
+          },
+          "response": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status", "contentType"],
+            "properties": {
+              "status": { "type": "integer", "minimum": 100, "maximum": 599 },
+              "contentType": {
+                "enum": ["text/plain; charset=utf-8", "application/json; charset=utf-8"]
+              },
+              "inlineBody": { "type": "string", "maxLength": 65536 },
+              "artifactPath": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$"
+              }
+            },
+            "oneOf": [
+              { "required": ["inlineBody"], "not": { "required": ["artifactPath"] } },
+              { "required": ["artifactPath"], "not": { "required": ["inlineBody"] } }
+            ]
+          }
+        },
+        "oneOf": [
+          { "required": ["operation"], "not": { "required": ["response"] } },
+          { "required": ["response"], "not": { "required": ["operation"] } }
+        ]
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "signed-node-handler-v1" } } },
+      "then": { "required": ["handler"] },
+      "else": { "not": { "required": ["handler"] } }
+    }
+  ]
+}

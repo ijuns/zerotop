@@ -1,0 +1,157 @@
+---
+- name: Require the initial RKE2 server for virtualization installation
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname == groups['rke2_servers'][0]
+    fail_msg: KubeVirt and CDI must be installed from the initial server.
+
+- name: Create the reviewed operator artifact directory
+  ansible.builtin.file:
+    path: /usr/local/src/codegate-operators
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Download pinned KubeVirt and CDI release manifests
+  ansible.builtin.get_url:
+    url: "{{ item.url }}"
+    dest: "{{ item.dest }}"
+    checksum: "sha256:{{ item.sha256 }}"
+    owner: root
+    group: root
+    mode: "0600"
+  loop:
+    - name: KubeVirt operator
+      url: "https://github.com/kubevirt/kubevirt/releases/download/{{ kubevirt_version }}/kubevirt-operator.yaml"
+      dest: /usr/local/src/codegate-operators/kubevirt-operator.yaml
+      sha256: "{{ kubevirt_operator_sha256 }}"
+    - name: KubeVirt custom resource
+      url: "https://github.com/kubevirt/kubevirt/releases/download/{{ kubevirt_version }}/kubevirt-cr.yaml"
+      dest: /usr/local/src/codegate-operators/kubevirt-cr.yaml
+      sha256: "{{ kubevirt_cr_sha256 }}"
+    - name: CDI operator
+      url: "https://github.com/kubevirt/containerized-data-importer/releases/download/{{ cdi_version }}/cdi-operator.yaml"
+      dest: /usr/local/src/codegate-operators/cdi-operator.yaml
+      sha256: "{{ cdi_operator_sha256 }}"
+    - name: CDI custom resource
+      url: "https://github.com/kubevirt/containerized-data-importer/releases/download/{{ cdi_version }}/cdi-cr.yaml"
+      dest: /usr/local/src/codegate-operators/cdi-cr.yaml
+      sha256: "{{ cdi_cr_sha256 }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not ansible_check_mode
+
+- name: Install explicit Pod Security boundaries for virtualization operators
+  ansible.builtin.template:
+    src: virtualization-namespaces.yaml.j2
+    dest: /usr/local/src/codegate-operators/virtualization-namespaces.yaml
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Apply virtualization namespaces with server-side ownership
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - apply
+      - --server-side
+      - --field-manager=codegate-bootstrap
+      - --filename=/usr/local/src/codegate-operators/virtualization-namespaces.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: virtualization_namespaces_apply
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Apply pinned KubeVirt and CDI manifests with server-side ownership
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - apply
+      - --server-side
+      - --field-manager=codegate-bootstrap
+      - "--filename={{ item }}"
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: virtualization_manifest_apply
+  changed_when: false
+  loop:
+    - /usr/local/src/codegate-operators/kubevirt-operator.yaml
+    - /usr/local/src/codegate-operators/kubevirt-cr.yaml
+    - /usr/local/src/codegate-operators/cdi-operator.yaml
+    - /usr/local/src/codegate-operators/cdi-cr.yaml
+  when: not ansible_check_mode
+
+- name: Explicitly prohibit KubeVirt software emulation
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace=kubevirt
+      - patch
+      - kubevirt
+      - kubevirt
+      - --type=merge
+      - '--patch={"spec":{"configuration":{"developerConfiguration":{"useEmulation":false}}}}'
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: kubevirt_emulation_policy
+  changed_when: false
+  retries: 30
+  delay: 10
+  until: kubevirt_emulation_policy.rc == 0
+  when: not ansible_check_mode
+
+- name: Wait for KubeVirt availability
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace=kubevirt
+      - wait
+      - kubevirt/kubevirt
+      - --for=condition=Available
+      - "--timeout={{ addon_ready_timeout_seconds }}s"
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: kubevirt_available
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Wait for CDI availability
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - wait
+      - cdi/cdi
+      - --for=condition=Available
+      - "--timeout={{ addon_ready_timeout_seconds }}s"
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: cdi_available
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Confirm every schedulable node advertises KVM
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - get
+      - nodes
+      - -o
+      - json
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  register: kubevirt_nodes
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Enforce hardware virtualization capacity on every Kubernetes node
+  ansible.builtin.assert:
+    that:
+      - item.status.allocatable['devices.kubevirt.io/kvm'] is defined
+      - (item.status.allocatable['devices.kubevirt.io/kvm'] | string) not in ['', '0']
+    fail_msg: "Node {{ item.metadata.name }} does not advertise devices.kubevirt.io/kvm."
+  loop: "{{ (kubevirt_nodes.stdout | from_json).items }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: not ansible_check_mode

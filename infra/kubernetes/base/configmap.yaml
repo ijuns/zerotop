@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: codegate-platform-config
+data:
+  NODE_ENV: production
+  RUNTIME_ADAPTER: service
+  API_PORT: "8080"
+  AI_SERVICE_URL: http://codegate-ai:8001
+  AI_ADAPTER: service
+  AI_GENERATION_TIMEOUT_MS: "90000"
+  AI_GENERATION_MODE: external
+  GENERATION_PROVIDER_URL: http://model-gateway:9010/v1/generate
+  AI_REVIEW_MODE: external
+  REVIEW_PROVIDER_URL: http://model-gateway:9010/v1/review
+  AI_RUBRIC_MODE: external
+  RUBRIC_PROVIDER_URL: http://model-gateway:9010/v1/rubric
+  OPENAI_BASE_URL: https://api.openai.com/v1
+  OPENAI_MODEL: gpt-5.6-sol
+  OPENAI_GENERATION_TIMEOUT_MS: "40000"
+  OPENAI_REVIEW_TIMEOUT_MS: "25000"
+  OPENAI_RUBRIC_TIMEOUT_MS: "9000"
+  MODEL_GATEWAY_MAX_CONCURRENCY: "8"
+  RUBRIC_CATALOG_JSON: '{"incident-analysis-v1":{"policyVersion":"incident-analysis-2026.07","passThreshold":0.7,"criteria":[{"id":"evidence","description":"Uses concrete evidence from the isolated exercise data.","weight":0.6},{"id":"mitigation","description":"Explains a proportionate detection or mitigation action.","weight":0.4}]}}'
+  AI_TARGET_BASE_IMAGE: registry.example.invalid/codegate/targets/http-v1-base@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  AI_OUTPUT_REPOSITORY: registry.example.invalid/codegate/targets
+  GRADER_ADAPTER: service
+  GRADER_SERVICE_URL: http://codegate-grader:9002
+  LAB_VALIDATOR_ADAPTER: service
+  VALIDATOR_SERVICE_URL: http://codegate-validator:9003
+  TELEMETRY_SERVICE_URL: http://codegate-telemetry:9201
+  ENVIRONMENT_BUILDER_ADAPTER: service
+  BUILDER_SERVICE_URL: http://codegate-builder:9004
+  BUILDKIT_IMAGE: registry.example.invalid/codegate/buildkit-rootless@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  BASE_IMAGE_ALLOWLIST_JSON: '["registry.example.invalid/codegate/targets/http-v1-base@sha256:0000000000000000000000000000000000000000000000000000000000000000"]'
+  OUTPUT_REPOSITORY_ALLOWLIST_JSON: '["registry.example.invalid/codegate/targets"]'
+  # AI generation and builder consume these exact same operator-owned catalogs.
+  # Production overlays must replace every placeholder digest and URL.
+  PACKAGE_CATALOG_JSON: '{"codegate-http-target@1.0.0":{"imageRef":"registry.example.invalid/codegate/catalog/http-target@sha256:0000000000000000000000000000000000000000000000000000000000000000","sourcePath":"/opt/codegate/package/","destination":"/opt/codegate/packages/codegate-http-target/","runtimeKind":"declarative-http-v1"}}'
+  ARTIFACT_CATALOG_JSON: '{"0000000000000000000000000000000000000000000000000000000000000000":{"url":"https://artifacts.example.invalid/codegate/catalog/replace-me.ndjson"}}'
+  BUILD_REGISTRY_SECRET_NAMESPACE: codegate-platform
+  BUILD_REGISTRY_SECRET_NAME: codegate-build-registry
+  BUILD_REGISTRY_TARGET_SECRET: build-registry-auth
+  BUILD_EGRESS_CIDRS: 192.0.2.10/32
+  BUILD_EGRESS_PORTS: "443"
+  # Cosign signatures are kept in a fixed repository. The registry credential
+  # grants the builder push and the validator pull access to this path only.
+  COSIGN_REPOSITORY: registry.example.invalid/codegate/signatures
+  SANDBOX_RUNNER_URL: http://codegate-runtime.codegate-runtime-system.svc.cluster.local:9000
+  COSIGN_PUBLIC_KEY_PATH: /etc/codegate-validator/trust/cosign.pub
+  VALIDATOR_CACHE_DIR: /var/cache/codegate-validator
+  DESKTOP_GATEWAY_PUBLIC_URL: https://desktop.example.invalid
+  OPENVPN_DOWNLOAD_PUBLIC_URL: https://vpn.example.invalid
+  RUNTIME_SERVICE_URL: http://codegate-runtime.codegate-runtime-system.svc.cluster.local:9000
+  ALLOWED_ORIGINS: https://range.example.invalid
+  OIDC_ISSUER: https://identity.example.invalid/realms/codegate
+  OIDC_JWKS_URL: https://identity.example.invalid/realms/codegate/protocol/openid-connect/certs
+  OIDC_AUDIENCE: codegate-api
+  OIDC_CLIENT_ID: codegate-web
+  TARGET_IMAGE_REGISTRIES: registry.example.invalid
+  KEYCLOAK_ISSUER: https://identity.example.invalid/realms/codegate
+  KEYCLOAK_JWKS_URL: https://identity.example.invalid/realms/codegate/protocol/openid-connect/certs
+  ELASTICSEARCH_URL: https://elasticsearch.example.invalid:9200
+  CODEGATE_WEB_API_URL: /api
+  CODEGATE_WEB_KEYCLOAK_URL: https://identity.example.invalid
+  CODEGATE_WEB_KEYCLOAK_REALM: codegate
+  CODEGATE_WEB_KEYCLOAK_CLIENT_ID: codegate-web
+  CODEGATE_WEB_DEVELOPMENT_IDENTITY: "false"

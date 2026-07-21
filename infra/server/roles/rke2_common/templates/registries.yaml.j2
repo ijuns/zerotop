@@ -1,0 +1,11 @@
+mirrors:
+  {{ private_registry_host | to_json }}:
+    endpoint:
+      - {{ private_registry_endpoint | to_json }}
+configs:
+  {{ private_registry_host | to_json }}:
+    auth:
+      username: {{ private_registry_pull_username | to_json }}
+      password: {{ private_registry_pull_password | to_json }}
+    tls:
+      ca_file: {{ private_registry_ca_path | to_json }}

@@ -1,0 +1,137 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codegate-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: codegate-api
+    spec:
+      serviceAccountName: codegate-api
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: ghcr.io/replace-me/codegate-api:replace-with-digest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: AUTH_MODE
+              value: oidc
+            - name: REPOSITORY_MODE
+              value: postgres
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: REDIS_URL
+            - name: KEYCLOAK_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: KEYCLOAK_CLIENT_SECRET
+            - name: RUNTIME_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: RUNTIME_INTERNAL_TOKEN
+            - name: DESKTOP_GATEWAY_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: DESKTOP_GATEWAY_INTERNAL_TOKEN
+            - name: GRADER_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: GRADER_INTERNAL_TOKEN
+            - name: AI_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: AI_INTERNAL_TOKEN
+            - name: OPENVPN_DOWNLOAD_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: OPENVPN_DOWNLOAD_INTERNAL_TOKEN
+            - name: VALIDATOR_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: VALIDATOR_INTERNAL_TOKEN
+            - name: TELEMETRY_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: TELEMETRY_INTERNAL_TOKEN
+            - name: BUILDER_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-api-secrets
+                  key: BUILDER_INTERNAL_TOKEN
+          envFrom:
+            - configMapRef:
+                name: codegate-platform-config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: temporary
+              mountPath: /tmp
+      volumes:
+        - name: temporary
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codegate-api
+spec:
+  selector:
+    app.kubernetes.io/name: codegate-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

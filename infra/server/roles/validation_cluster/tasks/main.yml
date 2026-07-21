@@ -1,0 +1,202 @@
+---
+- name: Confirm the Kubernetes API is ready through the HA endpoint
+  ansible.builtin.command:
+    argv: [/usr/local/bin/kubectl, get, --raw=/readyz]
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: kubernetes_ready
+  changed_when: false
+
+- name: Wait for every Kubernetes node to become Ready
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - wait
+      - node
+      - --all
+      - --for=condition=Ready
+      - --timeout=300s
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: nodes_ready
+  changed_when: false
+
+- name: Validate core and storage daemonsets
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace={{ item.namespace }}
+      - rollout
+      - status
+      - daemonset/{{ item.name }}
+      - "--timeout={{ addon_ready_timeout_seconds }}s"
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: required_daemonsets
+  changed_when: false
+  loop:
+    - { namespace: kube-system, name: rke2-cilium }
+    - { namespace: kube-system, name: rke2-traefik }
+    - { namespace: longhorn-system, name: longhorn-manager }
+    - { namespace: kubevirt, name: virt-handler }
+
+- name: Validate controller deployments
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace={{ item.namespace }}
+      - rollout
+      - status
+      - deployment/{{ item.name }}
+      - "--timeout={{ addon_ready_timeout_seconds }}s"
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: required_deployments
+  changed_when: false
+  loop:
+    - { namespace: cert-manager, name: cert-manager }
+    - { namespace: cert-manager, name: cert-manager-cainjector }
+    - { namespace: cert-manager, name: cert-manager-webhook }
+    - { namespace: external-secrets, name: external-secrets }
+    - { namespace: external-secrets, name: external-secrets-cert-controller }
+    - { namespace: external-secrets, name: external-secrets-webhook }
+    - { namespace: kubevirt, name: virt-api }
+    - { namespace: kubevirt, name: virt-controller }
+
+- name: Read the supported RKE2 Traefik Service
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace=kube-system
+      - get
+      - service
+      - rke2-traefik
+      - -o
+      - json
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: validated_traefik_service
+  changed_when: false
+
+- name: Read the supported Traefik IngressClass
+  ansible.builtin.command:
+    argv: [/usr/local/bin/kubectl, get, ingressclass, traefik, -o, json]
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: validated_traefik_ingress_class
+  changed_when: false
+
+- name: Verify the HA edge listeners reach healthy Traefik backends
+  ansible.builtin.wait_for:
+    host: "{{ rke2_ha_vip }}"
+    port: "{{ item }}"
+    state: started
+    timeout: 30
+  loop:
+    - 80
+    - 443
+
+- name: Validate the KubeVirt availability condition
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace=kubevirt
+      - wait
+      - kubevirt/kubevirt
+      - --for=condition=Available
+      - --timeout=300s
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: kubevirt_condition
+  changed_when: false
+
+- name: Validate the CDI availability condition
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - wait
+      - cdi/cdi
+      - --for=condition=Available
+      - --timeout=300s
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: cdi_condition
+  changed_when: false
+
+- name: Read the default StorageClass contract
+  ansible.builtin.command:
+    argv: [/usr/local/bin/kubectl, get, storageclass, longhorn, -o, json]
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: validated_storage_class
+  changed_when: false
+
+- name: Read the recurring Longhorn volume backup contract
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - --namespace=longhorn-system
+      - get
+      - recurringjob.longhorn.io
+      - codegate-volume-backup
+      - -o
+      - json
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: validated_longhorn_backup
+  changed_when: false
+
+- name: List the explicitly default StorageClasses
+  ansible.builtin.command:
+    argv:
+      - /usr/local/bin/kubectl
+      - get
+      - storageclass
+      - -o
+      - 'jsonpath={range .items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")]}{.metadata.name}{"\n"}{end}'
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: validated_default_storage_classes
+  changed_when: false
+
+- name: Read the KubeVirt configuration
+  ansible.builtin.command:
+    argv: [/usr/local/bin/kubectl, --namespace=kubevirt, get, kubevirt, kubevirt, -o, json]
+  environment:
+    KUBECONFIG: /root/.kube/config
+  register: validated_kubevirt
+  changed_when: false
+
+- name: Assert cluster production invariants
+  ansible.builtin.assert:
+    that:
+      - kubernetes_ready.stdout | trim == 'ok'
+      - >-
+        (validated_storage_class.stdout | from_json).metadata.annotations['storageclass.kubernetes.io/is-default-class']
+        == 'true'
+      - validated_default_storage_classes.stdout_lines == ['longhorn']
+      - >-
+        ((validated_storage_class.stdout | from_json).parameters.recurringJobSelector | from_json)
+        == [{'name': 'codegate-volume-backup', 'isGroup': false}]
+      - (validated_longhorn_backup.stdout | from_json).spec.task == 'backup'
+      - (validated_longhorn_backup.stdout | from_json).spec.cron == longhorn_backup_schedule
+      - >-
+        (validated_longhorn_backup.stdout | from_json).spec.retain
+        | int == longhorn_backup_retention | int
+      - (validated_traefik_service.stdout | from_json).spec.type == 'NodePort'
+      - (validated_traefik_service.stdout | from_json).spec.externalTrafficPolicy == 'Local'
+      - >-
+        ((validated_traefik_service.stdout | from_json).spec.ports
+          | selectattr('name', 'equalto', 'web') | map(attribute='nodePort') | first)
+        | int == ingress_http_node_port | int
+      - >-
+        ((validated_traefik_service.stdout | from_json).spec.ports
+          | selectattr('name', 'equalto', 'websecure') | map(attribute='nodePort') | first)
+        | int == ingress_https_node_port | int
+      - >-
+        (validated_traefik_ingress_class.stdout | from_json).metadata.annotations['ingressclass.kubernetes.io/is-default-class']
+        == 'true'
+      - >-
+        not ((validated_kubevirt.stdout | from_json).spec.configuration.developerConfiguration.useEmulation
+        | default(false) | bool)
+    fail_msg: The API, Traefik edge, default storage, or hardware-only KubeVirt invariant failed.

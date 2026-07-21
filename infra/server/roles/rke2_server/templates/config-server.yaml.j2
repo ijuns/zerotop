@@ -1,0 +1,50 @@
+{% if not rke2_initial_server | bool %}
+server: {{ ('https://' ~ rke2_ha_vip ~ ':9345') | to_json }}
+{% endif %}
+token: {{ rke2_token | to_json }}
+node-name: {{ inventory_hostname | to_json }}
+node-ip: {{ ansible_host | to_json }}
+data-dir: {{ rke2_data_dir | to_json }}
+write-kubeconfig-mode: "0600"
+tls-san:
+  - {{ rke2_ha_vip | to_json }}
+  - {{ rke2_registration_name | to_json }}
+
+cluster-cidr: {{ rke2_cluster_cidr | to_json }}
+service-cidr: {{ rke2_service_cidr | to_json }}
+cluster-dns: {{ rke2_cluster_dns | to_json }}
+cni:
+{% if rke2_enable_multus | bool %}
+  - multus
+{% endif %}
+  - cilium
+
+disable:
+  - rke2-ingress-nginx
+ingress-controller: {{ rke2_ingress_controller | to_json }}
+secrets-encryption: true
+protect-kernel-defaults: true
+{% if rke2_cis_profile | bool %}
+profile: cis
+{% endif %}
+
+audit-policy-file: /etc/rancher/rke2/audit-policy.yaml
+kube-apiserver-arg:
+  - audit-log-path=/var/lib/rancher/rke2/server/logs/audit.log
+  - audit-log-maxage=30
+  - audit-log-maxbackup=10
+  - audit-log-maxsize=100
+
+etcd-snapshot-compress: true
+etcd-snapshot-schedule-cron: {{ rke2_snapshot_schedule | to_json }}
+etcd-snapshot-retention: {{ rke2_snapshot_retention }}
+{% if etcd_s3_enabled | bool %}
+etcd-s3: true
+etcd-s3-endpoint: {{ etcd_s3_endpoint | to_json }}
+etcd-s3-region: {{ etcd_s3_region | to_json }}
+etcd-s3-bucket: {{ etcd_s3_bucket | to_json }}
+etcd-s3-folder: {{ etcd_s3_folder | to_json }}
+etcd-s3-access-key: {{ etcd_s3_access_key | to_json }}
+etcd-s3-secret-key: {{ etcd_s3_secret_key | to_json }}
+etcd-s3-retention: {{ rke2_snapshot_s3_retention }}
+{% endif %}

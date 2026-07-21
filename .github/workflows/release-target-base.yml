@@ -1,0 +1,114 @@
+name: Release target-base
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable release label, for example 2026.07.1
+        required: true
+        type: string
+      parent_image:
+        description: Digest-pinned Node 24 Linux image
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-sign:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate immutable inputs
+        shell: bash
+        env:
+          PARENT_IMAGE: ${{ inputs.parent_image }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$PARENT_IMAGE" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$ ]]
+          [[ "$RELEASE_TAG" =~ ^[0-9]{4}\.[0-9]{2}\.[0-9]+$ ]]
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: imjasonh/setup-crane@v0.4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/codegate-target-base" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the HTTP ABI image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/target-base/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          build-args: NODE_RUNTIME_IMAGE=${{ inputs.parent_image }}
+          tags: ${{ steps.image.outputs.name }}:${{ inputs.release_tag }}
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Scan the immutable multi-platform digest
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Verify published HTTP ABI config
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          config="$(crane config --platform linux/amd64 "$IMAGE@$DIGEST")"
+          test "$(jq -r '.config.User' <<<"$config")" = '65532:65532'
+          test "$(jq -r '.config.ExposedPorts["8080/tcp"] // empty' <<<"$config")" = '{}'
+          test "$(jq -r '.config.Labels["io.codegate.runtime.contract"]' <<<"$config")" = 'http-v1'
+          test "$(jq -r '.config.Labels["io.codegate.runtime.uid"]' <<<"$config")" = '65532'
+
+      - name: Sign and verify with the platform image-signing key
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$COSIGN_PRIVATE_KEY"
+          test -n "$COSIGN_PUBLIC_KEY"
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$IMAGE@$DIGEST"
+          cosign verify --key env://COSIGN_PUBLIC_KEY "$IMAGE@$DIGEST" >/dev/null
+
+      - name: Publish catalog coordinates
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo '### target-base http-v1'
+            echo
+            echo "\`$IMAGE@$DIGEST\`"
+            echo
+            echo 'Bind this exact digest in `AI_TARGET_BASE_IMAGE` and `BASE_IMAGE_ALLOWLIST_JSON`.'
+            echo 'The builder and validator must mount the same `COSIGN_PUBLIC_KEY` as `cosign.pub`.'
+          } >> "$GITHUB_STEP_SUMMARY"

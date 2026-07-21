@@ -1,0 +1,70 @@
+---
+- name: Install the HA endpoint packages
+  ansible.builtin.apt:
+    name:
+      - haproxy
+      - keepalived
+    state: present
+    update_cache: true
+
+- name: Configure HAProxy for RKE2 and ingress traffic
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    owner: root
+    group: root
+    mode: "0640"
+    validate: "{{ '/usr/sbin/haproxy -c -f %s' if not ansible_check_mode else omit }}"
+  notify: Restart HAProxy
+
+- name: Configure unicast Keepalived
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    owner: root
+    group: root
+    mode: "0600"
+    validate: "{{ '/usr/sbin/keepalived --config-test --use-file=%s' if not ansible_check_mode else omit }}"
+  no_log: true
+  notify: Restart Keepalived
+
+- name: Flush HA endpoint handlers before service checks
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable HA endpoint services
+  ansible.builtin.service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - haproxy
+    - keepalived
+  when: not ansible_check_mode
+
+- name: Wait for the fixed registration listener
+  ansible.builtin.wait_for:
+    host: "{{ rke2_ha_vip }}"
+    port: 9345
+    state: started
+    timeout: 60
+  run_once: true
+  when: not ansible_check_mode
+
+- name: Confirm one server owns the private VIP
+  ansible.builtin.command:
+    argv: [ip, -brief, address, show, dev, "{{ rke2_ha_interface }}"]
+  register: ha_interface_addresses
+  changed_when: false
+  check_mode: false
+
+- name: Count VIP owners
+  ansible.builtin.set_fact:
+    local_vip_owner: "{{ 1 if rke2_ha_vip in ha_interface_addresses.stdout else 0 }}"
+
+- name: Validate that exactly one server owns the VIP
+  ansible.builtin.assert:
+    that:
+      - groups['rke2_servers'] | map('extract', hostvars, 'local_vip_owner') | map('int') | sum == 1
+    fail_msg: Keepalived did not elect exactly one owner for the RKE2 VIP.
+  run_once: true
+  when: not ansible_check_mode

@@ -1,0 +1,36 @@
+---
+- name: Wait for the fixed registration endpoint
+  ansible.builtin.wait_for:
+    host: "{{ rke2_ha_vip }}"
+    port: 9345
+    state: started
+    timeout: 180
+  when: not ansible_check_mode
+
+- name: Write the protected RKE2 agent configuration
+  ansible.builtin.template:
+    src: config-agent.yaml.j2
+    dest: /etc/rancher/rke2/config.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart RKE2 node
+
+- name: Flush RKE2 agent handlers
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start the RKE2 agent
+  ansible.builtin.service:
+    name: rke2-agent
+    enabled: true
+    state: started
+  when: not ansible_check_mode
+
+- name: Wait for the local supervisor proxy
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 6444
+    state: started
+    timeout: 600
+  when: not ansible_check_mode

@@ -1,0 +1,104 @@
+---
+# Safety gate. Set true only in a private inventory/group vars override after
+# replacing every REQUIRED_* value and validating the physical hosts.
+deployment_confirmed: false
+
+platform_environment: production
+platform_base_domain: REQUIRED_BASE_DOMAIN
+management_cidr: REQUIRED_MANAGEMENT_CIDR
+
+# Three-node HA endpoint. Use a private LAN VIP; public NAT/LB is external.
+rke2_ha_vip: REQUIRED_PRIVATE_VIP
+rke2_ha_vip_prefix: 24
+rke2_ha_interface: REQUIRED_INTERFACE
+rke2_registration_name: REQUIRED_INTERNAL_DNS_NAME
+keepalived_virtual_router_id: 51
+
+# Current reviewed pins. Upgrade only after reading every component's notes and
+# testing restore/rollback. Never replace a pin with "latest".
+rke2_version: v1.36.2+rke2r1
+kubevirt_version: v1.8.2
+cdi_version: v1.64.0
+longhorn_chart_version: 1.12.0
+cert_manager_chart_version: v1.21.0
+external_secrets_chart_version: 2.5.0
+addon_ready_timeout_seconds: 1200
+
+# The RKE2 installer is downloaded only after this operator-reviewed checksum is
+# supplied. Release manifest checksums are also mandatory.
+rke2_install_script_url: https://get.rke2.io
+rke2_install_script_checksum: REQUIRED_SHA256
+kubevirt_operator_sha256: REQUIRED_SHA256
+kubevirt_cr_sha256: REQUIRED_SHA256
+cdi_operator_sha256: REQUIRED_SHA256
+cdi_cr_sha256: REQUIRED_SHA256
+
+rke2_cluster_cidr: 10.42.0.0/16
+rke2_service_cidr: 10.43.0.0/16
+rke2_cluster_dns: 10.43.0.10
+rke2_enable_multus: true
+rke2_cis_profile: true
+rke2_data_dir: /var/lib/rancher/rke2
+rke2_snapshot_schedule: "0 */6 * * *"
+rke2_snapshot_retention: 28
+rke2_snapshot_s3_retention: 56
+
+# Node-level pull access for the private OCI registry. The endpoint and host
+# are non-secret deployment inputs; the read-only pull credential and private
+# CA PEM come only from the encrypted vars/vault.yml file. RKE2/containerd
+# reads the generated files before pulling any platform, builder, target, or
+# workstation image.
+private_registry_enabled: true
+private_registry_host: REQUIRED_PRIVATE_REGISTRY_HOST
+private_registry_endpoint: "https://{{ private_registry_host }}"
+private_registry_ca_path: /etc/rancher/rke2/private-registry-ca.crt
+
+# Host hardening. The bootstrap does not enable UFW because an incorrectly
+# configured host firewall breaks Cilium/KubeVirt; enforce the documented port
+# matrix at the upstream firewall until a tested host ruleset is supplied.
+ssh_password_authentication: false
+ssh_permit_root_login: false
+enable_unattended_security_updates: true
+manage_host_firewall: false
+
+# KVM is mandatory. Software emulation is deliberately unsupported.
+require_hardware_virtualization: true
+minimum_node_vcpus: 8
+minimum_node_memory_mb: 32768
+
+# Longhorn V1 uses a pre-mounted dedicated filesystem. The playbook never
+# partitions or formats a disk automatically.
+longhorn_data_path: /var/lib/longhorn
+longhorn_min_free_gb: 200
+longhorn_require_dedicated_mount: true
+longhorn_default_replica_count: 3
+longhorn_backup_credential_secret: longhorn-backup-credentials
+longhorn_backup_schedule: "0 */6 * * *"
+# 56 six-hour restore points retain approximately 14 days when data changes.
+longhorn_backup_retention: 56
+longhorn_backup_concurrency: 2
+
+# Secret backends are provider-specific. The bootstrap installs External
+# Secrets but intentionally does not create a permissive ClusterSecretStore.
+external_secrets_provider_configured: false
+
+# RKE2 1.36 uses Traefik for new clusters. The retired community ingress-nginx
+# controller is explicitly disabled and rejected by preflight. HAProxy reaches
+# the supported Traefik DaemonSet through these fixed NodePorts.
+rke2_ingress_controller: traefik
+install_ingress_nginx: false
+ingress_http_node_port: 30080
+ingress_https_node_port: 30443
+
+# Production requires off-node etcd snapshots. Credentials live only in the
+# encrypted vars/vault.yml copied from vars/vault.example.yml.
+etcd_s3_enabled: true
+etcd_s3_endpoint: REQUIRED_S3_ENDPOINT
+etcd_s3_region: REQUIRED_S3_REGION
+etcd_s3_bucket: REQUIRED_S3_BUCKET
+etcd_s3_folder: codegate/rke2-etcd
+
+# Backup target configuration for Longhorn is provider-specific and is not
+# applied until External Secrets creates the expected secret.
+longhorn_backup_target_required: true
+longhorn_backup_target: REQUIRED_LONGHORN_BACKUP_TARGET

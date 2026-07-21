@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: codegate-runtime-config
+  namespace: codegate-runtime-system
+data:
+  RUNTIME_MODE: kubevirt
+  UBUNTU_DESKTOP_IMAGE: registry.example.invalid/codegate/ubuntu-desktop:replace-with-digest
+  KALI_DESKTOP_IMAGE: registry.example.invalid/codegate/kali-desktop:replace-with-digest
+  OPENVPN_GATEWAY_IMAGE: registry.example.invalid/codegate/openvpn-gateway@sha256:replace-with-reviewed-digest
+  OPENVPN_GATEWAY_BASE_DOMAIN: vpn-runs.example.invalid
+  OPENVPN_ALLOWED_CIDR: 10.42.0.0/16
+  OPENVPN_ISSUER_URL: http://openvpn-issuer.codegate-vpn-system.svc.cluster.local:9100
+  RUNTIME_READY_TIMEOUT_SECONDS: "600"
+  SANDBOX_PROBE_IMAGE: registry.example.invalid/codegate/probe-runner@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  SANDBOX_TIMEOUT_SECONDS: "300"
+  SANDBOX_CANARY_NAMESPACE: codegate-runtime-system
+  SANDBOX_CANARY_SERVICE: validation-canary
+  SANDBOX_CANARY_PORT: "8080"
+  TARGET_IMAGE_REGISTRIES: registry.example.invalid
+  ELASTICSEARCH_URL: https://elasticsearch.codegate-data.svc.cluster.local:9200

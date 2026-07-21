@@ -1,0 +1,17 @@
+apiVersion: longhorn.io/v1beta2
+kind: RecurringJob
+metadata:
+  name: codegate-volume-backup
+  namespace: longhorn-system
+  labels:
+    app.kubernetes.io/name: codegate-volume-backup
+    app.kubernetes.io/part-of: codegate-range
+spec:
+  cron: {{ longhorn_backup_schedule | to_json }}
+  task: backup
+  groups:
+    # Longhorn assigns volumes without an explicit job to the default group;
+    # this also covers volumes that predate the StorageClass selector.
+    - default
+  retain: {{ longhorn_backup_retention }}
+  concurrency: {{ longhorn_backup_concurrency }}

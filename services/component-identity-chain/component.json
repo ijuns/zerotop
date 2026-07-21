@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "codegate-component/v1",
+  "kind": "signed-node-handler-v1",
+  "componentId": "identity-chain",
+  "handler": {
+    "path": "handler.mjs",
+    "sha256": "744c5992c17c6c221859bdb1bcd6719e2fa80f7edb0b5486a42a1d3b869258f9"
+  },
+  "findings": ["scenario-idor", "CWE-639"],
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/api/accounts",
+      "operation": "read-account"
+    }
+  ]
+}

@@ -1,0 +1,116 @@
+name: Release identity-chain component
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable component version, for example 1.0.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test-build-sign:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate release and signed handler manifest
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]
+          expected="$(jq -r '.handler.sha256' services/component-identity-chain/component.json)"
+          actual="$(sha256sum services/component-identity-chain/handler.mjs | awk '{print $1}')"
+          test "$expected" = "$actual"
+          test "$(jq -r '.schemaVersion' services/component-identity-chain/component.json)" = 'codegate-component/v1'
+          test "$(jq -r '.kind' services/component-identity-chain/component.json)" = 'signed-node-handler-v1'
+          test "$(jq -r '.componentId' services/component-identity-chain/component.json)" = 'identity-chain'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Test component and target adapter ABI
+        run: |
+          node --test services/component-identity-chain/test/*.test.mjs
+          node --test services/target-base/test/*.test.mjs
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: imjasonh/setup-crane@v0.4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/codegate-component-identity-chain" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push reviewed helper
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/component-identity-chain/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.image.outputs.name }}:${{ inputs.release_tag }}
+
+      - uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Verify helper OCI execution identity
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          config="$(crane config --platform linux/amd64 "$IMAGE@$DIGEST")"
+          test "$(jq -r '.config.User' <<<"$config")" = '65532:65532'
+
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign and verify with the platform image-signing key
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PUBLIC_KEY: ${{ secrets.COSIGN_PUBLIC_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$COSIGN_PRIVATE_KEY"
+          test -n "$COSIGN_PUBLIC_KEY"
+          cosign sign --yes --key env://COSIGN_PRIVATE_KEY "$IMAGE@$DIGEST"
+          cosign verify --key env://COSIGN_PUBLIC_KEY "$IMAGE@$DIGEST" >/dev/null
+
+      - name: Publish exact catalog entry
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          entry="$(jq -cn --arg key "identity-chain@$RELEASE_TAG" --arg imageRef "$IMAGE@$DIGEST" '{($key):{imageRef:$imageRef,sourcePath:"/opt/codegate/package/",destination:"/opt/codegate/packages/identity-chain/",runtimeKind:"signed-node-handler-v1"}}')"
+          {
+            echo '### PACKAGE_CATALOG_JSON entry'
+            echo
+            echo '```json'
+            echo "$entry"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

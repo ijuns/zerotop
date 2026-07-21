@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codegate.example/schemas/labspec.json",
+  "title": "CODEGATE LabSpec",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["title", "prompt", "team", "desktopImage", "accessMethod", "questionTypes", "network"],
+  "properties": {
+    "title": { "type": "string", "minLength": 3, "maxLength": 120 },
+    "prompt": { "type": "string", "minLength": 10, "maxLength": 5000 },
+    "team": { "enum": ["blue", "red"] },
+    "desktopImage": { "enum": ["ubuntu", "kali"] },
+    "accessMethod": { "enum": ["browser_desktop", "openvpn", "both"] },
+    "difficulty": { "enum": ["beginner", "intermediate", "advanced", "expert"] },
+    "cveIds": {
+      "type": "array",
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^CVE-[0-9]{4}-[0-9]{4,}$" }
+    },
+    "questionTypes": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "enum": ["elk_search", "mitre_attack", "single_choice", "multiple_choice", "free_text"] }
+    },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["egress", "isolation"],
+      "properties": {
+        "egress": { "const": "deny" },
+        "isolation": { "const": "per_run" }
+      }
+    }
+  }
+}

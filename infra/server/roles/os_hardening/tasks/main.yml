@@ -1,0 +1,180 @@
+---
+- name: Refresh the Ubuntu package index
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install hardened host and storage prerequisites
+  ansible.builtin.apt:
+    name:
+      - apparmor
+      - apparmor-utils
+      - auditd
+      - audispd-plugins
+      - chrony
+      - cryptsetup
+      - curl
+      - fail2ban
+      - jq
+      - nfs-common
+      - open-iscsi
+      - qemu-kvm
+      - unattended-upgrades
+    state: present
+
+- name: Read CPU virtualization vendor data
+  ansible.builtin.slurp:
+    src: /proc/cpuinfo
+  register: cpuinfo_contents
+
+- name: Select the KVM vendor module
+  ansible.builtin.set_fact:
+    kvm_vendor_module: >-
+      {{ 'kvm_amd' if 'AuthenticAMD' in (cpuinfo_contents.content | b64decode)
+         else 'kvm_intel' }}
+
+- name: Persist required kernel modules
+  ansible.builtin.template:
+    src: codegate-modules.conf.j2
+    dest: /etc/modules-load.d/codegate-rke2.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Load required kernel modules now
+  ansible.builtin.command:
+    argv: [modprobe, "{{ item }}"]
+  loop:
+    - overlay
+    - br_netfilter
+    - nf_conntrack
+    - wireguard
+    - iscsi_tcp
+    - kvm
+    - "{{ kvm_vendor_module }}"
+  changed_when: false
+  when: not ansible_check_mode
+
+- name: Install Kubernetes and Cilium sysctl policy
+  ansible.builtin.template:
+    src: 99-codegate-kubernetes.conf.j2
+    dest: /etc/sysctl.d/99-codegate-kubernetes.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Apply sysctl policy
+
+- name: Disable active swap
+  ansible.builtin.command: swapoff --all
+  changed_when: ansible_swaptotal_mb | int > 0
+  when:
+    - ansible_swaptotal_mb | int > 0
+    - not ansible_check_mode
+
+- name: Disable swap entries persistently
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\s+swap\s+.*)$'
+    replace: '# disabled-by-codegate-rke2 \1'
+    backup: true
+
+- name: Harden OpenSSH with a drop-in
+  ansible.builtin.template:
+    src: 60-codegate-hardening.conf.j2
+    dest: /etc/ssh/sshd_config.d/60-codegate-hardening.conf
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Validate and reload ssh
+
+- name: Persist bounded systemd journal data
+  ansible.builtin.copy:
+    dest: /etc/systemd/journald.conf.d/60-codegate.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Journal]
+      Storage=persistent
+      Compress=yes
+      SystemMaxUse=4G
+      MaxRetentionSec=30day
+      ForwardToSyslog=no
+  notify: Restart journald
+
+- name: Prevent core dumps from privileged services
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/60-codegate-core.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      * hard core 0
+      root hard core 0
+
+- name: Create audited configuration directories before loading rules
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  loop:
+    - /etc/rancher/rke2
+    - /var/lib/rancher/rke2/server/cred
+    - /var/lib/rancher/rke2/server/tls
+    - /etc/keepalived
+    - /etc/haproxy
+
+- name: Install audit rules for cluster configuration
+  ansible.builtin.template:
+    src: codegate-rke2.rules.j2
+    dest: /etc/audit/rules.d/60-codegate-rke2.rules
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Load audit rules
+
+- name: Configure automatic security updates
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/52codegate-unattended-upgrades
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      Unattended-Upgrade::Allowed-Origins {
+        "${distro_id}:${distro_codename}-security";
+      };
+      Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+      Unattended-Upgrade::Remove-Unused-Dependencies "true";
+      Unattended-Upgrade::Automatic-Reboot "false";
+  when: enable_unattended_security_updates | bool
+
+- name: Enable host security and time services
+  ansible.builtin.service:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - apparmor
+    - auditd
+    - chrony
+    - fail2ban
+    - iscsid
+  when: not ansible_check_mode
+
+- name: Check whether UFW is installed
+  ansible.builtin.stat:
+    path: /usr/sbin/ufw
+  register: ufw_binary
+
+- name: Refuse an unmanaged active UFW ruleset
+  ansible.builtin.command: ufw status
+  register: ufw_status
+  changed_when: false
+  failed_when: >-
+    not manage_host_firewall | bool and
+    'Status: active' in ufw_status.stdout
+  when:
+    - not ansible_check_mode
+    - ufw_binary.stat.exists

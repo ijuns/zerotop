@@ -1,0 +1,162 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codegate-validator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-validator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: codegate-validator
+    spec:
+      serviceAccountName: codegate-validator
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: validator
+          image: ghcr.io/replace-me/codegate-validator:replace-with-digest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9003
+          env:
+            - name: PORT
+              value: "9003"
+            - name: VALIDATOR_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-validator-secrets
+                  key: VALIDATOR_INTERNAL_TOKEN
+            - name: SANDBOX_RUNNER_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-validator-secrets
+                  key: SANDBOX_RUNNER_INTERNAL_TOKEN
+            - name: AI_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-validator-secrets
+                  key: AI_INTERNAL_TOKEN
+            - name: AI_SERVICE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: codegate-platform-config
+                  key: AI_SERVICE_URL
+            - name: SANDBOX_RUNNER_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: codegate-platform-config
+                  key: SANDBOX_RUNNER_URL
+            - name: COSIGN_PUBLIC_KEY_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: codegate-platform-config
+                  key: COSIGN_PUBLIC_KEY_PATH
+            - name: VALIDATOR_CACHE_DIR
+              valueFrom:
+                configMapKeyRef:
+                  name: codegate-platform-config
+                  key: VALIDATOR_CACHE_DIR
+            - name: TARGET_IMAGE_REGISTRIES
+              valueFrom:
+                configMapKeyRef:
+                  name: codegate-platform-config
+                  key: TARGET_IMAGE_REGISTRIES
+            - name: DOCKER_CONFIG
+              value: /home/validator/.docker
+            - name: SSL_CERT_DIR
+              value: /etc/ssl/certs
+            - name: SSL_CERT_FILE
+              value: /etc/codegate/registry-ca/ca.crt
+            - name: COSIGN_REPOSITORY
+              valueFrom:
+                configMapKeyRef:
+                  name: codegate-platform-config
+                  key: COSIGN_REPOSITORY
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+              ephemeral-storage: 2Gi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 12Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: trust
+              mountPath: /etc/codegate-validator/trust
+              readOnly: true
+            - name: cache
+              mountPath: /var/cache/codegate-validator
+            - name: temporary
+              mountPath: /tmp
+            - name: registry-auth
+              mountPath: /home/validator/.docker
+              readOnly: true
+            - name: registry-ca
+              mountPath: /etc/codegate/registry-ca
+              readOnly: true
+      volumes:
+        - name: trust
+          secret:
+            secretName: codegate-validator-trust
+            defaultMode: 0440
+        - name: cache
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: temporary
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: registry-auth
+          secret:
+            secretName: codegate-validator-registry
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+            defaultMode: 0440
+        - name: registry-ca
+          secret:
+            secretName: codegate-private-registry-ca
+            items:
+              - key: ca.crt
+                path: ca.crt
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codegate-validator
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: codegate-validator
+  ports:
+    - name: http
+      port: 9003
+      targetPort: http

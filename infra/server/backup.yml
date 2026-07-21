@@ -1,0 +1,53 @@
+---
+- name: Create and verify an on-demand off-node etcd snapshot
+  hosts: rke2_servers
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Refuse a backup run without the S3 configuration
+      ansible.builtin.assert:
+        that:
+          - etcd_s3_enabled | bool
+          - etcd_s3_bucket is not match('^REQUIRED_')
+        fail_msg: Production backup validation requires an S3-compatible target.
+      run_once: true
+
+    - name: Save one encrypted-control-plane snapshot
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/rke2
+          - etcd-snapshot
+          - save
+          - --name
+          - codegate-manual
+      register: manual_snapshot
+      changed_when: true
+      no_log: true
+      when:
+        - inventory_hostname == groups['rke2_servers'][0]
+        - not ansible_check_mode
+
+    - name: List snapshots from the configured S3 target
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/rke2
+          - etcd-snapshot
+          - list
+          - --s3
+      register: snapshot_list
+      changed_when: false
+      no_log: true
+      when:
+        - inventory_hostname == groups['rke2_servers'][0]
+        - not ansible_check_mode
+
+    - name: Confirm an S3 snapshot is visible
+      ansible.builtin.assert:
+        that:
+          - "'s3://' in snapshot_list.stdout"
+        fail_msg: The on-demand snapshot was not visible in off-node storage.
+      when:
+        - inventory_hostname == groups['rke2_servers'][0]
+        - not ansible_check_mode
+

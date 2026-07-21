@@ -1,0 +1,120 @@
+---
+- name: Identify the initial embedded-etcd server
+  ansible.builtin.set_fact:
+    rke2_initial_server: "{{ inventory_hostname == groups['rke2_servers'][0] }}"
+
+- name: Wait for the fixed endpoint before joining another server
+  ansible.builtin.wait_for:
+    host: "{{ rke2_ha_vip }}"
+    port: 9345
+    state: started
+    timeout: 120
+  when:
+    - not rke2_initial_server | bool
+    - not ansible_check_mode
+
+- name: Write the protected RKE2 server configuration
+  ansible.builtin.template:
+    src: config-server.yaml.j2
+    dest: /etc/rancher/rke2/config.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Restart RKE2 node
+
+- name: Install the Kubernetes API audit policy
+  ansible.builtin.template:
+    src: audit-policy.yaml.j2
+    dest: /etc/rancher/rke2/audit-policy.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart RKE2 node
+
+- name: Create the server manifest directory on the initial node
+  ansible.builtin.file:
+    path: "{{ rke2_data_dir }}/server/manifests"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: rke2_initial_server | bool
+
+- name: Configure the bundled Cilium chart before first startup
+  ansible.builtin.template:
+    src: rke2-cilium-config.yaml.j2
+    dest: "{{ rke2_data_dir }}/server/manifests/rke2-cilium-config.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+  when: rke2_initial_server | bool
+  notify: Restart RKE2 node
+
+- name: Configure the supported RKE2 Traefik edge before first startup
+  ansible.builtin.template:
+    src: rke2-traefik-config.yaml.j2
+    dest: "{{ rke2_data_dir }}/server/manifests/rke2-traefik-config.yaml"
+    owner: root
+    group: root
+    mode: "0600"
+  when: rke2_initial_server | bool
+  notify: Restart RKE2 node
+
+- name: Flush RKE2 configuration handlers
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable and start the RKE2 server
+  ansible.builtin.service:
+    name: rke2-server
+    enabled: true
+    state: started
+  when: not ansible_check_mode
+
+- name: Wait for the local Kubernetes API
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 6443
+    state: started
+    timeout: 600
+  when: not ansible_check_mode
+
+- name: Link RKE2 kubectl into the standard path
+  ansible.builtin.file:
+    src: "{{ rke2_data_dir }}/bin/kubectl"
+    dest: /usr/local/bin/kubectl
+    state: link
+    force: true
+  when: not ansible_check_mode
+
+- name: Create the root kubeconfig directory on the initial server
+  ansible.builtin.file:
+    path: /root/.kube
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  when: rke2_initial_server | bool
+
+- name: Copy the admin kubeconfig to the initial server
+  ansible.builtin.copy:
+    src: /etc/rancher/rke2/rke2.yaml
+    dest: /root/.kube/config
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when:
+    - rke2_initial_server | bool
+    - not ansible_check_mode
+
+- name: Point the admin kubeconfig at the HA endpoint
+  ansible.builtin.replace:
+    path: /root/.kube/config
+    regexp: 'https://127\.0\.0\.1:6443'
+    replace: "https://{{ rke2_ha_vip }}:6443"
+  no_log: true
+  when:
+    - rke2_initial_server | bool
+    - not ansible_check_mode

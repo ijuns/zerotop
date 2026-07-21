@@ -1,0 +1,64 @@
+global
+  log /dev/log local0
+  log /dev/log local1 notice
+  chroot /var/lib/haproxy
+  stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+  stats timeout 30s
+  user haproxy
+  group haproxy
+  daemon
+
+defaults
+  log global
+  mode tcp
+  option tcplog
+  option dontlognull
+  timeout connect 5s
+  timeout client 1m
+  timeout server 1m
+
+frontend rke2_registration
+  bind {{ rke2_ha_vip }}:9345
+  default_backend rke2_registration_nodes
+
+backend rke2_registration_nodes
+  balance roundrobin
+  option tcp-check
+{% for host in groups['rke2_servers'] %}
+  server {{ host }} {{ hostvars[host].ansible_host }}:9345 check
+{% endfor %}
+
+frontend kubernetes_api
+  bind {{ rke2_ha_vip }}:6443
+  default_backend kubernetes_api_nodes
+
+backend kubernetes_api_nodes
+  balance roundrobin
+  option tcp-check
+{% for host in groups['rke2_servers'] %}
+  server {{ host }} {{ hostvars[host].ansible_host }}:6443 check
+{% endfor %}
+
+{% if rke2_ingress_controller == 'traefik' %}
+frontend platform_http
+  bind {{ rke2_ha_vip }}:80
+  default_backend ingress_http_nodes
+
+backend ingress_http_nodes
+  balance roundrobin
+  option tcp-check
+{% for host in groups['rke2_servers'] %}
+  server {{ host }} {{ hostvars[host].ansible_host }}:{{ ingress_http_node_port }} check send-proxy-v2
+{% endfor %}
+
+frontend platform_https
+  bind {{ rke2_ha_vip }}:443
+  default_backend ingress_https_nodes
+
+backend ingress_https_nodes
+  balance roundrobin
+  option tcp-check
+{% for host in groups['rke2_servers'] %}
+  server {{ host }} {{ hostvars[host].ansible_host }}:{{ ingress_https_node_port }} check send-proxy-v2
+{% endfor %}
+{% endif %}

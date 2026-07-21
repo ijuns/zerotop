@@ -1,0 +1,15 @@
+---
+- name: Restart HAProxy
+  ansible.builtin.service:
+    name: haproxy
+    enabled: true
+    state: restarted
+  when: not ansible_check_mode
+
+- name: Restart Keepalived
+  ansible.builtin.service:
+    name: keepalived
+    enabled: true
+    state: restarted
+  when: not ansible_check_mode
+

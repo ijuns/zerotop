@@ -1,0 +1,5 @@
+inventory.yml
+vars/vault.yml
+artifacts/
+*.retry
+

@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: codegate-platform
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - range.example.invalid
+      secretName: codegate-tls
+  rules:
+    - host: range.example.invalid
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: codegate-api
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: codegate-web
+                port:
+                  name: http

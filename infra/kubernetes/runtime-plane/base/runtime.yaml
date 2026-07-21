@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codegate-runtime
+  namespace: codegate-runtime-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-runtime
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: codegate-runtime
+    spec:
+      serviceAccountName: codegate-runtime
+      automountServiceAccountToken: true
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: runtime
+          image: ghcr.io/replace-me/codegate-runtime:replace-with-digest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9000
+          env:
+            - name: PORT
+              value: "9000"
+            - name: NODE_EXTRA_CA_CERTS
+              value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+            - name: RUNTIME_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-runtime-secrets
+                  key: RUNTIME_INTERNAL_TOKEN
+            - name: OPENVPN_ISSUER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-runtime-secrets
+                  key: OPENVPN_ISSUER_TOKEN
+            - name: SANDBOX_RUNNER_INTERNAL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-runtime-secrets
+                  key: SANDBOX_RUNNER_INTERNAL_TOKEN
+            - name: ELASTICSEARCH_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: codegate-runtime-secrets
+                  key: ELASTICSEARCH_API_KEY
+          envFrom:
+            - configMapRef:
+                name: codegate-runtime-config
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: codegate-runtime
+  namespace: codegate-runtime-system
+spec:
+  selector:
+    app.kubernetes.io/name: codegate-runtime
+  ports:
+    - name: http
+      port: 9000
+      targetPort: http

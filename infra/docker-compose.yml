@@ -1,0 +1,368 @@
+# Local development topology only.
+# The credentials and disabled Elasticsearch security below are NOT production-safe.
+name: codegate-range
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-codegate}
+      POSTGRES_USER: ${POSTGRES_USER:-codegate}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-codegate_dev_only_change_me}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - data
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.1
+    restart: unless-stopped
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-codegate}
+      KC_DB_USERNAME: ${POSTGRES_USER:-codegate}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-codegate_dev_only_change_me}
+      KC_DB_SCHEMA: keycloak
+      KC_HOSTNAME: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8081}
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      KC_METRICS_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-dev-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-keycloak_dev_only_change_me}
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ./keycloak/realm-codegate.json:/opt/keycloak/data/import/realm-codegate.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/9000;
+          printf "GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3;
+          grep -Eq '"status"[[:space:]]*:[[:space:]]*"UP"' <&3'
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - edge
+      - data
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION:-8.17.0}
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.enrollment.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl --silent --fail 'http://127.0.0.1:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null
+      interval: 10s
+      timeout: 6s
+      retries: 30
+      start_period: 30s
+    networks:
+      - data
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${KIBANA_VERSION:-8.17.0}
+    restart: unless-stopped
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      SERVER_PUBLICBASEURL: http://localhost:5601
+      TELEMETRY_ENABLED: "false"
+    ports:
+      - "127.0.0.1:5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl --silent --fail http://127.0.0.1:5601/api/status >/dev/null
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - edge
+      - data
+
+  api:
+    build:
+      context: ..
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      # Explicit local authentication; deployed manifests select OIDC.
+      AUTH_MODE: dev
+      REPOSITORY_MODE: postgres
+      SEED_DEVELOPMENT_DATA: "true"
+      PORT: "8080"
+      CODEGATE_DB_PATH: /app/.data/codegate.db
+      DATABASE_URL: postgresql://${POSTGRES_USER:-codegate}:${POSTGRES_PASSWORD:-codegate_dev_only_change_me}@postgres:5432/${POSTGRES_DB:-codegate}
+      REDIS_URL: redis://redis:6379/0
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      AI_SERVICE_URL: http://ai:8001
+      AI_ADAPTER: ${AI_ADAPTER:-local}
+      AI_INTERNAL_TOKEN: ${AI_INTERNAL_TOKEN:-ai_service_dev_token_change_me}
+      RUNTIME_ADAPTER: ${RUNTIME_ADAPTER:-simulator}
+      RUNTIME_SERVICE_URL: http://runtime:9000
+      RUNTIME_INTERNAL_TOKEN: ${RUNTIME_INTERNAL_TOKEN:-runtime_dev_only_change_me}
+      TELEMETRY_ADAPTER: http
+      TELEMETRY_SERVICE_URL: http://telemetry:9201
+      TELEMETRY_INTERNAL_TOKEN: ${TELEMETRY_INTERNAL_TOKEN:-telemetry_dev_only_change_me}
+      DESKTOP_GATEWAY_INTERNAL_TOKEN: ${DESKTOP_GATEWAY_INTERNAL_TOKEN:-desktop_dev_only_change_me}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      TARGET_IMAGE_REGISTRIES: ${TARGET_IMAGE_REGISTRIES:-registry.codegate.internal}
+      KEYCLOAK_ISSUER: ${KEYCLOAK_PUBLIC_URL:-http://localhost:8081}/realms/codegate
+      KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/codegate/protocol/openid-connect/certs
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - api_data:/app/.data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      runtime:
+        condition: service_healthy
+      telemetry:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    networks:
+      - edge
+      - application
+      - data
+
+  runtime:
+    build:
+      context: ..
+      dockerfile: services/runtime/Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: "9000"
+      RUNTIME_MODE: local
+      RUNTIME_INTERNAL_TOKEN: ${RUNTIME_INTERNAL_TOKEN:-runtime_dev_only_change_me}
+    ports:
+      - "127.0.0.1:9000:9000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:9000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - edge
+      - application
+
+  telemetry:
+    build:
+      context: ..
+      dockerfile: services/telemetry/Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: "9201"
+      TELEMETRY_INTERNAL_TOKEN: ${TELEMETRY_INTERNAL_TOKEN:-telemetry_dev_only_change_me}
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      # Elasticsearch security is intentionally disabled in this local-only topology.
+      ELASTICSEARCH_API_KEY: ${ELASTICSEARCH_API_KEY:-local_disabled_security_key}
+    ports:
+      - "127.0.0.1:9201:9201"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:9201/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - application
+      - data
+
+  ai:
+    profiles: ["ai"]
+    build:
+      context: ../services/ai
+      dockerfile: ../../infra/docker/ai.Dockerfile
+    restart: unless-stopped
+    environment:
+      PORT: "8001"
+      DATABASE_URL: postgresql://${POSTGRES_USER:-codegate}:${POSTGRES_PASSWORD:-codegate_dev_only_change_me}@postgres:5432/${POSTGRES_DB:-codegate}
+      REDIS_URL: redis://redis:6379/1
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      AI_APP_MODULE: ${AI_APP_MODULE:-app.main:app}
+      AI_AUTH_MODE: internal
+      AI_INTERNAL_TOKEN: ${AI_INTERNAL_TOKEN:-ai_service_dev_token_change_me}
+      # This Compose file is local-only; production manifests require external providers.
+      AI_GENERATION_MODE: ${AI_GENERATION_MODE:-dev}
+      AI_REVIEW_MODE: ${AI_REVIEW_MODE:-dev}
+      AI_RUBRIC_MODE: ${AI_RUBRIC_MODE:-dev}
+      GENERATION_PROVIDER_URL: ${GENERATION_PROVIDER_URL:-http://model-gateway:9010/v1/generate}
+      REVIEW_PROVIDER_URL: ${REVIEW_PROVIDER_URL:-http://model-gateway:9010/v1/review}
+      RUBRIC_PROVIDER_URL: ${RUBRIC_PROVIDER_URL:-http://model-gateway:9010/v1/rubric}
+      GENERATION_PROVIDER_TOKEN: ${MODEL_GATEWAY_INTERNAL_TOKEN:-model_gateway_dev_only_change_me_000000}
+      REVIEW_PROVIDER_TOKEN: ${MODEL_GATEWAY_INTERNAL_TOKEN:-model_gateway_dev_only_change_me_000000}
+      RUBRIC_PROVIDER_TOKEN: ${MODEL_GATEWAY_INTERNAL_TOKEN:-model_gateway_dev_only_change_me_000000}
+    ports:
+      - "127.0.0.1:8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    networks:
+      - edge
+      - application
+      - data
+
+  model-gateway:
+    profiles: ["external-ai"]
+    build:
+      context: ..
+      dockerfile: services/model-gateway/Dockerfile
+      args:
+        NODE_RUNTIME_IMAGE: ${MODEL_GATEWAY_NODE_IMAGE:-node:24.14.0-bookworm-slim}
+    restart: unless-stopped
+    environment:
+      PORT: "9010"
+      MODEL_GATEWAY_INTERNAL_TOKEN: ${MODEL_GATEWAY_INTERNAL_TOKEN:-model_gateway_dev_only_change_me_000000}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: https://api.openai.com/v1
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-sol}
+      OPENAI_GENERATION_TIMEOUT_MS: "40000"
+      OPENAI_REVIEW_TIMEOUT_MS: "25000"
+      OPENAI_RUBRIC_TIMEOUT_MS: "9000"
+      MODEL_GATEWAY_MAX_CONCURRENCY: "2"
+      RUBRIC_CATALOG_JSON: '{"incident-analysis-v1":{"policyVersion":"incident-analysis-2026.07","passThreshold":0.7,"criteria":[{"id":"evidence","description":"Uses concrete evidence from the isolated exercise data.","weight":0.6},{"id":"mitigation","description":"Explains a proportionate detection or mitigation action.","weight":0.4}]}}'
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:9010/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - application
+      - edge
+
+  web:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      CODEGATE_WEB_API_URL: ${CODEGATE_WEB_API_URL:-http://localhost:8080}
+      CODEGATE_WEB_KEYCLOAK_URL: ${CODEGATE_WEB_KEYCLOAK_URL:-http://localhost:8081}
+      CODEGATE_WEB_KEYCLOAK_REALM: codegate
+      CODEGATE_WEB_KEYCLOAK_CLIENT_ID: codegate-web
+      CODEGATE_WEB_DEVELOPMENT_IDENTITY: "true"
+      CODEGATE_WEB_DEV_USER_ID: user_dev
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks:
+      - edge
+      - application
+
+volumes:
+  postgres_data:
+  redis_data:
+  elasticsearch_data:
+  api_data:
+
+networks:
+  edge:
+    driver: bridge
+  application:
+    driver: bridge
+    internal: true
+  data:
+    driver: bridge
+    internal: true

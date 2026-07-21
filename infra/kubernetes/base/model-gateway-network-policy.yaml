@@ -1,0 +1,65 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: model-gateway-from-ai
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: model-gateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: codegate-ai
+      ports:
+        - protocol: TCP
+          port: 9010
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ai-to-model-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: codegate-ai
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: model-gateway
+      ports:
+        - protocol: TCP
+          port: 9010
+---
+# RKE2 is pinned to Cilium. Standard NetworkPolicy cannot safely allow a DNS
+# name without opening all HTTPS egress, so the model gateway receives one
+# exact FQDN rule and no IP-wide provider rule.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: model-gateway-openai-egress
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: model-gateway
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              - matchName: api.openai.com
+    - toFQDNs:
+        - matchName: api.openai.com
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP

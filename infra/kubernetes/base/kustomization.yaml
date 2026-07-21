@@ -1,0 +1,28 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: codegate-platform
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - application-external-secrets.yaml
+  - registry-external-secrets.yaml
+  - model-gateway-external-secret.yaml
+  - serviceaccounts.yaml
+  - api.yaml
+  - builder.yaml
+  - builder-workload-admission-policy.yaml
+  - ai.yaml
+  - ai-egress-policy.yaml
+  - model-gateway.yaml
+  - model-gateway-network-policy.yaml
+  - grader.yaml
+  - validator.yaml
+  - telemetry.yaml
+  - web.yaml
+  - ingress.yaml
+  - network-policies.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: codegate-range
+    includeSelectors: false
+    includeTemplates: true

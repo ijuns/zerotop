@@ -1,0 +1,17 @@
+---
+# Copy to vars/vault.yml, replace every value, then encrypt it:
+#   ansible-vault encrypt vars/vault.yml
+# This example is not loaded automatically and contains no usable credential.
+rke2_token: REQUIRED_RANDOM_RKE2_TOKEN
+keepalived_auth_pass: REQUIRED_8_CHAR_SECRET
+etcd_s3_access_key: REQUIRED_S3_ACCESS_KEY
+etcd_s3_secret_key: REQUIRED_S3_SECRET_KEY
+
+# Use a robot identity with pull-only access. Builder push/Cosign credentials
+# are separate Kubernetes secrets managed through External Secrets.
+private_registry_pull_username: REQUIRED_PRIVATE_REGISTRY_PULL_USERNAME
+private_registry_pull_password: REQUIRED_PRIVATE_REGISTRY_PULL_PASSWORD
+private_registry_ca_pem: |
+  -----BEGIN CERTIFICATE-----
+  REQUIRED_PRIVATE_REGISTRY_CA_PEM
+  -----END CERTIFICATE-----

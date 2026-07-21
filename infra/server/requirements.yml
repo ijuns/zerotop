@@ -1,0 +1,6 @@
+---
+# The bootstrap intentionally uses ansible-core built-ins only. Keep this file
+# so CI can run `ansible-galaxy install -r requirements.yml` consistently.
+roles: []
+collections: []
+

@@ -1,0 +1,82 @@
+---
+- name: Validate and prepare every RKE2 node
+  hosts: rke2_cluster
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - preflight
+    - os_hardening
+    - kvm_preflight
+    - storage_preflight
+
+- name: Configure the HA registration and API endpoint
+  hosts: rke2_servers
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - ha_endpoint
+
+- name: Bootstrap RKE2 server nodes serially
+  hosts: rke2_servers
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  serial: 1
+  roles:
+    - role: rke2_common
+      vars:
+        rke2_node_type: server
+    - rke2_server
+
+- name: Join optional RKE2 agent nodes serially
+  hosts: rke2_agents
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  serial: 1
+  roles:
+    - role: rke2_common
+      vars:
+        rke2_node_type: agent
+    - rke2_agent
+
+- name: Install storage and platform operators from the first server
+  hosts: rke2_servers
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Install RKE2-managed platform add-ons once
+      ansible.builtin.include_role:
+        name: platform_addons
+      run_once: true
+      when: not ansible_check_mode
+
+    - name: Install KubeVirt and CDI once
+      ansible.builtin.include_role:
+        name: kubevirt
+      run_once: true
+      when: not ansible_check_mode
+
+- name: Verify nodes after a mutating deployment run
+  hosts: rke2_cluster
+  become: true
+  gather_facts: true
+  any_errors_fatal: true
+  roles:
+    - role: validation_node
+      when: not ansible_check_mode
+
+- name: Verify cluster services after a mutating deployment run
+  hosts: rke2_servers
+  become: true
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Run cluster validation on one server
+      ansible.builtin.include_role:
+        name: validation_cluster
+      run_once: true
+      when: not ansible_check_mode

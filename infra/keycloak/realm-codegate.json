@@ -1,0 +1,92 @@
+{
+  "realm": "codegate",
+  "displayName": "ZeroTOP (LOCAL DEVELOPMENT ONLY)",
+  "enabled": true,
+  "registrationAllowed": true,
+  "registrationEmailAsUsername": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "rememberMe": true,
+  "verifyEmail": false,
+  "sslRequired": "external",
+  "roles": {
+    "realm": [
+      { "name": "individual", "description": "Independent learner without organization membership" },
+      { "name": "org_member", "description": "Organization learner" },
+      { "name": "org_admin", "description": "Organization administrator" },
+      { "name": "platform_admin", "description": "Platform administrator" }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "codegate-web",
+      "name": "ZeroTOP web local client",
+      "enabled": true,
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "protocol": "openid-connect",
+      "redirectUris": ["http://localhost:3000/*"],
+      "webOrigins": ["http://localhost:3000"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:3000/*"
+      }
+    },
+    {
+      "clientId": "codegate-api",
+      "name": "ZeroTOP API local service client",
+      "enabled": true,
+      "publicClient": false,
+      "bearerOnly": false,
+      "serviceAccountsEnabled": true,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "protocol": "openid-connect",
+      "secret": "api_client_dev_only_change_me"
+    }
+  ],
+  "users": [
+    {
+      "username": "individual",
+      "email": "individual@local.codegate.test",
+      "firstName": "Dev",
+      "lastName": "Individual",
+      "enabled": true,
+      "emailVerified": true,
+      "realmRoles": ["individual"],
+      "credentials": [{ "type": "password", "value": "Individual123!", "temporary": false }]
+    },
+    {
+      "username": "org-member",
+      "email": "member@local.codegate.test",
+      "firstName": "Dev",
+      "lastName": "Member",
+      "enabled": true,
+      "emailVerified": true,
+      "realmRoles": ["org_member"],
+      "credentials": [{ "type": "password", "value": "Member123!", "temporary": false }]
+    },
+    {
+      "username": "org-admin",
+      "email": "orgadmin@local.codegate.test",
+      "firstName": "Dev",
+      "lastName": "OrgAdmin",
+      "enabled": true,
+      "emailVerified": true,
+      "realmRoles": ["org_admin"],
+      "credentials": [{ "type": "password", "value": "OrgAdmin123!", "temporary": false }]
+    },
+    {
+      "username": "platform-admin",
+      "email": "admin@local.codegate.test",
+      "firstName": "Dev",
+      "lastName": "PlatformAdmin",
+      "enabled": true,
+      "emailVerified": true,
+      "realmRoles": ["platform_admin"],
+      "credentials": [{ "type": "password", "value": "PlatformAdmin123!", "temporary": false }]
+    }
+  ]
+}
