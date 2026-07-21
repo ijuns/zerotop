@@ -103,7 +103,7 @@ def assert_application_external_secrets() -> None:
     gateway_entries = {entry["secretKey"]: entry["remoteRef"] for entry in gateway_secret["spec"]["data"]}
     assert gateway_entries == {
         "MODEL_GATEWAY_INTERNAL_TOKEN": {"key": "codegate/production/internal/model-gateway", "property": "token"},
-        "OPENAI_API_KEY": {"key": "codegate/production/model-gateway/openai", "property": "api-key"},
+        "ANTHROPIC_API_KEY": {"key": "codegate/production/model-gateway/anthropic", "property": "api-key"},
     }
 
     runtime_expected = {
@@ -296,10 +296,26 @@ def assert_ai_egress_contract() -> None:
 
     gateway_egress = next(item for item in gateway_network_docs if item.get("kind") == "CiliumNetworkPolicy")
     gateway_fqdn_rule = next(rule for rule in gateway_egress["spec"]["egress"] if "toFQDNs" in rule)
-    assert gateway_fqdn_rule["toFQDNs"] == [{"matchName": "api.openai.com"}]
+    assert gateway_fqdn_rule["toFQDNs"] == [{"matchName": "api.anthropic.com"}]
     assert gateway_fqdn_rule["toPorts"] == [{"ports": [{"port": "443", "protocol": "TCP"}]}]
-    openai_url = urlparse(config["OPENAI_BASE_URL"])
-    assert (openai_url.scheme, openai_url.hostname, openai_url.path) == ("https", "api.openai.com", "/v1")
+    gateway_dns_rule = next(rule for rule in gateway_egress["spec"]["egress"] if "toEndpoints" in rule)
+    assert gateway_dns_rule["toPorts"][0]["rules"]["dns"] == [{"matchName": "api.anthropic.com"}]
+
+    assert config["MODEL_PROVIDER"] == "anthropic"
+    provider_config_keys = {
+        key for key in config
+        if key == "MODEL_PROVIDER" or key.startswith(("OPENAI_", "ANTHROPIC_"))
+    }
+    assert provider_config_keys == {
+        "MODEL_PROVIDER",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_VERSION",
+    }
+    anthropic_url = urlparse(config["ANTHROPIC_BASE_URL"])
+    assert (anthropic_url.scheme, anthropic_url.hostname, anthropic_url.path) == ("https", "api.anthropic.com", "/v1")
+    assert config["ANTHROPIC_MODEL"]
+    assert config["ANTHROPIC_VERSION"] == "2023-06-01"
 
     gateway = resource("infra/kubernetes/base/model-gateway.yaml", "Deployment", "model-gateway")
     pod = gateway["spec"]["template"]["spec"]
@@ -312,7 +328,7 @@ def assert_ai_egress_contract() -> None:
     }
     assert secret_refs == {
         "MODEL_GATEWAY_INTERNAL_TOKEN": {"name": "codegate-model-gateway-secrets", "key": "MODEL_GATEWAY_INTERNAL_TOKEN"},
-        "OPENAI_API_KEY": {"name": "codegate-model-gateway-secrets", "key": "OPENAI_API_KEY"},
+        "ANTHROPIC_API_KEY": {"name": "codegate-model-gateway-secrets", "key": "ANTHROPIC_API_KEY"},
     }
     assert container["securityContext"]["readOnlyRootFilesystem"] is True
 

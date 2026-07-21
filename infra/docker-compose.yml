@@ -305,10 +305,7 @@ services:
     environment:
       - PORT=9010
       - MODEL_GATEWAY_INTERNAL_TOKEN=${MODEL_GATEWAY_INTERNAL_TOKEN:-model_gateway_dev_only_change_me_000000}
-      - MODEL_PROVIDER=${MODEL_PROVIDER:-openai}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OPENAI_BASE_URL=https://api.openai.com/v1
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-5.6-sol}
+      - MODEL_PROVIDER=anthropic
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - ANTHROPIC_BASE_URL=https://api.anthropic.com/v1
       - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}

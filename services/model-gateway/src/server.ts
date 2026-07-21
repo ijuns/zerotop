@@ -4,7 +4,6 @@ import { fileURLToPath } from "node:url";
 
 import { loadConfig, type GatewayConfig } from "./config.ts";
 import { AnthropicMessagesClient } from "./anthropic.ts";
-import { OpenAiResponsesClient } from "./openai.ts";
 import { GatewayError, ModelGatewayService, type ModelClient } from "./service.ts";
 
 const MAX_REQUEST_BYTES = 1_000_000;
@@ -125,13 +124,11 @@ async function main(): Promise<void> {
 }
 
 function providerClient(config: GatewayConfig): ModelClient {
-  return config.provider === "anthropic"
-    ? new AnthropicMessagesClient(config)
-    : new OpenAiResponsesClient(config);
+  return new AnthropicMessagesClient(config);
 }
 
-function providerLabel(config: GatewayConfig): "openai-responses" | "anthropic-messages" {
-  return config.provider === "anthropic" ? "anthropic-messages" : "openai-responses";
+function providerLabel(_config: GatewayConfig): "anthropic-messages" {
+  return "anthropic-messages";
 }
 
 if (fileURLToPath(import.meta.url) === process.argv[1]) {

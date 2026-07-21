@@ -42,18 +42,11 @@ spec:
                 secretKeyRef:
                   name: codegate-model-gateway-secrets
                   key: MODEL_GATEWAY_INTERNAL_TOKEN
-            - name: OPENAI_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: codegate-model-gateway-secrets
-                  key: OPENAI_API_KEY
-                  optional: true
             - name: ANTHROPIC_API_KEY
               valueFrom:
                 secretKeyRef:
                   name: codegate-model-gateway-secrets
                   key: ANTHROPIC_API_KEY
-                  optional: true
           envFrom:
             - configMapRef:
                 name: codegate-platform-config

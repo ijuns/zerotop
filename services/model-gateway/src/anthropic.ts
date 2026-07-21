@@ -9,7 +9,7 @@ import Anthropic, {
 } from "@anthropic-ai/sdk";
 
 import type { GatewayConfig } from "./config.ts";
-import { ModelProviderError, type StructuredRequest, type StructuredResponse } from "./openai.ts";
+import { ModelProviderError, type StructuredRequest, type StructuredResponse } from "./provider.ts";
 import { longRunningProviderFetch } from "./provider-fetch.ts";
 
 // Anthropic Structured Outputs accepts the structural JSON Schema keywords but

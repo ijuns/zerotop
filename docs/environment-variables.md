@@ -107,11 +107,8 @@ Kubernetes의 `codegate-ai-secrets`에는 `AI_INTERNAL_TOKEN`, `GENERATION_PROVI
 |---|---|
 | `PORT` | 내부 HTTP port, 기본 `9010` |
 | `MODEL_GATEWAY_INTERNAL_TOKEN` | AI가 세 provider endpoint에 공통으로 사용하는 32자 이상 peer token |
-| `MODEL_PROVIDER` | `openai` 또는 `anthropic`, 기본 `openai` |
-| `OPENAI_API_KEY` | `MODEL_PROVIDER=openai`일 때 gateway에만 주입하는 OpenAI project API key |
-| `OPENAI_BASE_URL` | 고정 `https://api.openai.com/v1`; 다른 origin은 시작 단계에서 거부 |
-| `OPENAI_MODEL` | Structured Outputs 호환 비 fine-tuned 모델의 명시적 ID, Compose 기본값 `gpt-5.6-sol` |
-| `ANTHROPIC_API_KEY` | `MODEL_PROVIDER=anthropic`일 때 gateway에만 주입하는 Anthropic API key |
+| `MODEL_PROVIDER` | 미설정 또는 `anthropic`; 다른 값은 시작 단계에서 거부 |
+| `ANTHROPIC_API_KEY` | gateway에만 주입하는 Anthropic API key |
 | `ANTHROPIC_BASE_URL` | 고정 `https://api.anthropic.com/v1`; 다른 origin은 시작 단계에서 거부 |
 | `ANTHROPIC_MODEL` | Structured Outputs 호환 Claude 모델의 명시적 ID |
 | `ANTHROPIC_VERSION` | Messages API version header, 기본 `2023-06-01` |
@@ -123,7 +120,7 @@ Kubernetes의 `codegate-ai-secrets`에는 `AI_INTERNAL_TOKEN`, `GENERATION_PROVI
 | `MODEL_GATEWAY_MAX_CONCURRENCY` | body 수신부터 모델 완료까지 포함하는 동시 요청 상한, 기본 `8` |
 | `RUBRIC_CATALOG_JSON` | 서버 소유 rubric ID, policy version, threshold, 가중치 합이 1인 criteria catalog |
 
-OpenAI adapter는 공식 Responses API의 `text.format.type=json_schema`, `strict=true`, `store=false`를 사용하고, Anthropic adapter는 공식 Messages API의 `output_config.format.type=json_schema`를 사용합니다. 두 adapter 모두 tool을 제공하지 않으며 생성 결과를 곧바로 신뢰하지 않고 요청 범위와 승인 catalog를 대조해 LabSpec을 서버에서 재조립합니다. 공개 문제에서는 정답을 제거하고 hidden grading contract만 내부에 유지합니다. refusal, incomplete, 과대 응답, schema 불일치와 rubric catalog 밖 ID는 모두 fail-closed 됩니다. 기존 `OPENAI_*_TIMEOUT_MS` 및 `ANTHROPIC_*_TIMEOUT_MS`도 호환 alias로 읽지만 새 배포에는 provider-neutral timeout 이름을 사용합니다.
+Anthropic adapter는 공식 SDK로 Messages API의 `output_config.format.type=json_schema`를 사용합니다. tool을 제공하지 않으며 생성 결과를 곧바로 신뢰하지 않고 요청 범위와 승인 catalog를 대조해 LabSpec을 서버에서 재조립합니다. 공개 문제에서는 정답을 제거하고 hidden grading contract만 내부에 유지합니다. refusal, incomplete, 과대 응답, schema 불일치와 rubric catalog 밖 ID는 모두 fail-closed 됩니다. 기존 `ANTHROPIC_*_TIMEOUT_MS`는 호환 alias로만 읽고 새 배포에는 provider-neutral timeout 이름을 사용합니다.
 
 Claude 로컬 generation 제한은 바깥 호출부터 `API 1260000ms(21분) > AI service 1230초(20분 30초) > model gateway 1200000ms(20분)` 순서입니다. 안쪽 계층의 실패 응답과 진단 정보가 바깥 계층에 전달될 30초씩의 여유를 확보하기 위한 구성입니다. review와 rubric 제한은 기존 값을 유지합니다.
 

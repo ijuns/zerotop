@@ -22,10 +22,10 @@
 - PostgreSQL은 플랫폼 API, 빌더와 OpenVPN issuer가 접근할 수 있도록 TLS와 서비스별 최소 권한 계정을 구성합니다.
 - Keycloak에는 운영 realm, public web client와 API audience를 구성하고 운영 redirect URI만 허용합니다.
 - Elasticsearch/Kibana에는 실행별 인덱스 lifecycle, TLS trust와 telemetry/grader/runtime별로 분리한 API key를 발급합니다.
-- AI 생성·검토·주관식 루브릭 요청은 네트워크로 격리된 내부 `model-gateway:9010`으로만 전달합니다. 게이트웨이는 선택한 제공자에 따라 고정된 `https://api.openai.com/v1` 또는 `https://api.anthropic.com/v1` origin만 호출하며 선택한 API key와 AI↔gateway 내부 token은 비밀 관리 시스템에 저장합니다.
+- AI 생성·검토·주관식 루브릭 요청은 네트워크로 격리된 내부 `model-gateway:9010`으로만 전달합니다. 게이트웨이는 고정된 `https://api.anthropic.com/v1` origin만 호출하며 Anthropic API key와 AI↔gateway 내부 token은 비밀 관리 시스템에 저장합니다.
 - AI 서비스의 단일 `AI_TARGET_BASE_IMAGE`와 `AI_OUTPUT_REPOSITORY`는 builder 허용 목록과 동일한 운영 catalog를 가리키도록 설정합니다. learner의 Ubuntu/Kali desktop image는 이 target base와 별도입니다. `PACKAGE_CATALOG_JSON`과 `ARTIFACT_CATALOG_JSON`도 AI와 builder에 같은 값으로 주입합니다. 외부 모델은 logical `{name, version}`만 선택하며 서버가 digest/path를 resolve합니다. 모델이 좌표를 바꾸거나 catalog 밖 component/artifact를 선택한 응답은 거부됩니다.
 - CVE 지정 생성은 AI가 NVD 원문을 고정 endpoint에서 조회·정규화한 `cveIntel`을 provider에 전달한 뒤 수행합니다. NVD 조회가 실패하거나 응답 ID가 요청과 다르거나 승인 component/artifact를 선택하지 않으면 생성은 fail-closed 됩니다.
-- base는 AI egress를 기본 차단합니다. AI Pod은 Cilium FQDN 정책으로 `services.nvd.nist.gov:443`만 직접 호출하고, 생성·검토·루브릭은 NetworkPolicy가 허용한 내부 model gateway로만 보냅니다. 기본 게이트웨이는 `api.openai.com:443`만 호출하며 Anthropic overlay는 이를 `api.anthropic.com:443`으로 교체합니다. 두 제공자를 동시에 열거나 일반 `0.0.0.0/0`을 허용하지 않습니다.
+- base는 AI egress를 기본 차단합니다. AI Pod은 Cilium FQDN 정책으로 `services.nvd.nist.gov:443`만 직접 호출하고, 생성·검토·루브릭은 NetworkPolicy가 허용한 내부 model gateway로만 보냅니다. 게이트웨이는 `api.anthropic.com:443`만 호출하며 일반 `0.0.0.0/0` 또는 다른 모델 제공자 주소를 허용하지 않습니다.
 - Redis를 사용하는 확장 기능은 TLS/인증 endpoint를 사용하되 플랫폼 정합성의 source of truth는 PostgreSQL로 유지합니다.
 
 ### 이미지 공급망
@@ -41,7 +41,7 @@
 - External Secrets Operator 또는 동등한 secret manager 연동을 구성하고 source control에는 평문 Kubernetes Secret을 저장하지 않습니다.
 - peer 서비스가 공유하는 내부 token은 동일한 값을 받되 runtime, builder, grader, telemetry, validator, desktop, VPN 관계마다 서로 다른 token을 사용합니다.
 - `codegate-api-secrets`와 `codegate-builder-secrets`에는 동일한 `BUILDER_INTERNAL_TOKEN`을 주입하고, builder 전용 Secret에는 `DATABASE_URL`도 포함합니다.
-- `codegate-ai-secrets`에는 `AI_INTERNAL_TOKEN`과 내부 gateway의 동일한 bearer 값을 갖는 `GENERATION_PROVIDER_TOKEN`, `REVIEW_PROVIDER_TOKEN`, `RUBRIC_PROVIDER_TOKEN`, 사용하는 경우 `NVD_API_KEY`를 주입합니다. `codegate-model-gateway-secrets`에는 그 canonical `MODEL_GATEWAY_INTERNAL_TOKEN`과 선택한 `OPENAI_API_KEY` 또는 `ANTHROPIC_API_KEY` 하나만 주입합니다. 내부 provider URL, 세 AI mode의 `external` 값과 build catalog 좌표는 비밀이 아닌 ConfigMap으로 분리합니다.
+- `codegate-ai-secrets`에는 `AI_INTERNAL_TOKEN`과 내부 gateway의 동일한 bearer 값을 갖는 `GENERATION_PROVIDER_TOKEN`, `REVIEW_PROVIDER_TOKEN`, `RUBRIC_PROVIDER_TOKEN`, 사용하는 경우 `NVD_API_KEY`를 주입합니다. `codegate-model-gateway-secrets`에는 그 canonical `MODEL_GATEWAY_INTERNAL_TOKEN`과 `ANTHROPIC_API_KEY`만 주입합니다. 내부 provider URL, 세 AI mode의 `external` 값과 build catalog 좌표는 비밀이 아닌 ConfigMap으로 분리합니다.
 - registry 인증은 일반 환경 변수 Secret과 섞지 않습니다. 검토된 `kubernetes.io/dockerconfigjson` source Secret을 builder system namespace에 두고 build namespace에는 필요한 수명 동안만 `BUILD_REGISTRY_TARGET_SECRET` 이름으로 복제합니다.
 - 조직별 데이터 보존 기간, 최대 동시 실행, VM resource quota, Lab 최대 수명, 허용 CVE와 예상 취약점 정책을 확정합니다.
 - CNI NetworkPolicy, Pod Security, admission policy와 audit 수집을 운영 정책에 연결합니다.
@@ -83,7 +83,7 @@ PostgreSQL migration을 적용하고 API가 `REPOSITORY_MODE=postgres`로 시작
 - `ghcr.io/replace-me`, `replace-with-digest`, zero digest를 실제 서명 digest로 교체
 - 모든 `example.invalid` hostname과 TLS Secret 이름 교체
 - ExternalSecret, SecretStore와 CA mount 연결
-- 실제 Service/Pod CIDR, Kubernetes API `/32`, registry·Elasticsearch egress 목적지 지정. AI→내부 gateway와 AI→NVD, gateway→선택한 OpenAI 또는 Anthropic API 외에는 egress를 열지 않음
+- 실제 Service/Pod CIDR, Kubernetes API `/32`, registry·Elasticsearch egress 목적지 지정. AI→내부 gateway와 AI→NVD, gateway→Anthropic API 외에는 egress를 열지 않음
 - builder registry pull/push Secret과 catalog JSON 연결
 - ingress controller label, Gateway/Ingress class와 WebSocket timeout 검증
 - OpenVPN TUN device resource, wildcard DNS와 UDP LoadBalancer 연결

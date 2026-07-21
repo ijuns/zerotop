@@ -13,7 +13,7 @@ AI가 최신 CVE와 훈련 목표를 바탕으로 강의 자료, 취약 환경, 
 - 블루팀 Lab: 브라우저 분석 데스크톱, 실행 전용 ELK/Kibana, 분리된 피해 시스템과 Elastic Agent, 시나리오 행위·로그 생성, 증거 선택과 MITRE ATT&CK 매핑
 - 레드팀 Lab: 브라우저 Kali 또는 OpenVPN 진입점과 별도로 격리된 취약 대상, 단일 선택·복수 선택·주관식·MITRE ATT&CK 문제
 - AI Lab Builder: NVD로 확인한 CVE 정보와 운영자 승인 component catalog를 기반으로 학습 본문, 문제·채점 계약, 팀별 선언형 topology, 텔레메트리와 시나리오 행위 계획, 이미지 빌드 명세 생성
-- 운영 AI gateway: 동일한 JSON Schema 계약으로 OpenAI Responses API 또는 Anthropic Claude Messages API 선택 연결
+- 운영 AI gateway: Anthropic 공식 SDK와 Claude Messages API의 JSON Schema 응답을 엄격한 Lab 계약으로 검증
 - 환경 빌더: 허용 목록으로 제한한 명세를 rootless BuildKit 작업으로 빌드하고 이미지 digest와 provenance 기록
 - 자동 검증: 서명, SBOM, 취약점 스캔, 기능·의도된 취약점 probe, 네트워크 격리, 블루팀 ELK 검색을 모두 통과해야 승인
 - 실습 런타임: 실행별 namespace, Blue 분석 desktop·ELK·피해 환경 또는 Red Kali·취약 target을 분리 배치하고 브라우저 데스크톱과 실행별 OpenVPN 중 하나의 접속 방식만 활성화

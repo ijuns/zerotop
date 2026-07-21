@@ -1,20 +1,19 @@
 # Model gateway
 
-This service is the only application component allowed to call an external model API. Select `openai` or `anthropic` with `MODEL_PROVIDER`. Both adapters reuse the same strict JSON Schema contracts for Lab generation, independent review, and free-text rubric grading. The gateway reconstructs the trusted LabSpec from operator-owned catalogs instead of accepting a model-authored build specification.
+This service is the only application component allowed to call an external model API. It uses Anthropic Claude exclusively; `MODEL_PROVIDER` may be omitted or set to `anthropic`, and every other value is rejected. The gateway reuses the same strict JSON Schema contracts for Lab generation, independent review, and free-text rubric grading, and reconstructs the trusted LabSpec from operator-owned catalogs instead of accepting a model-authored build specification.
 
-The OpenAI adapter uses the Responses API with strict JSON Schema output, response storage disabled, and no tools. The Anthropic adapter uses the official `@anthropic-ai/sdk` Messages API client with `output_config.format.type=json_schema`, no tools or metadata, and accepts only one completed assistant text block. Provider refusals, truncated responses, malformed JSON, oversized bodies, and contract violations fail closed.
+The gateway uses the official `@anthropic-ai/sdk` Messages API client with `output_config.format.type=json_schema`, no tools or metadata, and accepts only one completed assistant text block. Provider refusals, truncated responses, malformed JSON, oversized bodies, and contract violations fail closed.
 
 ## Privacy boundary
 
-Do not send a user ID, email address, OIDC subject, organization ID, or any other direct identifier to the provider. The gateway intentionally omits OpenAI `safety_identifier` and Anthropic `metadata`. A future abuse-correlation feature may add an opaque HMAC-derived identifier only after its end-to-end trust boundary and key rotation are implemented.
+Do not send a user ID, email address, OIDC subject, organization ID, or any other direct identifier to the provider. The gateway intentionally omits Anthropic `metadata`. A future abuse-correlation feature may add an opaque HMAC-derived identifier only after its end-to-end trust boundary and key rotation are implemented.
 
 ## Required secrets
 
 - `MODEL_GATEWAY_INTERNAL_TOKEN`: shared only with the AI service.
-- OpenAI: `MODEL_PROVIDER=openai`, `OPENAI_API_KEY`, and `OPENAI_MODEL`.
-- Claude: `MODEL_PROVIDER=anthropic`, `ANTHROPIC_API_KEY`, and `ANTHROPIC_MODEL`.
+- Claude: `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`. `MODEL_PROVIDER=anthropic` is optional.
 
-The selected key is neither logged nor included in model input. Official origins are fixed to `https://api.openai.com/v1` and `https://api.anthropic.com/v1`; redirects and custom origins are rejected. Claude uses `ANTHROPIC_VERSION=2023-06-01` by default. Provider-neutral timeout variables are `MODEL_GATEWAY_GENERATION_TIMEOUT_MS`, `MODEL_GATEWAY_REVIEW_TIMEOUT_MS`, and `MODEL_GATEWAY_RUBRIC_TIMEOUT_MS`; the legacy provider-prefixed timeout names remain accepted. `MODEL_GATEWAY_GENERATION_MAX_ATTEMPTS` defaults to `1` and accepts only `1` or `2`.
+The key is neither logged nor included in model input. The official origin is fixed to `https://api.anthropic.com/v1`; redirects and custom origins are rejected. Claude uses `ANTHROPIC_VERSION=2023-06-01` by default. Provider-neutral timeout variables are `MODEL_GATEWAY_GENERATION_TIMEOUT_MS`, `MODEL_GATEWAY_REVIEW_TIMEOUT_MS`, and `MODEL_GATEWAY_RUBRIC_TIMEOUT_MS`; the legacy `ANTHROPIC_*_TIMEOUT_MS` names remain accepted. `MODEL_GATEWAY_GENERATION_MAX_ATTEMPTS` defaults to `1` and accepts only `1` or `2`.
 
 ## Local raw-response diagnosis
 

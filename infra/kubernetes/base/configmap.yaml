@@ -16,9 +16,7 @@ data:
   REVIEW_PROVIDER_URL: http://model-gateway:9010/v1/review
   AI_RUBRIC_MODE: external
   RUBRIC_PROVIDER_URL: http://model-gateway:9010/v1/rubric
-  MODEL_PROVIDER: openai
-  OPENAI_BASE_URL: https://api.openai.com/v1
-  OPENAI_MODEL: gpt-5.6-sol
+  MODEL_PROVIDER: anthropic
   ANTHROPIC_BASE_URL: https://api.anthropic.com/v1
   ANTHROPIC_MODEL: replace-with-structured-outputs-compatible-claude-model
   ANTHROPIC_VERSION: "2023-06-01"

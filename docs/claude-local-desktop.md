@@ -10,7 +10,7 @@
 
 - `ANTHROPIC_API_KEY`는 `model-gateway` 컨테이너에만 전달합니다.
 - Platform API에는 `AI_INTERNAL_TOKEN`만 전달합니다.
-- API 프로세스를 만들 때 Anthropic/OpenAI key와 model-gateway token을 환경에서 제거하여 불필요하게 상속하지 않게 합니다.
+- API 프로세스를 만들 때 Anthropic key와 model-gateway token을 환경에서 제거하여 불필요하게 상속하지 않게 합니다.
 - 설정값과 API key는 콘솔이나 로그에 출력하지 않습니다.
 - Compose 컨테이너 환경은 로컬 관리자에게 보일 수 있으므로 이 방식은 로컬 개발 전용입니다. 운영에서는 Kubernetes Secret 또는 별도 secret manager를 사용합니다.
 

@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 
 import type { GatewayConfig, RubricDefinition } from "./config.ts";
-import { ModelProviderError, type StructuredRequest, type StructuredResponse } from "./openai.ts";
+import { ModelProviderError, type StructuredRequest, type StructuredResponse } from "./provider.ts";
 import { generationPlanSchema, reviewSchema, rubricSchema } from "./schemas.ts";
 
 export interface ModelClient {
@@ -676,7 +676,7 @@ function mandatoryEvidencePassed(evidence: Record<string, unknown>): boolean {
 }
 
 function traceId(kind: string, responseId: string, input: unknown): string {
-  return `openai-${kind}:${responseId}:${createHash("sha256").update(JSON.stringify(input)).digest("hex").slice(0, 24)}`;
+  return `anthropic-${kind}:${responseId}:${createHash("sha256").update(JSON.stringify(input)).digest("hex").slice(0, 24)}`;
 }
 
 function digest(value: string): string {

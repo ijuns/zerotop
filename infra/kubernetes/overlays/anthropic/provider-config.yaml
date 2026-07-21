@@ -1,9 +1,0 @@
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: codegate-platform-config
-data:
-  MODEL_PROVIDER: anthropic
-  ANTHROPIC_BASE_URL: https://api.anthropic.com/v1
-  ANTHROPIC_MODEL: replace-with-structured-outputs-compatible-claude-model
-  ANTHROPIC_VERSION: "2023-06-01"

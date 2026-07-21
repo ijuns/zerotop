@@ -5,12 +5,11 @@ import { test } from "node:test";
 
 import { AnthropicMessagesClient, GENERATION_RAW_RESPONSE_CAPTURE_PATH, anthropicOutputSchema, writeGenerationRawResponseCapture } from "../src/anthropic.ts";
 import { loadConfig, type GatewayConfig } from "../src/config.ts";
-import { OpenAiResponsesClient, ModelProviderError, type StructuredRequest, type StructuredResponse } from "../src/openai.ts";
+import { ModelProviderError, type StructuredRequest, type StructuredResponse } from "../src/provider.ts";
 import { createModelGatewayServer } from "../src/server.ts";
 import { GatewayError, ModelGatewayService, type ModelClient } from "../src/service.ts";
 
 const TOKEN = "gateway-internal-token-000000000000000000";
-const KEY = "sk-test-000000000000000000000000000000000";
 const ANTHROPIC_KEY = "sk-ant-test-000000000000000000000000000000000";
 const BASE_IMAGE = `registry.example.test/codegate/http-base@sha256:${"a".repeat(64)}`;
 const RUBRICS = {
@@ -27,16 +26,6 @@ const RUBRICS = {
 function config(): GatewayConfig {
   return loadConfig({
     MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN,
-    OPENAI_API_KEY: KEY,
-    OPENAI_MODEL: "gpt-5.6-sol",
-    RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS),
-  });
-}
-
-function anthropicConfig(): GatewayConfig {
-  return loadConfig({
-    MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN,
-    MODEL_PROVIDER: "anthropic",
     ANTHROPIC_API_KEY: ANTHROPIC_KEY,
     ANTHROPIC_MODEL: "claude-sonnet-4-5-20250929",
     ANTHROPIC_VERSION: "2023-06-01",
@@ -176,13 +165,12 @@ class QueueClient implements ModelClient {
 
 test("configuration fails closed and rejects unsupported upstream/model modes", () => {
   assert.throws(() => loadConfig({}), /MODEL_GATEWAY_INTERNAL_TOKEN/);
-  assert.throws(() => loadConfig({ MODEL_GATEWAY_INTERNAL_TOKEN: " ".repeat(32), OPENAI_API_KEY: KEY, OPENAI_MODEL: "gpt-5.6-sol", RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS) }), /non-whitespace/);
-  assert.throws(() => loadConfig({ MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN, OPENAI_API_KEY: KEY, OPENAI_MODEL: "ft:gpt-4o:org:model", RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS) }), /non-fine-tuned/);
-  assert.throws(() => loadConfig({ MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN, OPENAI_API_KEY: KEY, OPENAI_MODEL: "gpt-5.6-sol", OPENAI_BASE_URL: "https://attacker.invalid/v1", RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS) }), /official OpenAI/);
-  assert.throws(() => loadConfig({ MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN, MODEL_PROVIDER: "other", RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS) }), /openai or anthropic/);
+  assert.throws(() => loadConfig({ MODEL_GATEWAY_INTERNAL_TOKEN: " ".repeat(32), ANTHROPIC_API_KEY: ANTHROPIC_KEY, ANTHROPIC_MODEL: "claude-sonnet-4-5-20250929", RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS) }), /non-whitespace/);
+  assert.throws(() => loadConfig({ MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN, MODEL_PROVIDER: "openai", ANTHROPIC_API_KEY: ANTHROPIC_KEY, ANTHROPIC_MODEL: "claude-sonnet-4-5-20250929", RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS) }), /must be anthropic/);
+  assert.throws(() => loadConfig({ MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN, MODEL_PROVIDER: "other", ANTHROPIC_API_KEY: ANTHROPIC_KEY, ANTHROPIC_MODEL: "claude-sonnet-4-5-20250929", RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS) }), /must be anthropic/);
   assert.throws(() => loadConfig({ MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN, MODEL_PROVIDER: "anthropic", ANTHROPIC_API_KEY: ANTHROPIC_KEY, ANTHROPIC_MODEL: "claude-sonnet-4-5-20250929", ANTHROPIC_BASE_URL: "https://attacker.invalid/v1", RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS) }), /official Anthropic/);
   assert.throws(() => loadConfig({ MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN, MODEL_PROVIDER: "anthropic", ANTHROPIC_API_KEY: ANTHROPIC_KEY, ANTHROPIC_MODEL: "claude-sonnet-4-5-20250929", ANTHROPIC_VERSION: "latest", RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS) }), /YYYY-MM-DD/);
-  const anthropic = anthropicConfig();
+  const anthropic = config();
   assert.equal(anthropic.provider, "anthropic");
   assert.equal(anthropic.providerEndpoint, "https://api.anthropic.com/v1/messages");
   assert.equal(anthropic.anthropicVersion, "2023-06-01");
@@ -219,8 +207,8 @@ test("configuration fails closed and rejects unsupported upstream/model modes", 
   for (const value of ["0", "3", "1.5", "true"]) {
     assert.throws(() => loadConfig({
       MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN,
-      OPENAI_API_KEY: KEY,
-      OPENAI_MODEL: "gpt-5.6-sol",
+      ANTHROPIC_API_KEY: ANTHROPIC_KEY,
+      ANTHROPIC_MODEL: "claude-sonnet-4-5-20250929",
       MODEL_GATEWAY_GENERATION_MAX_ATTEMPTS: value,
       RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS),
     }), /MODEL_GATEWAY_GENERATION_MAX_ATTEMPTS/);
@@ -228,8 +216,8 @@ test("configuration fails closed and rejects unsupported upstream/model modes", 
   for (const value of ["", "true", "false", "LOCAL-EXPLICIT", "local-explicit "]) {
     assert.throws(() => loadConfig({
       MODEL_GATEWAY_INTERNAL_TOKEN: TOKEN,
-      OPENAI_API_KEY: KEY,
-      OPENAI_MODEL: "gpt-5.6-sol",
+      ANTHROPIC_API_KEY: ANTHROPIC_KEY,
+      ANTHROPIC_MODEL: "claude-sonnet-4-5-20250929",
       MODEL_GATEWAY_DEBUG_RAW_RESPONSE_CAPTURE: value,
       RUBRIC_CATALOG_JSON: JSON.stringify(RUBRICS),
     }), /MODEL_GATEWAY_DEBUG_RAW_RESPONSE_CAPTURE/);
@@ -360,34 +348,15 @@ test("review is fail-closed over mandatory evidence and rubric pass is computed 
   };
   const review = await service.review({ lab: { id: "lab-safe" }, evidence });
   assert.equal(review.passed, true);
+  assert.match(review.traceId as string, /^anthropic-review:/);
   const failed = await new ModelGatewayService(config(), new QueueClient([{ passed: true, confidence: 0.95, riskScore: 0.05 }])).review({ lab: { id: "lab-safe" }, evidence: { ...evidence, sandbox: { ...evidence.sandbox, egressBlocked: false } } });
   assert.equal(failed.passed, false);
   assert.equal(failed.riskScore, 1);
   const grade = await service.rubric({ runId: "run-1", questionId: "q-1", rubricId: "incident-analysis-v1", response: "The correlated log evidence supports detection and a scoped mitigation action." });
   assert.equal(grade.scoreRatio, 0.72);
   assert.equal(grade.passed, true);
+  assert.match(grade.traceId as string, /^anthropic-rubric:/);
   assert.equal(client.requests[1]?.timeoutMs, 9_000);
-});
-
-test("Responses client requests strict non-persistent structured output and rejects refusals", async () => {
-  let requestBody: any;
-  const fetchImpl: typeof fetch = async (_input, init) => {
-    requestBody = JSON.parse(String(init?.body));
-    return new Response(JSON.stringify({ id: "resp_12345678", status: "completed", output: [{ type: "message", status: "completed", content: [{ type: "output_text", text: JSON.stringify({ passed: true }) }] }] }), { status: 200 });
-  };
-  const client = new OpenAiResponsesClient(config(), fetchImpl);
-  const result = await client.createStructured({ schemaName: "test_schema", schema: { type: "object", properties: { passed: { type: "boolean" } }, required: ["passed"], additionalProperties: false }, instructions: "fixed", input: { data: "untrusted" }, maxOutputTokens: 100, timeoutMs: 5_000 });
-  assert.deepEqual(result.payload, { passed: true });
-  assert.equal(requestBody.text.format.type, "json_schema");
-  assert.equal(requestBody.text.format.strict, true);
-  assert.equal(requestBody.store, false);
-  assert.equal(requestBody.tools, undefined);
-
-  const refusing = new OpenAiResponsesClient(config(), async () => new Response(JSON.stringify({ id: "resp_12345678", status: "completed", output: [{ type: "message", status: "completed", content: [{ type: "refusal", refusal: "no" }] }] }), { status: 200 }));
-  await assert.rejects(refusing.createStructured({ schemaName: "test_schema", schema: {}, instructions: "fixed", input: {}, maxOutputTokens: 100, timeoutMs: 5_000 }), (error: unknown) => error instanceof ModelProviderError && error.code === "model_refused");
-
-  const ambiguous = new OpenAiResponsesClient(config(), async () => new Response(JSON.stringify({ id: "resp_12345678", status: "completed", output: [{ type: "message", status: "completed", content: [{ type: "output_text", text: "{}" }, { type: "unexpected" }] }] }), { status: 200 }));
-  await assert.rejects(ambiguous.createStructured({ schemaName: "test_schema", schema: {}, instructions: "fixed", input: {}, maxOutputTokens: 100, timeoutMs: 5_000 }), (error: unknown) => error instanceof ModelProviderError && error.code === "model_response_invalid");
 });
 
 test("Anthropic client requests JSON Schema output and parses one completed text block", async () => {
@@ -406,7 +375,7 @@ test("Anthropic client requests JSON Schema output and parses one completed text
       stop_reason: "end_turn",
     }), { status: 200 });
   };
-  const client = new AnthropicMessagesClient(anthropicConfig(), fetchImpl);
+  const client = new AnthropicMessagesClient(config(), fetchImpl);
   const request: StructuredRequest = {
     schemaName: "test_schema",
     schema: { type: "object", properties: { passed: { type: "boolean" } }, required: ["passed"], additionalProperties: false },
@@ -426,14 +395,14 @@ test("Anthropic client requests JSON Schema output and parses one completed text
   assert.equal(requestBody.tools, undefined);
   assert.equal(requestBody.metadata, undefined);
 
-  const refused = new AnthropicMessagesClient(anthropicConfig(), async () => new Response(JSON.stringify({ id: "msg_12345678", type: "message", role: "assistant", content: [{ type: "text", text: "{}" }], stop_reason: "refusal" }), { status: 200 }));
+  const refused = new AnthropicMessagesClient(config(), async () => new Response(JSON.stringify({ id: "msg_12345678", type: "message", role: "assistant", content: [{ type: "text", text: "{}" }], stop_reason: "refusal" }), { status: 200 }));
   await assert.rejects(refused.createStructured(request), (error: unknown) => error instanceof ModelProviderError && error.code === "model_refused");
 
-  const truncated = new AnthropicMessagesClient(anthropicConfig(), async () => new Response(JSON.stringify({ id: "msg_12345678", type: "message", role: "assistant", content: [{ type: "text", text: "{}" }], stop_reason: "max_tokens" }), { status: 200 }));
+  const truncated = new AnthropicMessagesClient(config(), async () => new Response(JSON.stringify({ id: "msg_12345678", type: "message", role: "assistant", content: [{ type: "text", text: "{}" }], stop_reason: "max_tokens" }), { status: 200 }));
   await assert.rejects(truncated.createStructured(request), (error: unknown) => error instanceof ModelProviderError && error.code === "model_response_incomplete");
 
   let timeoutCalls = 0;
-  const timedOut = new AnthropicMessagesClient(anthropicConfig(), async () => {
+  const timedOut = new AnthropicMessagesClient(config(), async () => {
     timeoutCalls += 1;
     throw new DOMException("timed out", "TimeoutError");
   });
@@ -449,7 +418,7 @@ test("Anthropic client requests JSON Schema output and parses one completed text
   );
   assert.equal(timeoutCalls, 1);
 
-  const rejected = new AnthropicMessagesClient(anthropicConfig(), async () => new Response(JSON.stringify({
+  const rejected = new AnthropicMessagesClient(config(), async () => new Response(JSON.stringify({
     type: "error",
     error: {
       type: "invalid_request_error",
@@ -478,7 +447,7 @@ test("Anthropic client requests JSON Schema output and parses one completed text
   );
 
   let serverErrorCalls = 0;
-  const serverError = new AnthropicMessagesClient(anthropicConfig(), async () => {
+  const serverError = new AnthropicMessagesClient(config(), async () => {
     serverErrorCalls += 1;
     return new Response(JSON.stringify({
       type: "error",
@@ -521,7 +490,7 @@ test("Anthropic client removes unsupported constraints without weakening the int
     }), { status: 200 });
   };
 
-  const client = new AnthropicMessagesClient(anthropicConfig(), fetchImpl);
+  const client = new AnthropicMessagesClient(config(), fetchImpl);
   await client.createStructured({
     schemaName: "constraint_projection",
     schema,
@@ -579,7 +548,7 @@ test("Anthropic client envelopes the complex generation plan and decodes it befo
     }), { status: 200 });
   };
 
-  const client = new AnthropicMessagesClient(anthropicConfig(), fetchImpl);
+  const client = new AnthropicMessagesClient(config(), fetchImpl);
   const result = await client.createStructured({
     schemaName: "codegate_lab_generation_plan_v1",
     schema: generationSchema,
@@ -603,7 +572,7 @@ test("Anthropic client envelopes the complex generation plan and decodes it befo
 
   const malformedBodies: any[] = [];
   const malformedSignals: AbortSignal[] = [];
-  const malformed = new AnthropicMessagesClient(anthropicConfig(), async (_input, init) => {
+  const malformed = new AnthropicMessagesClient(config(), async (_input, init) => {
     malformedBodies.push(JSON.parse(String(init?.body)));
     assert.ok(init?.signal);
     malformedSignals.push(init.signal);
@@ -668,7 +637,7 @@ test("Anthropic generation accepts only whole JSON with BOM or exact JSON/plain 
     `\`\`\`\n${JSON.stringify(expected)}\n\`\`\``,
   ]) {
     let calls = 0;
-    const client = new AnthropicMessagesClient(anthropicConfig(), async () => {
+    const client = new AnthropicMessagesClient(config(), async () => {
       calls += 1;
       return new Response(JSON.stringify({
         id: `msg_normalized_${calls}`,
@@ -689,7 +658,7 @@ test("Anthropic generation accepts only whole JSON with BOM or exact JSON/plain 
     `\u00A0${JSON.stringify(expected)}\u00A0`,
   ]) {
     let calls = 0;
-    const client = new AnthropicMessagesClient(anthropicConfig(), async () => {
+    const client = new AnthropicMessagesClient(config(), async () => {
       calls += 1;
       return new Response(JSON.stringify({
         id: `msg_strict_${calls}`,
@@ -711,7 +680,7 @@ test("Anthropic generation retries malformed JSON only when configured and prese
   const requestBodies: any[] = [];
   const requestSignals: AbortSignal[] = [];
   const expected = { scenario: { summary: "corrected" } };
-  const client = new AnthropicMessagesClient({ ...anthropicConfig(), generationMaxAttempts: 2 }, async (_input, init) => {
+  const client = new AnthropicMessagesClient({ ...config(), generationMaxAttempts: 2 }, async (_input, init) => {
     requestBodies.push(JSON.parse(String(init?.body)));
     assert.ok(init?.signal);
     requestSignals.push(init.signal);
@@ -751,7 +720,7 @@ test("Anthropic generation capture receives the exact successful response bytes 
   const captured: Buffer[] = [];
   const invalidProviderBody = Buffer.from([0x7b, 0x22, 0x62, 0x61, 0x64, 0x22, 0x3a, 0xff, 0x7d]);
   const client = new AnthropicMessagesClient(
-    { ...anthropicConfig(), captureGenerationRawResponse: true },
+    { ...config(), captureGenerationRawResponse: true },
     async () => new Response(invalidProviderBody, { status: 200 }),
     async (raw) => {
       captured.push(Buffer.from(raw));
@@ -806,7 +775,7 @@ test("Anthropic generation capture uses the fixed path, exclusive create, and mo
 test("Anthropic raw capture is generation-only and fails explicitly without exposing response data", async () => {
   let captureCalls = 0;
   const regular = new AnthropicMessagesClient(
-    { ...anthropicConfig(), captureGenerationRawResponse: true },
+    { ...config(), captureGenerationRawResponse: true },
     async () => new Response(JSON.stringify({
       id: "msg_regular_12345678",
       type: "message",
@@ -837,7 +806,7 @@ test("Anthropic raw capture is generation-only and fails explicitly without expo
     stop_reason: "end_turn",
   });
   const captureFailure = new AnthropicMessagesClient(
-    { ...anthropicConfig(), captureGenerationRawResponse: true },
+    { ...config(), captureGenerationRawResponse: true },
     async () => new Response(sensitiveRaw, { status: 200 }),
     async () => {
       throw new Error(`write failed: ${sensitiveRaw}`);

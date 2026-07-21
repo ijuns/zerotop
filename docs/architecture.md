@@ -11,7 +11,7 @@ flowchart TB
     API --> DB["PostgreSQL"]
     API --> AI["FastAPI AI 서비스"]
     AI --> ModelGateway["내부 모델 게이트웨이"]
-    ModelGateway --> OpenAI["OpenAI Responses API"]
+    ModelGateway --> Claude["Anthropic Claude Messages API"]
     API --> Builder["환경 빌더"]
     API --> Validator["자동 검증 서비스"]
     API --> Runtime["KubeVirt 런타임 컨트롤러"]
@@ -42,7 +42,7 @@ flowchart TB
     Grader --> AI
 ```
 
-웹은 공개 문제와 실행 상태만 받습니다. API는 사용자 권한, 조직 소속, Lab, 실행, 제출, 점수, 리포트, 랭킹과 감사 로그의 경계를 소유합니다. AI는 OpenAI API key를 소유하지 않고 내부 모델 게이트웨이만 호출합니다. 게이트웨이는 고정된 Responses API origin과 strict JSON schema만 사용합니다. AI, 빌더, 검증, 런타임, 채점, 텔레메트리는 서로 다른 내부 bearer token으로 호출되며 공개 브라우저에서 직접 접근하지 않습니다.
+웹은 공개 문제와 실행 상태만 받습니다. API는 사용자 권한, 조직 소속, Lab, 실행, 제출, 점수, 리포트, 랭킹과 감사 로그의 경계를 소유합니다. AI는 Anthropic API key를 소유하지 않고 내부 모델 게이트웨이만 호출합니다. 게이트웨이는 고정된 Anthropic Messages API origin과 strict JSON schema만 사용합니다. AI, 빌더, 검증, 런타임, 채점, 텔레메트리는 서로 다른 내부 bearer token으로 호출되며 공개 브라우저에서 직접 접근하지 않습니다.
 
 PostgreSQL이 플랫폼 상태의 source of truth입니다. Redis는 배포 토폴로지에 캐시·비동기 작업 확장 지점으로 포함되지만 현재 요청의 정합성은 Redis에 의존하지 않습니다. Elasticsearch는 블루팀 실행별 텔레메트리와 ELK 증거 채점에만 사용하며 API는 텔레메트리/채점 계약을 통해 접근합니다. 학습자는 공용 Elasticsearch 관리 권한을 받지 않고 자신의 run에 묶인 Kibana space와 제한된 검색 권한만 받습니다.
 
