@@ -1,0 +1,81 @@
+# Render Blueprint — free single-domain demo deployment of ZeroTOP.
+#
+# Two services: the Node API and the Next.js web. The web proxies /api/* to the
+# API (API_PROXY_TARGET), so the browser only ever talks to the web origin and
+# no CORS is involved. Data lives in an ephemeral SQLite file and is reseeded on
+# every boot (DEMO_SEED), so the ranking is always populated; accounts created
+# by visitors do not survive a restart, which is acceptable for a demo.
+#
+# This runs AUTH_MODE=local: real password login without Keycloak. It is a demo
+# posture, not production authentication.
+#
+# After the first deploy, set the two secrets marked `sync: false` in the Render
+# dashboard:
+#   - SEED_FIXTURE_PASSWORD (on zerotop-api): the login password for every seed
+#     account, including the admin admin@zerotop.local. Choose your own so the
+#     value in the public repo is not the live credential.
+
+services:
+  - type: web
+    name: zerotop-api
+    runtime: docker
+    dockerfilePath: ./infra/docker/api.Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: AUTH_MODE
+        value: local
+      - key: REPOSITORY_MODE
+        value: sqlite
+      - key: RUNTIME_ADAPTER
+        value: simulator
+      - key: AI_ADAPTER
+        value: local
+      - key: ENVIRONMENT_BUILDER_ADAPTER
+        value: development
+      - key: LAB_VALIDATOR_ADAPTER
+        value: development
+      - key: GRADER_ADAPTER
+        value: mock
+      - key: TELEMETRY_ADAPTER
+        value: development
+      - key: DEMO_SEED
+        value: "true"
+      # The web proxies to the API, so same-origin requests need no CORS. This
+      # empty value keeps ALLOWED_ORIGINS from being required.
+      - key: ALLOWED_ORIGINS
+        value: ""
+      - key: SESSION_SIGNING_SECRET
+        generateValue: true
+      # Set this in the dashboard; it is the login password for the seed
+      # accounts including admin@zerotop.local.
+      - key: SEED_FIXTURE_PASSWORD
+        sync: false
+
+  - type: web
+    name: zerotop-web
+    runtime: docker
+    dockerfilePath: ./apps/web/Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CODEGATE_WEB_AUTH_MODE
+        value: local
+      - key: CODEGATE_WEB_DEVELOPMENT_IDENTITY
+        value: "false"
+      # The browser calls the web's own /api, which is proxied to the API.
+      - key: CODEGATE_WEB_API_URL
+        value: /api
+      # Server-side proxy target: the API service's public host. next.config
+      # prepends https://, and the proxy runs on the Next server, not the
+      # browser, so no CORS is involved.
+      - key: API_PROXY_TARGET
+        fromService:
+          type: web
+          name: zerotop-api
+          property: host

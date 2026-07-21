@@ -3,7 +3,11 @@ import { hashPassword } from "./security.ts";
 import { DEV_USER_ID, SECURITY_LAB_ORG_ID } from "./types.ts";
 
 export const DEVELOPMENT_FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
-export const DEVELOPMENT_FIXTURE_PASSWORD = "ZeroTOP!2026";
+// The seed accounts (including the platform admin admin@zerotop.local) use this
+// password. A public deployment must override it via SEED_FIXTURE_PASSWORD so
+// the value committed here is not the live credential.
+export const DEVELOPMENT_FIXTURE_PASSWORD =
+  process.env.SEED_FIXTURE_PASSWORD?.trim() || "ZeroTOP!2026";
 
 /**
  * Every seed account shares one password, and scrypt is deliberately slow, so

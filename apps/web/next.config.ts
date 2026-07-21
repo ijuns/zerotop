@@ -1,9 +1,25 @@
 import type { NextConfig } from "next";
 
+// When API_PROXY_TARGET is set the web proxies /api/* to the API service, so
+// the browser only ever talks to the web origin and no CORS is involved. This
+// is how the single-domain Render deployment avoids cross-origin entirely.
+// A bare host (as Render's fromService supplies) is assumed to be https.
+function resolveApiProxyTarget(): string | null {
+  const raw = process.env.API_PROXY_TARGET?.trim().replace(/\/$/, "");
+  if (!raw) return null;
+  return /^https?:\/\//.test(raw) ? raw : `https://${raw}`;
+}
+
+const apiProxyTarget = resolveApiProxyTarget();
+
 const nextConfig: NextConfig = {
   output: "standalone",
   reactStrictMode: true,
   poweredByHeader: false,
+  async rewrites() {
+    if (!apiProxyTarget) return [];
+    return [{ source: "/api/:path*", destination: `${apiProxyTarget}/:path*` }];
+  },
   async headers() {
     return [
       {

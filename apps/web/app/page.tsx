@@ -653,11 +653,14 @@ export default function HomePage() {
           return;
         }
         // In password-session mode an unauthenticated visitor lands on the
-        // login screen rather than an error.
+        // login screen. This covers a clean 401/403 as well as a blocked or
+        // unreachable API (status 0), so a broken connection shows the login
+        // screen rather than an empty app shell.
         if (
+          authentication.mode === "local" &&
           getSessionToken() === null &&
           error instanceof ApiError &&
-          (error.status === 401 || error.status === 403)
+          (error.status === 401 || error.status === 403 || error.status === 0)
         ) {
           setAuthScreen("login");
           setUserError(null);
