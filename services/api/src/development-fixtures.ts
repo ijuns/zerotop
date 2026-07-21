@@ -50,6 +50,7 @@ export interface DevelopmentCapabilityLabFixture {
   name: string;
   description: string;
   teamType: "blue" | "red";
+  difficulty: "beginner" | "intermediate" | "advanced" | "expert";
   questionTypes: readonly string[];
   environment: "ubuntu" | "kali";
 }
@@ -286,6 +287,7 @@ const DEVELOPMENT_TRAINING_TEMPLATES = [
     title: "공개 CVE 웹 침투",
     description: "공개된 N-day 취약점을 분석하고 웹 서비스의 공격 경로를 검증합니다.",
     teamType: "red",
+    difficulty: "advanced",
     questionTypes: ["single_choice", "free_text", "mitre_attack"],
     environment: "kali",
     skills: [
@@ -298,6 +300,7 @@ const DEVELOPMENT_TRAINING_TEMPLATES = [
     title: "ELK 위협 헌팅",
     description: "ELK에서 공격 흔적을 추적하고 MITRE ATT&CK 전술과 연결합니다.",
     teamType: "blue",
+    difficulty: "intermediate",
     questionTypes: ["elk_search", "mitre_attack"],
     environment: "ubuntu",
     skills: [
@@ -310,6 +313,7 @@ const DEVELOPMENT_TRAINING_TEMPLATES = [
     title: "Linux 권한 상승 분석",
     description: "Linux 호스트의 권한 상승 경로를 식별하고 공격 흐름을 설명합니다.",
     teamType: "red",
+    difficulty: "expert",
     questionTypes: ["multiple_choice", "free_text", "mitre_attack"],
     environment: "kali",
     skills: [
@@ -363,6 +367,7 @@ export function buildDevelopmentCapabilityFixtures(
       name: `${cohort.name} · ${template.title}`,
       description: template.description,
       teamType: template.teamType,
+      difficulty: template.difficulty,
       questionTypes: template.questionTypes,
       environment: template.environment,
     })),

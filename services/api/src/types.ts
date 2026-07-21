@@ -79,6 +79,7 @@ export interface ChallengeResultInput {
   answers: unknown[];
   gradeEvidence: JsonObject;
   skills: JsonObject;
+  hintsUsed?: number;
   completedAt: string;
 }
 

@@ -110,6 +110,11 @@ const MIGRATIONS = [
     name: "ranking_seasons",
     url: new URL("../migrations/014_ranking_seasons.sql", import.meta.url),
   },
+  {
+    version: 15,
+    name: "scoring_inputs",
+    url: new URL("../migrations/015_scoring_inputs.sql", import.meta.url),
+  },
 ] as const;
 
 function nowIso(): string {
@@ -119,6 +124,46 @@ function nowIso(): string {
 function timestamp(value: unknown): string {
   if (value instanceof Date) return value.toISOString();
   return String(value);
+}
+
+const LAB_DIFFICULTIES = ["beginner", "intermediate", "advanced", "expert"];
+
+/** Reads a validated difficulty from a lab config, defaulting to intermediate. */
+function difficultyOf(config: unknown): string {
+  const value =
+    config && typeof config === "object"
+      ? (config as Record<string, unknown>).difficulty
+      : undefined;
+  return typeof value === "string" && LAB_DIFFICULTIES.includes(value)
+    ? value
+    : "intermediate";
+}
+
+/** See the SQLite copy: derives run duration and lifetime, null when unknown. */
+function runTiming(
+  runCreatedAt: unknown,
+  completedAt: unknown,
+  runExpiresAt: unknown,
+): { durationSeconds: number | null; ttlSeconds: number | null } {
+  const parse = (value: unknown) =>
+    value instanceof Date
+      ? value.getTime()
+      : value
+        ? Date.parse(String(value))
+        : NaN;
+  const created = parse(runCreatedAt);
+  const completed = parse(completedAt);
+  const expires = parse(runExpiresAt);
+  return {
+    durationSeconds:
+      Number.isNaN(created) || Number.isNaN(completed)
+        ? null
+        : Math.max(0, Math.round((completed - created) / 1000)),
+    ttlSeconds:
+      Number.isNaN(created) || Number.isNaN(expires)
+        ? null
+        : Math.max(0, Math.round((expires - created) / 1000)),
+  };
 }
 
 function jsonValue<T>(value: unknown, fallback: T): T {
@@ -772,9 +817,9 @@ export class PostgresRepository implements PlatformRepository {
         `INSERT INTO labs
           (id, owner_user_id, organization_id, name, description, team_type,
            question_types_json, environment, access_modes_json, validation_status,
-           config_json, grading_config_json, created_at, updated_at)
+           config_json, grading_config_json, difficulty, created_at, updated_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9::jsonb,
-                 'draft', $10::jsonb, $11::jsonb, $12, $12)`,
+                 'draft', $10::jsonb, $11::jsonb, $12, $13, $13)`,
         [
           id,
           userId,
@@ -787,6 +832,7 @@ export class PostgresRepository implements PlatformRepository {
           JSON.stringify(input.accessModes),
           JSON.stringify(input.config),
           JSON.stringify({ questions: input.gradingQuestions }),
+          difficultyOf(input.config),
           createdAt,
         ],
       );
@@ -1030,8 +1076,8 @@ export class PostgresRepository implements PlatformRepository {
       await client.query(
         `INSERT INTO challenge_results
           (id, lab_id, user_id, run_id, score, max_score, answers_json,
-           evidence_json, skills_json, completed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10)`,
+           evidence_json, skills_json, hints_used, completed_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11)`,
         [
           input.id,
           input.labId,
@@ -1042,6 +1088,7 @@ export class PostgresRepository implements PlatformRepository {
           JSON.stringify(input.answers),
           JSON.stringify(input.gradeEvidence),
           JSON.stringify(input.skills),
+          input.hintsUsed ?? 0,
           input.completedAt,
         ],
       );
@@ -1199,9 +1246,12 @@ export class PostgresRepository implements PlatformRepository {
       this.pool.query(
         `SELECT cr.id, cr.user_id, cr.run_id, cr.lab_id, cr.score, cr.max_score,
                 cr.completed_at, cr.skills_json, cr.evidence_json,
-                l.name AS lab_title, l.team_type, m.organization_id
+                cr.hints_used, l.difficulty, l.name AS lab_title, l.team_type,
+                m.organization_id, r.created_at AS run_created_at,
+                r.expires_at AS run_expires_at
            FROM challenge_results cr
            JOIN labs l ON l.id = cr.lab_id
+           LEFT JOIN runtime_runs r ON r.id = cr.run_id
            LEFT JOIN organization_memberships m ON m.user_id = cr.user_id
            ${evidenceWhere}`,
         parameters,
@@ -1243,6 +1293,9 @@ export class PostgresRepository implements PlatformRepository {
           maxPoints: row.max_score,
           completedAt: timestamp(row.completed_at),
           skills,
+          difficulty: row.difficulty ?? "intermediate",
+          hintsUsed: Number(row.hints_used ?? 0),
+          ...runTiming(row.run_created_at, row.completed_at, row.run_expires_at),
         };
       }),
     };

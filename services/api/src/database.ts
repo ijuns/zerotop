@@ -47,6 +47,44 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+/**
+ * Derives the run duration and lifetime the season time bonus needs. Returns
+ * nulls when the timestamps are missing so scoring falls back to no bonus
+ * rather than inventing one.
+ */
+function runTiming(
+  runCreatedAt: unknown,
+  completedAt: unknown,
+  runExpiresAt: unknown,
+): { durationSeconds: number | null; ttlSeconds: number | null } {
+  const created = runCreatedAt ? Date.parse(String(runCreatedAt)) : NaN;
+  const completed = completedAt ? Date.parse(String(completedAt)) : NaN;
+  const expires = runExpiresAt ? Date.parse(String(runExpiresAt)) : NaN;
+  return {
+    durationSeconds:
+      Number.isNaN(created) || Number.isNaN(completed)
+        ? null
+        : Math.max(0, Math.round((completed - created) / 1000)),
+    ttlSeconds:
+      Number.isNaN(created) || Number.isNaN(expires)
+        ? null
+        : Math.max(0, Math.round((expires - created) / 1000)),
+  };
+}
+
+const LAB_DIFFICULTIES = ["beginner", "intermediate", "advanced", "expert"];
+
+/** Reads a validated difficulty from a lab config, defaulting to intermediate. */
+function difficultyOf(config: unknown): string {
+  const value =
+    config && typeof config === "object"
+      ? (config as Record<string, unknown>).difficulty
+      : undefined;
+  return typeof value === "string" && LAB_DIFFICULTIES.includes(value)
+    ? value
+    : "intermediate";
+}
+
 function parseJson<T>(value: unknown, fallback: T): T {
   if (typeof value !== "string") return fallback;
 
@@ -608,6 +646,18 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
     ensureColumn(this.database, "challenge_results", "run_id", "TEXT");
     ensureColumn(
       this.database,
+      "challenge_results",
+      "hints_used",
+      "INTEGER NOT NULL DEFAULT 0 CHECK (hints_used >= 0)",
+    );
+    ensureColumn(
+      this.database,
+      "labs",
+      "difficulty",
+      "TEXT NOT NULL DEFAULT 'intermediate' CHECK (difficulty IN ('beginner', 'intermediate', 'advanced', 'expert'))",
+    );
+    ensureColumn(
+      this.database,
       "labs",
       "grading_config_json",
       "TEXT NOT NULL DEFAULT '{\"questions\":[]}'",
@@ -776,8 +826,8 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       `INSERT INTO labs
         (id, owner_user_id, organization_id, name, description, team_type,
          question_types_json, environment, access_modes_json, validation_status,
-         config_json, grading_config_json, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'validated', ?, ?, ?, ?)
+         config_json, grading_config_json, difficulty, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'validated', ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          owner_user_id = excluded.owner_user_id,
          organization_id = excluded.organization_id,
@@ -790,6 +840,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
          validation_status = 'validated',
          config_json = excluded.config_json,
          grading_config_json = excluded.grading_config_json,
+         difficulty = excluded.difficulty,
          updated_at = excluded.updated_at`,
     );
     const validationInsert = this.database.prepare(
@@ -876,6 +927,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
               },
             ],
           }),
+          lab.difficulty,
           DEVELOPMENT_FIXTURE_CREATED_AT,
           seedTime.toISOString(),
         );
@@ -1146,8 +1198,8 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         `INSERT INTO labs
           (id, owner_user_id, organization_id, name, description, team_type,
            question_types_json, environment, access_modes_json, validation_status,
-           config_json, grading_config_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)`,
+           config_json, grading_config_json, difficulty, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -1163,6 +1215,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         JSON.stringify(input.accessModes),
         JSON.stringify(input.config),
         JSON.stringify({ questions: input.gradingQuestions }),
+        difficultyOf(input.config),
         createdAt,
         createdAt,
       );
@@ -1411,8 +1464,8 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         .prepare(
           `INSERT INTO challenge_results
             (id, lab_id, user_id, run_id, score, max_score, answers_json,
-             evidence_json, skills_json, completed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             evidence_json, skills_json, hints_used, completed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           input.id,
@@ -1424,6 +1477,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
           JSON.stringify(input.answers),
           JSON.stringify(input.gradeEvidence),
           JSON.stringify(input.skills),
+          input.hintsUsed ?? 0,
           input.completedAt,
         );
       this.database
@@ -1574,9 +1628,12 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         .prepare(
           `SELECT cr.id, cr.user_id, cr.run_id, cr.lab_id, cr.score, cr.max_score,
                   cr.completed_at, cr.skills_json, cr.evidence_json,
-                  l.name AS lab_title, l.team_type, m.organization_id
+                  cr.hints_used, l.difficulty, l.name AS lab_title, l.team_type,
+                  m.organization_id, r.created_at AS run_created_at,
+                  r.expires_at AS run_expires_at
              FROM challenge_results cr
              JOIN labs l ON l.id = cr.lab_id
+             LEFT JOIN runtime_runs r ON r.id = cr.run_id
              LEFT JOIN organization_memberships m ON m.user_id = cr.user_id
             WHERE cr.user_id = ?`,
         )
@@ -1603,9 +1660,12 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         .prepare(
           `SELECT cr.id, cr.user_id, cr.run_id, cr.lab_id, cr.score, cr.max_score,
                   cr.completed_at, cr.skills_json, cr.evidence_json,
-                  l.name AS lab_title, l.team_type, m.organization_id
+                  cr.hints_used, l.difficulty, l.name AS lab_title, l.team_type,
+                  m.organization_id, r.created_at AS run_created_at,
+                  r.expires_at AS run_expires_at
              FROM challenge_results cr
              JOIN labs l ON l.id = cr.lab_id
+             LEFT JOIN runtime_runs r ON r.id = cr.run_id
              JOIN organization_memberships m ON m.user_id = cr.user_id
             WHERE m.organization_id = ?`,
         )
@@ -1631,9 +1691,12 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         .prepare(
           `SELECT cr.id, cr.user_id, cr.run_id, cr.lab_id, cr.score, cr.max_score,
                   cr.completed_at, cr.skills_json, cr.evidence_json,
-                  l.name AS lab_title, l.team_type, m.organization_id
+                  cr.hints_used, l.difficulty, l.name AS lab_title, l.team_type,
+                  m.organization_id, r.created_at AS run_created_at,
+                  r.expires_at AS run_expires_at
              FROM challenge_results cr
              JOIN labs l ON l.id = cr.lab_id
+             LEFT JOIN runtime_runs r ON r.id = cr.run_id
              LEFT JOIN organization_memberships m ON m.user_id = cr.user_id`,
         )
         .all() as Row[];
@@ -1674,6 +1737,9 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
           maxPoints: row.max_score,
           completedAt: row.completed_at,
           skills,
+          difficulty: row.difficulty ?? "intermediate",
+          hintsUsed: Number(row.hints_used ?? 0),
+          ...runTiming(row.run_created_at, row.completed_at, row.run_expires_at),
         };
       }),
     };

@@ -2105,7 +2105,14 @@ export default function HomePage() {
         {rankingPolicyOpen && (
           <section className="panel" role="note">
             <h2>점수 산정 기준</h2>
-            <p>시즌 점수는 검증을 통과한 실습의 획득 점수 합계입니다. 정확도는 획득 점수를 배점 합계로 나눈 값이며, 조직 준비도는 정확도 50% · 참여율 30% · 완료율 20%의 가중 평균입니다.</p>
+            <p>실습 한 건의 시즌 점수 = <strong>난이도 기본점 × 정확도 × (1 + 시간 보너스) × (1 − 힌트 감점)</strong> 이며, 시즌 점수는 검증을 통과한 모든 실습의 합계입니다.</p>
+            <ul>
+              <li><strong>난이도 기본점</strong> — 초급 100 · 중급 250 · 고급 500 (expert는 고급으로 집계)</li>
+              <li><strong>정확도</strong> — 획득 점수 ÷ 배점 합계</li>
+              <li><strong>시간 보너스</strong> — 이용 시간의 절반 안에 완료하면 최대 +20%, 시간을 모두 쓰면 0%</li>
+              <li><strong>힌트 감점</strong> — 힌트 1회당 −4%, 최대 −20%. 힌트 기록이 없으면 감점하지 않습니다.</li>
+              <li><strong>조직 준비도</strong> — 정확도 50% · 참여율 30% · 완료율 20%의 가중 평균</li>
+            </ul>
           </section>
         )}
       </>

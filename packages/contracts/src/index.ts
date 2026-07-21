@@ -224,6 +224,26 @@ export const RANKING_DOMAINS = [
 
 export type RankingDomain = (typeof RANKING_DOMAINS)[number]["key"];
 
+export type LabDifficulty = "beginner" | "intermediate" | "advanced" | "expert";
+
+/**
+ * Season scoring policy, matching the on-screen "순위 산정 방식":
+ *   score = base(difficulty) × accuracy × (1 + timeBonus) × (1 − hintPenalty)
+ * base is the difficulty tier; a fast finish adds up to +20%; each hint removes
+ * a fixed slice down to −20%. Expert maps to the highest (advanced) tier so the
+ * three published tiers (초급/중급/고급 = 100/250/500) stay exact.
+ */
+export const DIFFICULTY_BASE_POINTS: Record<LabDifficulty, number> = {
+  beginner: 100,
+  intermediate: 250,
+  advanced: 500,
+  expert: 500,
+};
+
+export const MAX_TIME_BONUS = 0.2;
+export const MAX_HINT_PENALTY = 0.2;
+export const HINT_PENALTY_PER_USE = 0.04;
+
 export interface RankingSeason {
   id: string;
   name: string;

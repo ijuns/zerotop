@@ -1,5 +1,12 @@
-import { RANKING_DOMAINS } from "@codegate/contracts";
+import {
+  DIFFICULTY_BASE_POINTS,
+  HINT_PENALTY_PER_USE,
+  MAX_HINT_PENALTY,
+  MAX_TIME_BONUS,
+  RANKING_DOMAINS,
+} from "@codegate/contracts";
 import type {
+  LabDifficulty,
   OrganizationRankingEntry,
   RankingDomain,
   RankingSeason,
@@ -42,6 +49,13 @@ export interface CapabilityEvidence {
   maxPoints: number;
   completedAt: string;
   skills: Record<string, { label: string; points: number; maxPoints: number }>;
+  /** Scoring-policy inputs. Absent fields fall back to neutral defaults. */
+  difficulty?: LabDifficulty;
+  /** Seconds spent in the run; used for the time bonus when the TTL is known. */
+  durationSeconds?: number | null;
+  /** Run lifetime in seconds; the time bonus is measured against it. */
+  ttlSeconds?: number | null;
+  hintsUsed?: number;
 }
 
 export interface ReportingDataset {
@@ -256,6 +270,44 @@ export function ranking(
   };
 }
 
+/**
+ * Season score for one graded lab, per the published policy:
+ *   base(difficulty) × accuracy × (1 + timeBonus) × (1 − hintPenalty)
+ * With a domain filter, accuracy is measured over that domain's skills only.
+ * Missing inputs are neutral: no difficulty → intermediate base, no timing → no
+ * bonus, no hints → no penalty. Nothing is invented for absent data.
+ */
+function seasonScore(
+  item: CapabilityEvidence,
+  skills: Set<string> | null,
+): number {
+  const scored = evidencePoints(item, skills);
+  if (scored.maxPoints <= 0) return 0;
+  const base = DIFFICULTY_BASE_POINTS[item.difficulty ?? "intermediate"];
+  const accuracy = scored.points / scored.maxPoints;
+  return Math.round(base * accuracy * timeMultiplier(item) * hintMultiplier(item));
+}
+
+/** +MAX_TIME_BONUS for finishing within half the TTL, tapering to 0 at the TTL. */
+function timeMultiplier(item: CapabilityEvidence): number {
+  const ttl = item.ttlSeconds ?? 0;
+  const duration = item.durationSeconds ?? null;
+  if (ttl <= 0 || duration === null || duration < 0) return 1;
+  const fractionUsed = duration / ttl;
+  const bonus = MAX_TIME_BONUS * clamp((1 - fractionUsed) / 0.5, 0, 1);
+  return 1 + bonus;
+}
+
+/** −HINT_PENALTY_PER_USE per hint, floored at 1 − MAX_HINT_PENALTY. */
+function hintMultiplier(item: CapabilityEvidence): number {
+  const hints = item.hintsUsed ?? 0;
+  return 1 - Math.min(MAX_HINT_PENALTY, HINT_PENALTY_PER_USE * hints);
+}
+
+function clamp(value: number, low: number, high: number): number {
+  return Math.max(low, Math.min(high, value));
+}
+
 /** Skill keys that count towards a domain filter. */
 function domainSkills(domain: RankingDomain | null): Set<string> | null {
   if (!domain) return null;
@@ -363,14 +415,16 @@ function viewerSummary(
 
   const currentEvidence = inWindow(current);
   let points = 0;
+  let rawPoints = 0;
   let maxPoints = 0;
   for (const item of currentEvidence) {
     const scored = evidencePoints(item, skills);
-    points += scored.points;
+    points += seasonScore(item, skills);
+    rawPoints += scored.points;
     maxPoints += scored.maxPoints;
   }
   const previousPoints = inWindow(previous).reduce(
-    (total, item) => total + evidencePoints(item, skills).points,
+    (total, item) => total + seasonScore(item, skills),
     0,
   );
   const rank = entries.find((item) => item.userId === userId)?.rank ?? null;
@@ -385,7 +439,7 @@ function viewerSummary(
     points,
     pointsDelta: points - previousPoints,
     completedLabs: currentEvidence.length,
-    accuracy: percent(points, maxPoints),
+    accuracy: percent(rawPoints, maxPoints),
     streakDays: currentStreak(
       mine.map((item) => item.completedAt),
       new Date(Math.min(current.end, Date.now())),
@@ -550,10 +604,14 @@ function rankWindow(
         return item.userId === user.id && timestamp >= window.start && timestamp < window.end;
       });
       let points = 0;
+      let rawPoints = 0;
       let maxPoints = 0;
       for (const item of evidence) {
         const scored = evidencePoints(item, skills);
-        points += scored.points;
+        // Season points apply the difficulty/time/hint policy; accuracy stays
+        // the plain share of available points so it reads as a percentage.
+        points += seasonScore(item, skills);
+        rawPoints += scored.points;
         maxPoints += scored.maxPoints;
       }
       return {
@@ -564,7 +622,7 @@ function rankWindow(
           : null,
         points,
         completedLabs: evidence.length,
-        accuracy: percent(points, maxPoints),
+        accuracy: percent(rawPoints, maxPoints),
         primaryDomain: primaryDomainOf(evidence),
       };
     })

@@ -660,6 +660,19 @@ function actorOrganizationRole(actor: RequestActor): string {
   return (organization ? stringField(organization, "role") : null) ?? "";
 }
 
+/**
+ * Reads a self-reported hint count from a submission. Absent or invalid values
+ * are 0, so no penalty is applied rather than an assumed one; the cap keeps a
+ * single submission from erasing more than the policy's maximum.
+ */
+function hintsUsedOf(value: unknown): number {
+  if (!isObject(value)) return 0;
+  const raw = value.hintsUsed ?? value.hints_used;
+  const parsed = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(20, Math.floor(parsed));
+}
+
 function submittedAnswers(value: unknown): SubmittedAnswer[] {
   if (!isObject(value) || !Array.isArray(value.answers)) {
     throw new ApiError(
@@ -2786,6 +2799,7 @@ async function route(
     }
 
     const answers = submittedAnswers(body);
+    const hintsUsed = hintsUsedOf(body);
     const labId = stringField(run, "labId") as string;
     const lab = await context.repository.getLab(actor.id, labId);
     if (!lab) {
@@ -2831,6 +2845,7 @@ async function route(
         trustedEvidence,
       },
       skills: gradeSkills(grade.grades as unknown as JsonRecord[]),
+      hintsUsed,
       completedAt,
     });
     const payload = { data: { result, grade } };
