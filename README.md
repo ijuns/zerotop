@@ -1,6 +1,6 @@
 # ZeroTOP
 
-**Zero-day Training Orchestration Platform** — AI가 만드는 실전형 사이버 레인지
+**Zero Training Orchestration Platform** — AI가 만드는 실전형 사이버 레인지
 
 최신 CVE와 훈련 목표를 입력하면 AI가 강의 자료, 취약 환경, 공격·방어 시나리오와
 채점 문제까지 한 번에 생성합니다. 만들어진 환경은 실행마다 격리되고, 배포 전에
