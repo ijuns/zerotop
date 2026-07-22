@@ -204,6 +204,7 @@ def validate_catalog_binding(
     catalog: BuildCatalog,
     *,
     requested_cve_ids: list[str] | None = None,
+    allow_uncurated_cve_simulation: bool = False,
 ) -> None:
     """Fail closed unless generated build coordinates are exact catalog members."""
 
@@ -298,7 +299,11 @@ def validate_catalog_binding(
         raise BuildCatalogError(
             "environmentBuildSpec source.cveIds changed the requested CVE scope"
         )
-    if requested_cves and not (selected_packages or selected_artifacts):
+    if (
+        requested_cves
+        and not (selected_packages or selected_artifacts)
+        and not allow_uncurated_cve_simulation
+    ):
         raise BuildCatalogError(
             "Explicit CVE environments require at least one selected curated package or artifact"
         )

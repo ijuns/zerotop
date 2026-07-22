@@ -216,3 +216,72 @@ test("creates one isolated VPN data-plane gateway inside the run namespace", () 
     false,
   );
 });
+
+test("builds a blue-team ELK topology with monitored-target telemetry sidecars", () => {
+  const blueRequest = {
+    ...request,
+    accessMethod: "browser_desktop" as const,
+    topology: {
+      schemaVersion: 1 as const,
+      team: "blue" as const,
+      isolation: "per_run" as const,
+      workstation: { role: "soc_analyst" as const, desktopImage: "ubuntu" as const, entrypoint: "kibana" as const },
+      target: { role: "monitored_target" as const, hostname: "target" as const },
+      telemetry: {
+        stack: "elastic" as const,
+        collector: "elastic_agent" as const,
+        generator: "scenario_log_generator" as const,
+        index: "zerotop-logs-*",
+        generation: {
+          schemaVersion: 1 as const,
+          profile: "powershell_rce_exfiltration" as const,
+          totalEvents: 1_200,
+          timeRangeMinutes: 60,
+          seed: "manifest-test-seed",
+          timelineAnchor: "2026-07-22T00:00:00.000Z",
+        },
+        events: [{
+          id: "evidence-1",
+          document: {
+            "@timestamp": "2026-07-22T00:00:00.000Z",
+            event: { dataset: "zerotop.endpoint" },
+            threat: { technique: { id: ["T1059.004"] } },
+          },
+        }],
+      },
+    },
+  };
+  const blueImages = {
+    ...images,
+    elasticsearch: `registry.example/elastic/elasticsearch@sha256:${"c".repeat(64)}`,
+    kibana: `registry.example/elastic/kibana@sha256:${"d".repeat(64)}`,
+    elasticAgent: `registry.example/elastic/agent@sha256:${"e".repeat(64)}`,
+    scenarioLogGenerator: `registry.example/ranges/log-generator@sha256:${"f".repeat(64)}`,
+  };
+
+  const resources = buildRunResources(blueRequest, blueImages);
+
+  const names = resources.map((item) => `${item.kind}/${item.metadata.name}`);
+  assert.ok(names.includes("Deployment/elasticsearch"));
+  assert.ok(names.includes("Deployment/kibana"));
+  assert.ok(names.includes("Service/elasticsearch"));
+  assert.ok(names.includes("Service/kibana"));
+  const target = resources.find((item) => item.kind === "Deployment" && item.metadata.name === "target");
+  const containers = (target?.spec as any).template.spec.containers;
+  assert.deepEqual(containers.map((item: any) => item.name), ["target", "scenario-log-generator", "elastic-agent"]);
+  assert.equal(containers[1].env[0].name, "SCENARIO_EVENTS_BASE64");
+  assert.equal(containers[1].env[1].name, "SCENARIO_GENERATION_BASE64");
+  assert.equal(containers[2].env[0].value, "http://elasticsearch:9200");
+  const policies = resources.filter((item) => item.kind === "NetworkPolicy").map((item) => item.metadata.name);
+  for (const name of [
+    "allow-workstation-to-kibana",
+    "allow-kibana-from-workstation",
+    "allow-kibana-to-elasticsearch",
+    "allow-target-agent-to-elasticsearch",
+    "allow-target-agent-to-kibana",
+    "allow-kibana-from-target-agent",
+    "allow-elasticsearch-ingest",
+  ]) assert.ok(policies.includes(name));
+  const namespace = resources.find((item) => item.kind === "Namespace");
+  assert.equal(namespace?.metadata.annotations?.["codegate.ai/team"], "blue");
+});

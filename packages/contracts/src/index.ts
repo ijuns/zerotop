@@ -30,11 +30,18 @@ export interface UserProfile {
 
 export interface RegistrationRequest {
   email: string;
-  handle: string;
+  /** Omitted when the server should derive it from the email address. */
+  handle?: string;
   displayName: string;
+  affiliation: string;
   password?: string;
   accountType: AccountType;
+  organizationId?: string;
   organizationJoinCode?: string;
+  consent: {
+    terms: boolean;
+    privacy: boolean;
+  };
 }
 
 export interface LabGenerationRequest {
@@ -52,6 +59,66 @@ export interface AttackTechnique {
   id: string;
   name: string;
   tactic: string;
+}
+
+export interface ScenarioTelemetryEvent {
+  id: string;
+  document: Record<string, unknown>;
+}
+
+export interface ScenarioTelemetryGeneration {
+  schemaVersion: 1;
+  profile: "powershell_rce_exfiltration" | "credential_abuse" | "ransomware" | "webshell" | "generic_intrusion" | "generic_endpoint_activity";
+  totalEvents: number;
+  timeRangeMinutes: number;
+  seed: string;
+  timelineAnchor: string;
+}
+
+export interface RedTargetExercise {
+  schemaVersion: 1;
+  profile: "command_injection" | "path_traversal" | "sql_injection" | "auth_bypass" | "sensitive_data_exposure";
+  scenarioId: string;
+  title: string;
+  summary: string;
+  expectedCves: string[];
+  service: {
+    scheme: "http";
+    host: "target";
+    port: 8080;
+    baseUrl: "http://target:8080";
+  };
+  verification: {
+    method: "GET";
+    path: string;
+    successMarker: string;
+  };
+  attackTechniqueIds: string[];
+  simulationMode: "bounded_behavioral";
+}
+
+export interface LabRuntimeTopology {
+  schemaVersion: 1;
+  team: Team;
+  isolation: "per_run";
+  workstation: {
+    role: "soc_analyst" | "attack_operator";
+    desktopImage: DesktopImage;
+    entrypoint: "kibana" | "target";
+  };
+  target: {
+    role: "monitored_target" | "vulnerable_target";
+    hostname: "target";
+    exercise?: RedTargetExercise;
+  };
+  telemetry?: {
+    stack: "elastic";
+    collector: "elastic_agent";
+    generator: "scenario_log_generator";
+    index: string;
+    events: ScenarioTelemetryEvent[];
+    generation?: ScenarioTelemetryGeneration;
+  };
 }
 
 export interface LabSpec extends LabGenerationRequest {
@@ -81,6 +148,8 @@ export interface LabSpec extends LabGenerationRequest {
     affectedProducts: string[];
     cveIds: string[];
   };
+  /** Optional only for reading LabSpecs created before topology schema v1. */
+  topology?: LabRuntimeTopology;
   questions?: LabQuestion[];
   createdAt: string;
 }
@@ -114,7 +183,7 @@ export interface ValidationResult {
 export interface RuntimeRun {
   id: string;
   labId: string;
-  status: "provisioning" | "ready" | "stopped" | "expired";
+  status: "provisioning" | "ready" | "failed" | "stopped" | "expired";
   desktopImage: DesktopImage;
   accessMethod: AccessMethod;
   expiresAt: string;
@@ -125,6 +194,7 @@ export interface RuntimeRun {
     assignedIp: string;
     allowedCidr: string;
   };
+  topology?: LabRuntimeTopology;
 }
 
 export interface AnswerSubmission {

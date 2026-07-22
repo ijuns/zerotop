@@ -70,7 +70,12 @@ export class KubernetesHttpApplier implements KubernetesApplier {
 
     const browserRequired = accessMethod === "browser_desktop" || accessMethod === "both";
     const vpnRequired = accessMethod === "openvpn" || accessMethod === "both";
-    const [workstationVmi, targetDeployment, desktopEndpoints, vpnPods, vpnService] = await Promise.all([
+    const team = annotations["codegate.ai/team"] === "blue"
+      ? "blue"
+      : annotations["codegate.ai/team"] === "red"
+        ? "red"
+        : undefined;
+    const [workstationVmi, targetDeployment, desktopEndpoints, vpnPods, vpnService, elasticsearchDeployment, kibanaDeployment] = await Promise.all([
       this.getJson(`/apis/kubevirt.io/v1/namespaces/${encodedNamespace}/virtualmachineinstances/workstation`),
       this.getJson(`/apis/apps/v1/namespaces/${encodedNamespace}/deployments/target`),
       browserRequired
@@ -82,17 +87,35 @@ export class KubernetesHttpApplier implements KubernetesApplier {
       vpnRequired
         ? this.getJson(`/api/v1/namespaces/${encodedNamespace}/services/openvpn-gateway`)
         : Promise.resolve(null),
+      team === "blue"
+        ? this.getJson(`/apis/apps/v1/namespaces/${encodedNamespace}/deployments/elasticsearch`)
+        : Promise.resolve(null),
+      team === "blue"
+        ? this.getJson(`/apis/apps/v1/namespaces/${encodedNamespace}/deployments/kibana`)
+        : Promise.resolve(null),
     ]);
+
+    const targetReady = deploymentAvailable(targetDeployment);
 
     const checks = {
       workstationVmi: vmiReady(workstationVmi),
-      targetWorkload: deploymentAvailable(targetDeployment),
+      targetWorkload: targetReady,
       ...(browserRequired ? { desktopEndpoints: endpointsReady(desktopEndpoints) } : {}),
       ...(vpnRequired ? { vpnPod: podListReady(vpnPods), vpnService: loadBalancerReady(vpnService) } : {}),
+      ...(team === "blue" ? {
+        elasticsearch: deploymentAvailable(elasticsearchDeployment),
+        kibana: deploymentAvailable(kibanaDeployment),
+        // Agent and generator are hardened sidecars in the monitored target;
+        // Deployment availability requires all sidecar readiness probes.
+        telemetryAgent: targetReady,
+        scenarioLogs: targetReady,
+      } : {}),
     };
     const failureReason = firstFailureReason([
       namedVmiFailure("workstation", workstationVmi),
       deploymentFailure("target", targetDeployment),
+      team === "blue" ? deploymentFailure("elasticsearch", elasticsearchDeployment) : undefined,
+      team === "blue" ? deploymentFailure("kibana", kibanaDeployment) : undefined,
       vpnRequired ? podListFailure(vpnPods) : undefined,
     ]);
     return { expiresAt, readinessDeadline, checks, ...(failureReason ? { failureReason } : {}) };

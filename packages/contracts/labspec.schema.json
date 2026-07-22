@@ -32,6 +32,150 @@
         "egress": { "const": "deny" },
         "isolation": { "const": "per_run" }
       }
+    },
+    "topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "team", "isolation", "workstation", "target"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "team": { "enum": ["blue", "red"] },
+        "isolation": { "const": "per_run" },
+        "workstation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "desktopImage", "entrypoint"],
+          "properties": {
+            "role": { "enum": ["soc_analyst", "attack_operator"] },
+            "desktopImage": { "enum": ["ubuntu", "kali"] },
+            "entrypoint": { "enum": ["kibana", "target"] }
+          }
+        },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["role", "hostname"],
+          "properties": {
+            "role": { "enum": ["monitored_target", "vulnerable_target"] },
+            "hostname": { "const": "target" },
+            "exercise": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["schemaVersion", "profile", "scenarioId", "title", "summary", "expectedCves", "service", "verification", "attackTechniqueIds", "simulationMode"],
+              "properties": {
+                "schemaVersion": { "const": 1 },
+                "profile": { "enum": ["command_injection", "path_traversal", "sql_injection", "auth_bypass", "sensitive_data_exposure"] },
+                "scenarioId": { "type": "string", "pattern": "^red-[a-f0-9]{16}$" },
+                "title": { "type": "string", "minLength": 1, "maxLength": 120 },
+                "summary": { "type": "string", "minLength": 1, "maxLength": 500 },
+                "expectedCves": {
+                  "type": "array",
+                  "maxItems": 20,
+                  "uniqueItems": true,
+                  "items": { "type": "string", "pattern": "^CVE-[0-9]{4}-[0-9]{4,7}$" }
+                },
+                "service": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["scheme", "host", "port", "baseUrl"],
+                  "properties": {
+                    "scheme": { "const": "http" },
+                    "host": { "const": "target" },
+                    "port": { "const": 8080 },
+                    "baseUrl": { "const": "http://target:8080" }
+                  }
+                },
+                "verification": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["method", "path", "successMarker"],
+                  "properties": {
+                    "method": { "const": "GET" },
+                    "path": { "type": "string", "pattern": "^/[A-Za-z0-9._~!$&'()*+,;=:@%/?-]{1,499}$" },
+                    "successMarker": { "type": "string", "pattern": "^ZEROTOP_[A-Z_]+_CONFIRMED$" }
+                  }
+                },
+                "attackTechniqueIds": {
+                  "type": "array",
+                  "maxItems": 20,
+                  "uniqueItems": true,
+                  "items": { "type": "string", "pattern": "^T[0-9]{4}(?:\\.[0-9]{3})?$" }
+                },
+                "simulationMode": { "const": "bounded_behavioral" }
+              }
+            }
+          }
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stack", "collector", "generator", "index", "events"],
+          "properties": {
+            "stack": { "const": "elastic" },
+            "collector": { "const": "elastic_agent" },
+            "generator": { "const": "scenario_log_generator" },
+            "index": { "type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,126}-\\*$" },
+            "generation": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["schemaVersion", "profile", "totalEvents", "timeRangeMinutes", "seed", "timelineAnchor"],
+              "properties": {
+                "schemaVersion": { "const": 1 },
+                "profile": { "enum": ["powershell_rce_exfiltration", "credential_abuse", "ransomware", "webshell", "generic_intrusion", "generic_endpoint_activity"] },
+                "totalEvents": { "type": "integer", "minimum": 100, "maximum": 5000 },
+                "timeRangeMinutes": { "type": "integer", "minimum": 15, "maximum": 240 },
+                "seed": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+                "timelineAnchor": { "type": "string", "format": "date-time" }
+              }
+            },
+            "events": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 100,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "document"],
+                "properties": {
+                  "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+                  "document": { "type": "object" }
+                }
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "team": { "const": "blue" } } },
+          "then": {
+            "required": ["telemetry"],
+            "properties": {
+              "workstation": {
+                "properties": {
+                  "role": { "const": "soc_analyst" },
+                  "desktopImage": { "const": "ubuntu" },
+                  "entrypoint": { "const": "kibana" }
+                }
+              },
+              "target": { "properties": { "role": { "const": "monitored_target" } } }
+            }
+          },
+          "else": {
+            "not": { "required": ["telemetry"] },
+            "properties": {
+              "workstation": {
+                "properties": {
+                  "role": { "const": "attack_operator" },
+                  "desktopImage": { "const": "kali" },
+                  "entrypoint": { "const": "target" }
+                }
+              },
+              "target": { "properties": { "role": { "const": "vulnerable_target" } } }
+            }
+          }
+        }
+      ]
     }
   }
 }

@@ -40,7 +40,7 @@ spec:
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
-  name: model-gateway-openai-egress
+  name: model-gateway-provider-egress
 spec:
   endpointSelector:
     matchLabels:
@@ -56,9 +56,9 @@ spec:
               protocol: ANY
           rules:
             dns:
-              - matchName: api.openai.com
+              - matchName: api.anthropic.com
     - toFQDNs:
-        - matchName: api.openai.com
+        - matchName: api.anthropic.com
       toPorts:
         - ports:
             - port: "443"

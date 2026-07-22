@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { ApiError } from "./errors.ts";
 import {
   ACCESS_METHODS,
@@ -11,6 +13,11 @@ import {
   type RegistrationInput,
   type TeamType,
 } from "./types.ts";
+import {
+  buildTrainingContent,
+  KOREAN_CONTENT_REVISION,
+} from "./training-content.ts";
+import { buildRedExercise } from "./red-exercise.ts";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -29,57 +36,58 @@ function optionalTrimmedString(value: unknown): string | undefined {
   return trimmed || undefined;
 }
 
-function generatedQuestions(
-  teamType: TeamType,
-  questionTypes: QuestionType[],
-  mitreTechniques: string[],
-): { publicQuestions: JsonObject[]; gradingQuestions: JsonObject[] } {
-  const prompts: Record<QuestionType, string> = {
-    elk_search: "Use the ELK evidence to identify the first suspicious source address.",
-    single_choice: "Select the action that best advances the attack scenario.",
-    multiple_choice: "Select every artifact produced by the simulated attack.",
-    free_text: "Explain the attack path and the evidence supporting your conclusion.",
-    mitre_attack: "Map the observed behavior to the correct MITRE ATT&CK technique.",
-  };
-
-  const gradingQuestions: JsonObject[] = [];
-  const publicQuestions = questionTypes.map((type, index) => {
-    const id = `${teamType}-q${index + 1}`;
-    const points = type === "mitre_attack" ? 20 : 30;
-    const options =
-      type === "single_choice"
-        ? [
-            { id: "option-a", label: "Enumerate the exposed service safely" },
-            { id: "option-b", label: "Disable all audit telemetry" },
-            { id: "option-c", label: "Run an unscoped destructive payload" },
-          ]
-        : type === "multiple_choice"
-          ? [
-              { id: "artifact-a", label: "Process execution event" },
-              { id: "artifact-b", label: "Authentication event" },
-              { id: "artifact-c", label: "Unrelated marketing cookie" },
-            ]
-          : undefined;
-    const answerKey =
-      type === "single_choice"
-        ? { optionIds: ["option-a"] }
-        : type === "multiple_choice"
-          ? { optionIds: ["artifact-a", "artifact-b"] }
-          : type === "mitre_attack"
-            ? { techniqueIds: [mitreTechniques[0]] }
-            : type === "elk_search"
-              ? { expectedEvidenceIds: [`${id}-elk-evidence`] }
-              : { rubricId: `${id}-analysis-rubric-v1` };
-    gradingQuestions.push({ id, type, points, answerKey });
+function generatedRuntimeTopology(
+  team: TeamType,
+  events: JsonObject[],
+  title: string,
+  prompt: string,
+  scenarioProfile: string,
+  cveIds: string[],
+  attackTechniqueIds: string[],
+): JsonObject {
+  if (team === "blue") {
     return {
-      id,
-      type,
-      prompt: prompts[type],
-      points,
-      ...(options ? { options } : {}),
+      schemaVersion: 1,
+      team: "blue",
+      isolation: "per_run",
+      workstation: {
+        role: "soc_analyst",
+        desktopImage: "ubuntu",
+        entrypoint: "kibana",
+      },
+      target: { role: "monitored_target", hostname: "target" },
+      telemetry: {
+        stack: "elastic",
+        collector: "elastic_agent",
+        generator: "scenario_log_generator",
+        index: "zerotop-logs-*",
+        events,
+        generation: {
+          schemaVersion: 1,
+          profile: scenarioProfile,
+          totalEvents: 1_200,
+          timeRangeMinutes: 60,
+          seed: createHash("sha256").update(`${title}\n${prompt}`).digest("hex").slice(0, 32),
+          timelineAnchor: new Date().toISOString(),
+        },
+      },
     };
-  });
-  return { publicQuestions, gradingQuestions };
+  }
+  return {
+    schemaVersion: 1,
+    team: "red",
+    isolation: "per_run",
+    workstation: {
+      role: "attack_operator",
+      desktopImage: "kali",
+      entrypoint: "target",
+    },
+    target: {
+      role: "vulnerable_target",
+      hostname: "target",
+      exercise: buildRedExercise({ title, prompt, cveIds, attackTechniqueIds }),
+    },
+  };
 }
 
 export function normalizeRegistration(value: unknown): RegistrationInput {
@@ -340,7 +348,7 @@ export function normalizeLabGeneration(value: unknown): LabGenerationInput {
     return item.toUpperCase();
   }))];
   const title = optionalTrimmedString(body.title ?? body.name);
-  const prompt = optionalTrimmedString(body.prompt ?? body.description);
+  const suppliedPrompt = optionalTrimmedString(body.prompt ?? body.description);
   if (!title || title.length < 3 || title.length > 120) {
     throw new ApiError(
       400,
@@ -348,18 +356,31 @@ export function normalizeLabGeneration(value: unknown): LabGenerationInput {
       "title is required and must contain 3-120 characters.",
     );
   }
-  if (!prompt || prompt.length < 10 || prompt.length > 5000) {
+  if (suppliedPrompt && (suppliedPrompt.length < 10 || suppliedPrompt.length > 5000)) {
     throw new ApiError(
       400,
       "INVALID_PROMPT",
-      "prompt is required and must contain 10-5000 characters.",
+      "prompt must contain 10-5000 characters when provided.",
     );
   }
-  const generated = generatedQuestions(
-    teamType,
+  if (!suppliedPrompt && cveIds.length === 0) {
+    throw new ApiError(
+      400,
+      "PROMPT_OR_CVE_REQUIRED",
+      "At least one of prompt or cveIds is required.",
+    );
+  }
+  const prompt = suppliedPrompt ??
+    `${cveIds.join(", ")} 취약점의 적용 조건과 영향 범위, 방어 관측 지점을 격리된 환경에서 안전하게 분석합니다.`;
+  const generated = buildTrainingContent({
+    team: teamType,
+    title,
+    prompt,
     questionTypes,
-    rawTechniques as string[],
-  );
+    mitreTechniques: rawTechniques as string[],
+    cveIds,
+  });
+  const blueTelemetryEvents = generated.telemetryEvents;
 
   return {
     title,
@@ -371,36 +392,27 @@ export function normalizeLabGeneration(value: unknown): LabGenerationInput {
     accessModes,
     config: {
       generator: { kind: "local-simulator", version: 1 },
+      contentRevision: KOREAN_CONTENT_REVISION,
+      topology: generatedRuntimeTopology(
+        teamType,
+        blueTelemetryEvents,
+        title,
+        prompt,
+        generated.scenarioProfile,
+        cveIds,
+        generated.attackChain.map((item) => item.id),
+      ),
       difficulty,
       scenario: {
         ...scenario,
         objective:
           optionalTrimmedString(body.objective ?? scenario.objective) ?? prompt,
-        mitreTechniques: rawTechniques,
+        summary: generated.scenarioSummary,
+        logSources: generated.logSources,
+        mitreTechniques: generated.attackChain.map((item) => item.id),
+        attackChain: generated.attackChain,
       },
-      learning: {
-        title,
-        summary: "격리된 실습 환경에서 공격 조건, 관찰 증거와 완화 절차를 순서대로 학습합니다.",
-        prerequisites: ["TCP/IP 기초", "Linux 명령행 기초"],
-        objectives: [
-          "대상 서비스의 공격 표면과 취약 조건을 식별합니다.",
-          "관찰한 증거를 MITRE ATT&CK 기법에 연결합니다.",
-          "탐지 및 완화 방안을 근거와 함께 설명합니다.",
-        ],
-        sections: [
-          {
-            id: "scenario-context",
-            title: "위협 시나리오와 영향 범위",
-            bodyMarkdown: `## ${title}\n\n${prompt}\n\n외부 시스템이 아닌 제공된 격리 대상만 분석합니다.`,
-          },
-          {
-            id: "investigation-workflow",
-            title: "분석 및 검증 절차",
-            bodyMarkdown:
-              "서비스 노출 조건을 확인하고, 실행·인증·네트워크 증거를 시간순으로 정리한 뒤 ATT&CK 기법, 탐지 지점과 완화 조치를 함께 기록합니다.",
-          },
-        ],
-      },
+      learning: generated.learning,
       telemetry: {
         ...suppliedTelemetry,
         elkEnabled:
@@ -408,29 +420,8 @@ export function normalizeLabGeneration(value: unknown): LabGenerationInput {
             ? teamType === "blue"
             : suppliedTelemetry.elkEnabled,
         indexPattern:
-          optionalTrimmedString(suppliedTelemetry.indexPattern) ?? "codegate-logs-*",
-        ...(teamType === "blue"
-          ? {
-              events: [
-                {
-                  id: "blue-q1-elk-evidence",
-                  document: {
-                    "@timestamp": new Date().toISOString(),
-                    message:
-                      "suspicious PowerShell process execution after anomalous authentication",
-                    event: {
-                      id: "blue-q1-elk-evidence",
-                      category: "process",
-                      dataset: "codegate.endpoint",
-                    },
-                    source: { ip: "192.0.2.44" },
-                    process: { name: "powershell.exe" },
-                    threat: { technique: { id: [String(rawTechniques[0])] } },
-                  },
-                },
-              ],
-            }
-          : {}),
+          optionalTrimmedString(suppliedTelemetry.indexPattern) ?? "zerotop-logs-*",
+        ...(teamType === "blue" ? { events: blueTelemetryEvents } : {}),
       },
       safety: {
         ...suppliedSafety,

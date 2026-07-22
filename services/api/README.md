@@ -63,8 +63,8 @@ Required values depend on enabled adapters:
   `{ "data": { "evidence": [...] } }` containing validated ELK/AI-rubric
   evidence. The bundled grader listens on port `9002` by default.
 - Access gateways: `DESKTOP_GATEWAY_PUBLIC_URL`,
-  `DESKTOP_GATEWAY_INTERNAL_TOKEN`, `OPENVPN_DOWNLOAD_PUBLIC_URL`, and
-  `OPENVPN_DOWNLOAD_INTERNAL_TOKEN`.
+  `DESKTOP_GATEWAY_INTERNAL_TOKEN`, `DESKTOP_TICKET_TTL_SECONDS`,
+  `OPENVPN_DOWNLOAD_PUBLIC_URL`, and `OPENVPN_DOWNLOAD_INTERNAL_TOKEN`.
 - Browser access: `ALLOWED_ORIGINS`.
 
 A runtime target is accepted only when the server-side Lab config contains an
@@ -146,6 +146,9 @@ evidence fetched by the API; client-supplied evidence is rejected. The trusted
 evidence and final grade are stored with the result. Score events are append-only
 at the database layer.
 
-Desktop and OpenVPN tickets are opaque, expire after 60 seconds, are stored only
-as SHA-256 hashes and are consumed atomically once by an authenticated internal
-gateway. Every mutation and sensitive administrative/report access is audited.
+Desktop and OpenVPN tickets are opaque, stored only as SHA-256 hashes and
+consumed atomically once by an authenticated internal gateway. Desktop tickets
+expire after 5 minutes by default (`DESKTOP_TICKET_TTL_SECONDS`, bounded to
+60-900 seconds); OpenVPN tickets expire after 60 seconds. The desktop gateway
+turns a consumed ticket into a signed HttpOnly cookie bounded by the run expiry.
+Every mutation and sensitive administrative/report access is audited.

@@ -13,6 +13,10 @@
     "build": "pnpm -r --if-present build",
     "test": "pnpm -r --if-present test && pnpm test:ai",
     "test:ai": "python -m unittest discover -s services/ai/tests -p \"test_*.py\"",
-    "check": "pnpm -r --if-present check"
+    "check": "pnpm -r --if-present check",
+    "claude:init": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/init-claude-config.ps1",
+    "claude:check": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/check-claude-config.ps1",
+    "claude:start": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/start-claude-ai.ps1",
+    "claude:desktop": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/start-desktop-claude.ps1"
   }
 }

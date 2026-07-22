@@ -11,6 +11,9 @@
     "check": "tsc --noEmit",
     "test": "node --test test/*.test.ts"
   },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.112.5"
+  },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"

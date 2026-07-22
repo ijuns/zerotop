@@ -6,6 +6,7 @@ import type {
   GeneratedQuestion,
   HiddenGradingRef,
   HttpProbe,
+  LabRuntimeTopology,
   LearningSection,
   PackageSelection,
   PublicArtifact,
@@ -40,7 +41,7 @@ export function parseCreateBuildInput(value: unknown): CreateBuildInput {
 }
 
 export function parseEnvironmentBuildSpec(value: unknown): EnvironmentBuildSpec {
-  const root = strictObject(value, "spec", ["schemaVersion", "team", "source", "scenario", "target", "telemetry", "learning", "questions", "grading"], ["telemetry"]);
+  const root = strictObject(value, "spec", ["schemaVersion", "team", "source", "scenario", "target", "telemetry", "topology", "learning", "questions", "grading"], ["telemetry", "topology"]);
   if (root.schemaVersion !== 1) invalid("spec.schemaVersion must equal 1");
   const team = oneOf(root.team, "spec.team", ["blue", "red"] as const);
   const source = strictObject(root.source, "spec.source", ["promptDigest", "cveIds"]);
@@ -75,6 +76,9 @@ export function parseEnvironmentBuildSpec(value: unknown): EnvironmentBuildSpec 
       invalid("Telemetry fixture ATT&CK techniques must be present in spec.scenario.mitreTechniques");
     }
   }
+  const topology = root.topology === undefined
+    ? undefined
+    : parseRuntimeTopology(root.topology, team, telemetry?.events ?? []);
 
   const learningObject = strictObject(root.learning, "spec.learning", ["title", "summary", "sections"]);
   const learning = {
@@ -113,9 +117,100 @@ export function parseEnvironmentBuildSpec(value: unknown): EnvironmentBuildSpec 
     scenario,
     target,
     ...(telemetry ? { telemetry } : {}),
+    ...(topology ? { topology } : {}),
     learning,
     questions,
     grading: { hiddenRefs },
+  };
+}
+
+function parseRuntimeTopology(
+  value: unknown,
+  team: "blue" | "red",
+  telemetryEvents: TelemetryEvent[],
+): LabRuntimeTopology {
+  const root = strictObject(value, "spec.topology", ["schemaVersion", "team", "isolation", "workstation", "target", "telemetry"], ["telemetry"]);
+  if (root.schemaVersion !== 1 || root.team !== team || root.isolation !== "per_run") {
+    invalid("spec.topology must match the build team and use schemaVersion=1/per_run");
+  }
+  const blue = team === "blue";
+  const workstation = strictObject(root.workstation, "spec.topology.workstation", ["role", "desktopImage", "entrypoint"]);
+  const target = strictObject(root.target, "spec.topology.target", ["role", "hostname"]);
+  if (
+    workstation.role !== (blue ? "soc_analyst" : "attack_operator")
+    || workstation.desktopImage !== (blue ? "ubuntu" : "kali")
+    || workstation.entrypoint !== (blue ? "kibana" : "target")
+    || target.role !== (blue ? "monitored_target" : "vulnerable_target")
+    || target.hostname !== "target"
+  ) invalid("spec.topology roles do not match its team");
+  if (!blue) {
+    if (root.telemetry !== undefined) invalid("Red-team topology must not contain telemetry services");
+    return {
+      schemaVersion: 1,
+      team: "red",
+      isolation: "per_run",
+      workstation: { role: "attack_operator", desktopImage: "kali", entrypoint: "target" },
+      target: { role: "vulnerable_target", hostname: "target" },
+    };
+  }
+  const telemetry = strictObject(root.telemetry, "spec.topology.telemetry", ["stack", "collector", "generator", "index", "events", "generation"], ["generation"]);
+  if (
+    telemetry.stack !== "elastic"
+    || telemetry.collector !== "elastic_agent"
+    || telemetry.generator !== "scenario_log_generator"
+  ) invalid("Blue-team topology must use Elastic, Elastic Agent and the scenario log generator");
+  const index = text(telemetry.index, "spec.topology.telemetry.index", 3, 128);
+  if (!/^[a-z0-9][a-z0-9._-]{0,126}-\*$/.test(index)) invalid("spec.topology.telemetry.index is invalid");
+  const events = array(telemetry.events, "spec.topology.telemetry.events", 1, 100).map(parseTelemetryEvent);
+  if (stableStringify(events) !== stableStringify(telemetryEvents)) {
+    invalid("spec.topology telemetry events must match spec.telemetry.events");
+  }
+  const generation = telemetry.generation === undefined
+    ? undefined
+    : parseTelemetryGeneration(telemetry.generation, events.length);
+  return {
+    schemaVersion: 1,
+    team: "blue",
+    isolation: "per_run",
+    workstation: { role: "soc_analyst", desktopImage: "ubuntu", entrypoint: "kibana" },
+    target: { role: "monitored_target", hostname: "target" },
+    telemetry: {
+      stack: "elastic",
+      collector: "elastic_agent",
+      generator: "scenario_log_generator",
+      index,
+      events,
+      ...(generation ? { generation } : {}),
+    },
+  };
+}
+
+function parseTelemetryGeneration(value: unknown, seedEventCount: number) {
+  const root = strictObject(
+    value,
+    "spec.topology.telemetry.generation",
+    ["schemaVersion", "profile", "totalEvents", "timeRangeMinutes", "seed", "timelineAnchor"],
+  );
+  if (root.schemaVersion !== 1) invalid("spec.topology.telemetry.generation.schemaVersion must be 1");
+  const profile = oneOf(
+    root.profile,
+    "spec.topology.telemetry.generation.profile",
+    ["powershell_rce_exfiltration", "credential_abuse", "ransomware", "webshell", "generic_intrusion", "generic_endpoint_activity"] as const,
+  );
+  const totalEvents = integer(root.totalEvents, "spec.topology.telemetry.generation.totalEvents", 100, 5_000);
+  if (totalEvents < seedEventCount) invalid("spec.topology.telemetry.generation.totalEvents must cover every seed event");
+  const timeRangeMinutes = integer(root.timeRangeMinutes, "spec.topology.telemetry.generation.timeRangeMinutes", 15, 240);
+  const seed = text(root.seed, "spec.topology.telemetry.generation.seed", 1, 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(seed)) invalid("spec.topology.telemetry.generation.seed is invalid");
+  const timelineAnchor = text(root.timelineAnchor, "spec.topology.telemetry.generation.timelineAnchor", 20, 40);
+  if (!Number.isFinite(Date.parse(timelineAnchor))) invalid("spec.topology.telemetry.generation.timelineAnchor is invalid");
+  return {
+    schemaVersion: 1 as const,
+    profile,
+    totalEvents,
+    timeRangeMinutes,
+    seed,
+    timelineAnchor: new Date(timelineAnchor).toISOString(),
   };
 }
 

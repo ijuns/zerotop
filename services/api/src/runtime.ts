@@ -9,6 +9,8 @@ import type {
   RuntimeRunStatusInput,
 } from "./types.ts";
 import { parseTargetRuntimeContract, type TargetRuntimeContract } from "./target-runtime-contract.ts";
+import { blueTelemetryGeneration } from "./blue-telemetry.ts";
+import { buildRedExercise } from "./red-exercise.ts";
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -34,6 +36,8 @@ export class DevelopmentRuntimeSimulator implements RuntimeAdapter {
       environment === "ubuntu"
         ? "codegate/ubuntu-soc:development"
         : "codegate/kali-attack:development";
+    const config = isObject(lab.config) ? lab.config : {};
+    const topology = isObject(config.topology) ? config.topology : null;
     const metadata: JsonObject = {
       runtime: "simulator",
       provisioner: "local-runtime-adapter",
@@ -41,6 +45,7 @@ export class DevelopmentRuntimeSimulator implements RuntimeAdapter {
       desktop,
       image,
       isolatedNetwork: true,
+      ...(topology ? { team: topology.team ?? null, topology } : {}),
       note: "Development metadata only; replace this adapter with KubeVirt in production.",
     };
 
@@ -148,6 +153,7 @@ export class HttpRuntimeAdapter implements RuntimeAdapter {
     const targetImage = this.approvedTargetImage(lab);
     const targetRuntimeContract = this.approvedTargetRuntimeContract(lab);
     const targetService = this.approvedTargetService(lab, targetRuntimeContract);
+    const topology = this.approvedRuntimeTopology(lab, desktopImage, new Date().toISOString());
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.serviceUrl}/v1/runs/provision`, {
@@ -167,6 +173,7 @@ export class HttpRuntimeAdapter implements RuntimeAdapter {
           targetImage,
           targetService,
           targetRuntimeContract,
+          ...(topology ? { topology } : {}),
         }),
         signal: AbortSignal.timeout(15_000),
       });
@@ -217,6 +224,7 @@ export class HttpRuntimeAdapter implements RuntimeAdapter {
         namespace: payload.namespace ?? null,
         desktop: desktopImage === "ubuntu" ? "Ubuntu SOC Desktop" : "Kali Attack Box",
         isolatedNetwork: true,
+        ...(topology ? { team: topology.team, topology } : {}),
       },
       createdAt: new Date().toISOString(),
     };
@@ -406,6 +414,183 @@ export class HttpRuntimeAdapter implements RuntimeAdapter {
       "The validated lab has no approved target service port and protocol.",
     );
   }
+
+  private approvedRuntimeTopology(
+    lab: Record<string, unknown>,
+    desktopImage: "ubuntu" | "kali",
+    timelineAnchor: string,
+  ): JsonObject | null {
+    const config = isObject(lab.config) ? lab.config : {};
+    const builderSpec = isObject(config.builderSpec) ? config.builderSpec : {};
+    const candidate = isObject(config.topology)
+      ? config.topology
+      : isObject(builderSpec.topology)
+        ? builderSpec.topology
+        : null;
+    if (!candidate) {
+      return this.legacyRuntimeTopology(lab, config, desktopImage, timelineAnchor);
+    }
+    const team = candidate.team;
+    const workstation = isObject(candidate.workstation) ? candidate.workstation : {};
+    const target = isObject(candidate.target) ? candidate.target : {};
+    const blue = team === "blue";
+    if (
+      (team !== "blue" && team !== "red")
+      || candidate.schemaVersion !== 1
+      || candidate.isolation !== "per_run"
+      || desktopImage !== (blue ? "ubuntu" : "kali")
+      || workstation.role !== (blue ? "soc_analyst" : "attack_operator")
+      || workstation.desktopImage !== desktopImage
+      || workstation.entrypoint !== (blue ? "kibana" : "target")
+      || target.role !== (blue ? "monitored_target" : "vulnerable_target")
+      || target.hostname !== "target"
+    ) {
+      throw new ApiError(409, "LAB_RUNTIME_TOPOLOGY_INVALID", "The validated Lab has an invalid team runtime topology.");
+    }
+    if (!blue) {
+      if (candidate.telemetry !== undefined) {
+        throw new ApiError(409, "LAB_RUNTIME_TOPOLOGY_INVALID", "Red-team topology must not contain a defensive telemetry stack.");
+      }
+      return {
+        ...candidate,
+        target: {
+          ...target,
+          exercise: redExerciseForLab(lab, config),
+        },
+      } as JsonObject;
+    }
+    const telemetry = isObject(candidate.telemetry) ? candidate.telemetry : {};
+    if (
+      telemetry.stack !== "elastic"
+      || telemetry.collector !== "elastic_agent"
+      || telemetry.generator !== "scenario_log_generator"
+      || typeof telemetry.index !== "string"
+      || !Array.isArray(telemetry.events)
+      || telemetry.events.length < 1
+    ) {
+      throw new ApiError(409, "LAB_RUNTIME_TOPOLOGY_INVALID", "Blue-team topology requires ELK, an Elastic Agent and scenario telemetry events.");
+    }
+    let generation: JsonObject;
+    try {
+      generation = blueTelemetryGeneration(lab, config, telemetry.generation, timelineAnchor) as unknown as JsonObject;
+    } catch (error) {
+      throw new ApiError(
+        409,
+        "LAB_RUNTIME_TOPOLOGY_INVALID",
+        error instanceof Error ? error.message : "The Blue-team telemetry generation plan is invalid.",
+      );
+    }
+    return {
+      ...candidate,
+      telemetry: { ...telemetry, generation },
+    } as JsonObject;
+  }
+
+  private legacyRuntimeTopology(
+    lab: Record<string, unknown>,
+    config: Record<string, unknown>,
+    desktopImage: "ubuntu" | "kali",
+    timelineAnchor: string,
+  ): JsonObject {
+    const team = lab.team ?? lab.teamType;
+    if (team !== "blue" && team !== "red") {
+      throw new ApiError(
+        409,
+        "LAB_RUNTIME_TOPOLOGY_INVALID",
+        "The legacy Lab has no valid team for runtime topology migration.",
+      );
+    }
+
+    const expectedDesktop = team === "blue" ? "ubuntu" : "kali";
+    if (desktopImage !== expectedDesktop) {
+      throw new ApiError(
+        409,
+        "LAB_RUNTIME_TOPOLOGY_INVALID",
+        "The legacy Lab team and desktop image do not match.",
+      );
+    }
+
+    if (team === "red") {
+      return {
+        schemaVersion: 1,
+        team: "red",
+        isolation: "per_run",
+        workstation: {
+          role: "attack_operator",
+          desktopImage: "kali",
+          entrypoint: "target",
+        },
+        target: {
+          role: "vulnerable_target",
+          hostname: "target",
+          exercise: redExerciseForLab(lab, config),
+        },
+      };
+    }
+
+    const telemetry = isObject(config.telemetry) ? config.telemetry : {};
+    const events = approvedLegacyTelemetryEvents(telemetry.events);
+    if (!events) {
+      throw new ApiError(
+        409,
+        "LAB_RUNTIME_TOPOLOGY_INVALID",
+        "The legacy Blue-team Lab requires valid scenario telemetry events before it can be deployed.",
+      );
+    }
+    let generation: JsonObject;
+    try {
+      generation = blueTelemetryGeneration(lab, config, telemetry.generation, timelineAnchor) as unknown as JsonObject;
+    } catch (error) {
+      throw new ApiError(
+        409,
+        "LAB_RUNTIME_TOPOLOGY_INVALID",
+        error instanceof Error ? error.message : "The legacy Blue-team telemetry generation plan is invalid.",
+      );
+    }
+    return {
+      schemaVersion: 1,
+      team: "blue",
+      isolation: "per_run",
+      workstation: {
+        role: "soc_analyst",
+        desktopImage: "ubuntu",
+        entrypoint: "kibana",
+      },
+      target: { role: "monitored_target", hostname: "target" },
+      telemetry: {
+        stack: "elastic",
+        collector: "elastic_agent",
+        generator: "scenario_log_generator",
+        index: "zerotop-logs-*",
+        events,
+        generation,
+      },
+    };
+  }
+}
+
+function redExerciseForLab(
+  lab: Record<string, unknown>,
+  config: Record<string, unknown>,
+): JsonObject {
+  const target = isObject(config.target) ? config.target : {};
+  const scenario = isObject(config.scenario) ? config.scenario : {};
+  const cveCandidates = [
+    ...(Array.isArray(lab.cveIds) ? lab.cveIds : []),
+    ...(Array.isArray(target.expectedCves) ? target.expectedCves : []),
+  ];
+  const attackCandidates = [
+    ...(Array.isArray(scenario.mitreTechniques) ? scenario.mitreTechniques : []),
+    ...(Array.isArray(scenario.attackChain)
+      ? scenario.attackChain.map((item) => isObject(item) ? item.id : null)
+      : []),
+  ];
+  return buildRedExercise({
+    title: typeof lab.title === "string" ? lab.title : "Red Team Lab",
+    prompt: typeof lab.prompt === "string" ? lab.prompt : "격리된 대상의 취약 조건을 검증합니다.",
+    cveIds: cveCandidates.filter((item): item is string => typeof item === "string"),
+    attackTechniqueIds: attackCandidates.filter((item): item is string => typeof item === "string"),
+  });
 }
 
 function developmentTargetRuntimeContract(): TargetRuntimeContract {
@@ -425,6 +610,45 @@ function developmentTargetRuntimeContract(): TargetRuntimeContract {
 
 function isBooleanRecord(value: unknown): value is JsonObject {
   return isObject(value) && Object.values(value).every((item) => typeof item === "boolean");
+}
+
+function approvedLegacyTelemetryEvents(value: unknown): unknown[] | null {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 100) return null;
+  try {
+    for (const item of value) {
+      if (!isObject(item) || typeof item.id !== "string" || !isObject(item.document)) {
+        return null;
+      }
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(item.id)) return null;
+      if (
+        typeof item.document["@timestamp"] !== "string"
+        || !isObject(item.document.event)
+        || !isObject(item.document.threat)
+        || containsAnswerMaterial(item.document)
+      ) {
+        return null;
+      }
+      const documentSize = Buffer.byteLength(JSON.stringify(item.document), "utf8");
+      if (documentSize > 32_000) return null;
+    }
+    const encodedSize = Buffer.byteLength(JSON.stringify(value), "utf8");
+    return encodedSize <= 256_000 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function containsAnswerMaterial(value: unknown, depth = 0): boolean {
+  if (depth > 12) return true;
+  if (Array.isArray(value)) {
+    return value.some((item) => containsAnswerMaterial(item, depth + 1));
+  }
+  if (!isObject(value)) return false;
+  return Object.entries(value).some(
+    ([key, item]) =>
+      /^(?:answer|answerkey|correct(?:answer|option|options?)?|solution|flag)$/i.test(key)
+      || containsAnswerMaterial(item, depth + 1),
+  );
 }
 
 function parseTargetService(

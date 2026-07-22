@@ -50,6 +50,11 @@ import {
   type TelemetryGateway,
 } from "./telemetry.ts";
 import {
+  blueTelemetryGeneration,
+  expandBlueTelemetryEvents,
+  type BlueTelemetryGeneration,
+} from "./blue-telemetry.ts";
+import {
   DevelopmentEnvironmentBuilder,
   HttpEnvironmentBuilder,
   type EnvironmentBuildOperation,
@@ -111,6 +116,7 @@ interface ApplicationOptions {
   allowedOrigins?: string[];
   desktopGatewayInternalToken?: string;
   desktopGatewayPublicUrl?: string;
+  desktopTicketTtlSeconds?: number;
   openVpnDownloadInternalToken?: string;
   openVpnDownloadPublicUrl?: string;
   /** Expiry sweep period in ms. 0 disables the timer (tests drive it manually). */
@@ -134,6 +140,7 @@ interface HandlerContext {
   sessionSecret: string;
   desktopGatewayInternalToken: string;
   desktopGatewayPublicUrl: string;
+  desktopTicketTtlSeconds: number;
   openVpnDownloadInternalToken: string;
   openVpnDownloadPublicUrl: string;
   trustProxyHeaders: boolean;
@@ -177,17 +184,32 @@ async function refreshRuntimeRun(
   return updated;
 }
 
-function telemetryEvents(lab: unknown): TelemetryEventInput[] {
+function telemetryEvents(lab: unknown, runtimeMetadata?: unknown): TelemetryEventInput[] {
   const config = field(lab, "config");
   const validation = field(config, "validation");
   const telemetry = field(validation, "telemetry") ?? field(config, "telemetry");
   const events = field(telemetry, "events");
   if (!Array.isArray(events)) return [];
-  return events.flatMap((item) => {
+  const seeds = events.flatMap((item): TelemetryEventInput[] => {
     if (!isObject(item) || typeof item.id !== "string" || !isObject(item.document)) return [];
     if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(item.id)) return [];
     return [{ id: item.id, document: item.document }];
   });
+  if (seeds.length === 0 || (field(lab, "teamType") !== "blue" && field(lab, "team") !== "blue")) {
+    return seeds;
+  }
+  const runtimeTopology = field(runtimeMetadata, "topology");
+  const runtimeTelemetry = field(runtimeTopology, "telemetry");
+  const runtimeGeneration = field(runtimeTelemetry, "generation");
+  const generation = isObject(runtimeGeneration)
+    ? runtimeGeneration as unknown as BlueTelemetryGeneration
+    : blueTelemetryGeneration(
+        isObject(lab) ? lab : {},
+        isObject(config) ? config : {},
+        field(telemetry, "generation"),
+        new Date().toISOString(),
+      );
+  return expandBlueTelemetryEvents(seeds, generation);
 }
 
 function labBuilder(lab: unknown): JsonRecord | null {
@@ -204,6 +226,36 @@ function buildState(operation: EnvironmentBuildOperation): JsonRecord {
     updatedAt: operation.updatedAt ?? null,
     failureCode: operation.failureCode ?? null,
   };
+}
+
+function canonicalLearning(value: unknown): JsonRecord | null {
+  if (!isObject(value)) return null;
+  const sections = Array.isArray(value.sections)
+    ? value.sections.map((section) => {
+        if (!isObject(section)) return section;
+        const bodyMarkdown = typeof section.bodyMarkdown === "string"
+          ? section.bodyMarkdown
+          : typeof section.markdown === "string"
+            ? section.markdown
+            : null;
+        return bodyMarkdown === null ? section : { ...section, bodyMarkdown };
+      })
+    : undefined;
+  return {
+    ...value,
+    ...(sections ? { sections } : {}),
+  };
+}
+
+function mergedLearning(current: unknown, built: unknown): JsonRecord | null {
+  const currentLearning = canonicalLearning(current);
+  const builtLearning = canonicalLearning(built);
+  if (!currentLearning) return builtLearning;
+  if (!builtLearning) return currentLearning;
+  // The builder payload is an executable projection and intentionally omits
+  // learner-only fields such as objectives and prerequisites. The validated
+  // AI curriculum remains authoritative for learner-visible content.
+  return { ...builtLearning, ...currentLearning };
 }
 
 function successfulBuildPatch(lab: unknown, operation: EnvironmentBuildOperation): JsonRecord {
@@ -231,6 +283,17 @@ function successfulBuildPatch(lab: unknown, operation: EnvironmentBuildOperation
         vulnerabilityProbes: Array.isArray(target.vulnerabilityProbes) ? target.vulnerabilityProbes : [],
         ...(isObject(consumable.telemetry) ? { telemetry: consumable.telemetry } : {}),
       };
+  const learning = mergedLearning(config.learning, consumable.learning);
+  const builtScenario = isObject(consumable.scenario) ? consumable.scenario : null;
+  const currentScenario = isObject(config.scenario) ? config.scenario : null;
+  const scenario = builtScenario && currentScenario
+    ? { ...builtScenario, ...currentScenario }
+    : currentScenario ?? builtScenario;
+  const questions = Array.isArray(config.questions) && config.questions.length > 0
+    ? config.questions
+    : Array.isArray(consumable.questions)
+      ? consumable.questions
+      : null;
   return {
     builder: buildState(operation),
     target: {
@@ -247,9 +310,10 @@ function successfulBuildPatch(lab: unknown, operation: EnvironmentBuildOperation
       source: "ai_environment_builder",
     },
     validation,
-    ...(isObject(consumable.learning) ? { learning: consumable.learning } : {}),
-    ...(Array.isArray(consumable.questions) ? { questions: consumable.questions } : {}),
-    ...(isObject(consumable.scenario) ? { scenario: consumable.scenario } : {}),
+    ...(learning ? { learning } : {}),
+    ...(questions ? { questions } : {}),
+    ...(scenario ? { scenario } : {}),
+    ...(isObject(consumable.topology) ? { topology: consumable.topology } : {}),
     buildProvenance: operation.buildProvenance ?? {},
   };
 }
@@ -2688,7 +2752,7 @@ async function route(
     }
 
     const runInput = await context.runtime.createRun(lab, actor.id, accessMethod);
-    const events = telemetryEvents(lab);
+    const events = telemetryEvents(lab, runInput.metadata);
     if (field(lab, "teamType") === "blue" || field(lab, "team") === "blue") {
       if (events.length === 0 && context.authMode !== "dev") {
         await Promise.resolve(context.runtime.destroyRun(runInput.id)).catch(() => undefined);
@@ -2762,7 +2826,7 @@ async function route(
     }
     const ticket = randomBytes(32).toString("base64url");
     const createdAt = new Date();
-    const expiresAt = new Date(createdAt.getTime() + 60_000);
+    const expiresAt = new Date(createdAt.getTime() + context.desktopTicketTtlSeconds * 1_000);
     await context.repository.createAccessTicket({
       ticketHash: opaqueTicketHash(ticket),
       runId,
@@ -3133,6 +3197,7 @@ export function createApplication(options: ApplicationOptions = {}) {
             process.env.AI_INTERNAL_TOKEN ??
             (devInfra ? "ai-service-dev-token" : ""),
           generationTimeoutMs: aiGenerationTimeoutFromEnvironment(),
+          exposeDebugErrors: authMode === "dev",
         }));
   const configuredEvidenceGraderMode =
     options.evidenceGraderMode ??
@@ -3258,7 +3323,7 @@ export function createApplication(options: ApplicationOptions = {}) {
   const environmentBuilder =
     options.environmentBuilder ??
     (configuredEnvironmentBuilderMode === "development"
-      ? new DevelopmentEnvironmentBuilder()
+      ? new DevelopmentEnvironmentBuilder({ targetImage: process.env.RUNTIME_TARGET_IMAGE })
       : new HttpEnvironmentBuilder({
           url: process.env.BUILDER_SERVICE_URL ?? "http://codegate-builder:9004",
           token: process.env.BUILDER_INTERNAL_TOKEN ?? (devInfra ? "builder-service-dev-token" : ""),
@@ -3282,6 +3347,12 @@ export function createApplication(options: ApplicationOptions = {}) {
     process.env.DESKTOP_GATEWAY_PUBLIC_URL ??
     (devInfra ? "http://localhost:9001" : "https://desktop.codegate.invalid")
   ).replace(/\/$/, "");
+  const desktopTicketTtlSeconds = boundedInteger(
+    options.desktopTicketTtlSeconds ?? process.env.DESKTOP_TICKET_TTL_SECONDS ?? 300,
+    "DESKTOP_TICKET_TTL_SECONDS",
+    60,
+    900,
+  );
   const openVpnDownloadInternalToken =
     options.openVpnDownloadInternalToken ??
     process.env.OPENVPN_DOWNLOAD_INTERNAL_TOKEN ??
@@ -3317,6 +3388,7 @@ export function createApplication(options: ApplicationOptions = {}) {
     sessionSecret,
     desktopGatewayInternalToken,
     desktopGatewayPublicUrl,
+    desktopTicketTtlSeconds,
     openVpnDownloadInternalToken,
     openVpnDownloadPublicUrl,
     trustProxyHeaders,
@@ -3461,6 +3533,18 @@ function productionPublicUrl(value: string, name: string): void {
   if (parsed.protocol !== "https:" || !parsed.hostname || parsed.username || parsed.password || parsed.search || parsed.hash || placeholderHostname(parsed.hostname)) {
     throw new RepositoryError("PRODUCTION_PUBLIC_URL_INVALID", `${name} must be a non-placeholder HTTPS URL without credentials, query, or fragment.`, 500);
   }
+}
+
+function boundedInteger(value: number | string, name: string, minimum: number, maximum: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new RepositoryError(
+      "INVALID_CONFIGURATION",
+      `${name} must be an integer between ${minimum} and ${maximum}.`,
+      500,
+    );
+  }
+  return parsed;
 }
 
 function placeholderHostname(hostname: string): boolean {

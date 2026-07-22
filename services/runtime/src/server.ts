@@ -76,9 +76,15 @@ async function createComponents(): Promise<{ adapter: RuntimeAdapter; sandboxVal
     return {
       adapter: new DockerRuntimeAdapter({
         network: process.env.LOCAL_DESKTOP_NETWORK ?? "codegate-local-desktops",
+        gatewayContainer: process.env.LOCAL_DESKTOP_GATEWAY_CONTAINER ?? "codegate-local-desktop-gateway",
         ubuntuDesktopImage: process.env.LOCAL_UBUNTU_DESKTOP_IMAGE ?? "lscr.io/linuxserver/webtop:ubuntu-xfce",
         kaliDesktopImage: process.env.LOCAL_KALI_DESKTOP_IMAGE ?? "lscr.io/linuxserver/kali-linux:latest",
         localTargetImage: process.env.LOCAL_TARGET_IMAGE ?? "codegate/local-target:development",
+        localTargetSourceImage: process.env.LOCAL_TARGET_SOURCE_IMAGE ?? `local.codegate.invalid/codegate/local-target@sha256:${"0".repeat(64)}`,
+        elasticsearchImage: process.env.LOCAL_ELASTICSEARCH_IMAGE ?? "docker.elastic.co/elasticsearch/elasticsearch:8.17.0",
+        kibanaImage: process.env.LOCAL_KIBANA_IMAGE ?? "docker.elastic.co/kibana/kibana:8.17.0",
+        elasticAgentImage: process.env.LOCAL_ELASTIC_AGENT_IMAGE ?? "codegate/elastic-agent:development",
+        scenarioLogGeneratorImage: process.env.LOCAL_SCENARIO_LOG_GENERATOR_IMAGE ?? "codegate/scenario-log-generator:development",
         desktopMemory: process.env.LOCAL_DESKTOP_MEMORY ?? "4g",
         desktopCpus: numberEnv("LOCAL_DESKTOP_CPUS", 2, 0.1, 64),
         desktopPidsLimit: integerEnv("LOCAL_DESKTOP_PIDS_LIMIT", 1024, 64, 32768),
@@ -99,6 +105,10 @@ async function createComponents(): Promise<{ adapter: RuntimeAdapter; sandboxVal
     {
       ubuntuDesktop: requiredEnv("UBUNTU_DESKTOP_IMAGE"),
       kaliDesktop: requiredEnv("KALI_DESKTOP_IMAGE"),
+      elasticsearch: requiredEnv("RANGE_ELASTICSEARCH_IMAGE"),
+      kibana: requiredEnv("RANGE_KIBANA_IMAGE"),
+      elasticAgent: requiredEnv("RANGE_ELASTIC_AGENT_IMAGE"),
+      scenarioLogGenerator: requiredEnv("RANGE_SCENARIO_LOG_GENERATOR_IMAGE"),
     },
     {
       image: requiredEnv("OPENVPN_GATEWAY_IMAGE"),

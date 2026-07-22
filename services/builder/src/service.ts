@@ -328,6 +328,7 @@ function makeConsumable(record: BuildRecord, imageRef: string, imageDigest: stri
     validation,
     scenario: record.spec.scenario,
     ...(record.spec.telemetry ? { telemetry: record.spec.telemetry } : {}),
+    ...(record.spec.topology ? { topology: record.spec.topology } : {}),
     learning: record.spec.learning,
     questions: record.spec.questions,
     grading: record.spec.grading,

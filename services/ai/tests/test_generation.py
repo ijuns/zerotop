@@ -1,11 +1,13 @@
 import asyncio
 import copy
+import io
 import json
 import os
 import sys
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from urllib.error import HTTPError
 
 SERVICE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVICE_ROOT))
@@ -32,6 +34,8 @@ REQUEST = {
 TARGET_IMAGE = "registry.example.test/codegate/http-target-base@sha256:" + ("b" * 64)
 OTHER_TARGET_IMAGE = "registry.example.test/codegate/other-target@sha256:" + ("c" * 64)
 OUTPUT_REPOSITORY = "registry.example.test/codegate/generated-targets"
+LOCAL_TARGET_IMAGE = "codegate/local-target@sha256:" + ("f" * 64)
+LOCAL_OUTPUT_REPOSITORY = "codegate/local-target"
 PROVIDER_TOKEN = "provider-token-not-for-model-input"
 INTERNAL_TOKEN = "internal-service-token-not-for-model-input"
 PACKAGE_IMAGE = "registry.example.test/codegate/catalog/nginx@sha256:" + ("d" * 64)
@@ -76,6 +80,85 @@ CURATED_EXTERNAL_ENV = {
 
 
 class GenerationBoundaryTests(unittest.TestCase):
+    def test_provider_timeout_is_bounded_and_defaults_above_gateway_budget(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                generation_module._generation_provider_timeout_seconds(), 1230
+            )
+        with patch.dict(
+            os.environ, {"GENERATION_PROVIDER_TIMEOUT_SECONDS": "1800"}, clear=True
+        ):
+            self.assertEqual(
+                generation_module._generation_provider_timeout_seconds(), 1800
+            )
+        for invalid in ("9", "1801", "1230.5", "unlimited"):
+            with self.subTest(invalid=invalid):
+                with patch.dict(
+                    os.environ,
+                    {"GENERATION_PROVIDER_TIMEOUT_SECONDS": invalid},
+                    clear=True,
+                ):
+                    with self.assertRaises(GenerationError):
+                        generation_module._generation_provider_timeout_seconds()
+
+    def test_gateway_error_metadata_is_allowlisted_and_secrets_are_redacted(self) -> None:
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "model_provider_timeout",
+                    "message": "Anthropic exceeded timeout sk-ant-secret-value",
+                    "details": {
+                        "stage": "anthropic",
+                        "timeoutMs": 1200000,
+                        "providerStatus": 504,
+                        "providerErrorType": "timeout_error",
+                        "providerRequestId": "req_debug_123",
+                        "providerResponseId": "msg_debug_123",
+                        "providerMessage": "Bearer sensitive-token timed out",
+                        "generationAttempts": 2,
+                        "payloadBytes": 65432,
+                        "payloadDigest": "sha256:abcdef0123456789",
+                        "parseKind": "syntax_error",
+                        "parseOffset": 321,
+                        "rawBody": "must-not-propagate",
+                    },
+                }
+            }
+        ).encode("utf-8")
+        failure = HTTPError(
+            "http://model-gateway:9010/v1/generate",
+            504,
+            "Gateway Timeout",
+            {},
+            io.BytesIO(body),
+        )
+        with patch.dict(
+            os.environ,
+            {"GENERATION_PROVIDER_TIMEOUT_SECONDS": "1230"},
+            clear=True,
+        ):
+            with patch("app.generation.urlopen", side_effect=failure):
+                with self.assertRaises(GenerationError) as raised:
+                    generation_module._post_json(
+                        "http://model-gateway:9010/v1/generate",
+                        PROVIDER_TOKEN,
+                        {"request": {}},
+                    )
+        error = raised.exception
+        self.assertEqual(error.status, 504)
+        self.assertEqual(error.details["upstreamCode"], "model_provider_timeout")
+        self.assertEqual(error.details["providerStage"], "anthropic")
+        self.assertEqual(error.details["providerResponseId"], "msg_debug_123")
+        self.assertEqual(error.details["timeoutMs"], 1200000)
+        self.assertEqual(error.details["generationAttempts"], 2)
+        self.assertEqual(error.details["payloadBytes"], 65432)
+        self.assertEqual(error.details["payloadDigest"], "sha256:abcdef0123456789")
+        self.assertEqual(error.details["parseKind"], "syntax_error")
+        self.assertEqual(error.details["parseOffset"], 321)
+        self.assertNotIn("rawBody", error.details)
+        self.assertNotIn("secret-value", json.dumps(error.details))
+        self.assertNotIn("sensitive-token", json.dumps(error.details))
+
     def test_external_mode_fails_closed_without_credentials(self) -> None:
         with patch.dict(os.environ, {"AI_GENERATION_MODE": "external"}, clear=True):
             with self.assertRaises(GenerationError):
@@ -161,7 +244,15 @@ class GenerationBoundaryTests(unittest.TestCase):
             generated = generate_lab_draft(REQUEST)
             with patch("app.generation._post_json", return_value=generated):
                 result = asyncio.run(generate_lab(REQUEST))
-        self.assertEqual(len(result["learning"]["sections"]), 2)
+        self.assertEqual(len(result["learning"]["sections"]), 6)
+        self.assertEqual(
+            [question["type"] for question in result["questions"]].count("elk_search"),
+            3,
+        )
+        self.assertEqual(
+            [question["type"] for question in result["questions"]].count("mitre_attack"),
+            3,
+        )
         self.assertEqual(
             result["gradingQuestions"][0]["id"], result["questions"][0]["id"]
         )
@@ -426,6 +517,114 @@ class GenerationBoundaryTests(unittest.TestCase):
         provider_input = post_json.call_args.args[2]
         self.assertEqual(provider_input["cveIntel"], [intel])
         self.assertNotIn("NVD_API_KEY", json.dumps(provider_input))
+
+    def test_external_cve_allows_explicit_local_uncurated_simulation(self) -> None:
+        cve_id = "CVE-2026-12345"
+        cve_request = {**REQUEST, "cveIds": [cve_id]}
+        intel = {
+            "id": cve_id,
+            "description": "A server-owned normalized NVD record.",
+            "references": [],
+        }
+        local_env = {
+            **EXTERNAL_ENV,
+            "GENERATION_PROVIDER_URL": "http://model-gateway:9010/v1/generate",
+            "AI_TARGET_BASE_IMAGE": LOCAL_TARGET_IMAGE,
+            "AI_OUTPUT_REPOSITORY": LOCAL_OUTPUT_REPOSITORY,
+            "AI_ALLOW_UNCURATED_CVE_SIMULATION": "true",
+        }
+
+        with patch.dict(os.environ, local_env, clear=True):
+            generated = generate_lab_draft(cve_request)
+            with patch.object(
+                generation_module._generation_nvd_client,
+                "resolve",
+                new=AsyncMock(return_value=intel),
+            ):
+                with patch(
+                    "app.generation._post_json", return_value=generated
+                ) as post_json:
+                    result = asyncio.run(generate_lab(cve_request))
+
+        self.assertEqual(result["environmentBuildSpec"]["source"]["cveIds"], [cve_id])
+        target = result["environmentBuildSpec"]["target"]
+        self.assertEqual(target["packages"], [])
+        self.assertEqual(target["artifacts"], [])
+        provider_input = post_json.call_args.args[2]
+        self.assertEqual(provider_input["cveIntel"], [intel])
+        self.assertTrue(provider_input["policy"]["allowUncuratedCveSimulation"])
+
+    def test_uncurated_cve_simulation_rejects_non_local_build_coordinates(self) -> None:
+        cve_request = {**REQUEST, "cveIds": ["CVE-2026-12345"]}
+        env = {
+            **EXTERNAL_ENV,
+            "AI_ALLOW_UNCURATED_CVE_SIMULATION": "true",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with patch("app.generation._post_json") as post_json:
+                with self.assertRaisesRegex(
+                    GenerationError, "restricted to the local target runtime"
+                ):
+                    asyncio.run(generate_lab(cve_request))
+        post_json.assert_not_called()
+
+    def test_uncurated_cve_simulation_does_not_bypass_catalog_membership(self) -> None:
+        cve_id = "CVE-2026-12345"
+        cve_request = {**REQUEST, "cveIds": [cve_id]}
+        local_env = {
+            **EXTERNAL_ENV,
+            "GENERATION_PROVIDER_URL": "http://model-gateway:9010/v1/generate",
+            "AI_TARGET_BASE_IMAGE": LOCAL_TARGET_IMAGE,
+            "AI_OUTPUT_REPOSITORY": LOCAL_OUTPUT_REPOSITORY,
+            "AI_ALLOW_UNCURATED_CVE_SIMULATION": "true",
+        }
+        generated = generate_lab_draft(cve_request)
+        generated["environmentBuildSpec"]["target"]["packages"] = [
+            {"name": "invented-package", "version": "1.0.0"}
+        ]
+
+        with patch.dict(os.environ, local_env, clear=True):
+            with patch.object(
+                generation_module._generation_nvd_client,
+                "resolve",
+                new=AsyncMock(return_value={"id": cve_id}),
+            ):
+                with patch("app.generation._post_json", return_value=generated):
+                    with self.assertRaisesRegex(
+                        GenerationError, "outside the server build catalog"
+                    ):
+                        asyncio.run(generate_lab(cve_request))
+
+    def test_uncurated_cve_simulation_flag_is_strictly_opt_in(self) -> None:
+        cve_request = {**REQUEST, "cveIds": ["CVE-2026-12345"]}
+        for configured in ("", "false", "0"):
+            with self.subTest(configured=configured):
+                env = {
+                    **EXTERNAL_ENV,
+                    "AI_ALLOW_UNCURATED_CVE_SIMULATION": configured,
+                }
+                with patch.dict(os.environ, env, clear=True):
+                    with patch("app.generation._post_json") as post_json:
+                        with self.assertRaisesRegex(
+                            GenerationError, "non-empty curated"
+                        ):
+                            asyncio.run(generate_lab(cve_request))
+                post_json.assert_not_called()
+
+    def test_uncurated_cve_simulation_rejects_an_invalid_flag_value(self) -> None:
+        cve_request = {**REQUEST, "cveIds": ["CVE-2026-12345"]}
+        env = {
+            **EXTERNAL_ENV,
+            "AI_ALLOW_UNCURATED_CVE_SIMULATION": "yes",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with patch("app.generation._post_json") as post_json:
+                with self.assertRaisesRegex(
+                    GenerationError,
+                    "AI_ALLOW_UNCURATED_CVE_SIMULATION must be true or false",
+                ):
+                    asyncio.run(generate_lab(cve_request))
+        post_json.assert_not_called()
 
     def test_cve_intel_fails_closed_on_mismatched_record(self) -> None:
         cve_id = "CVE-2026-12345"

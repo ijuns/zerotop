@@ -1,4 +1,5 @@
 import { ApiError } from "./errors.ts";
+import { parseTargetRuntimeContract } from "./target-runtime-contract.ts";
 import type { JsonObject } from "./types.ts";
 
 export type EnvironmentBuildStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
@@ -97,20 +98,38 @@ export class HttpEnvironmentBuilder implements EnvironmentBuilder {
 
 export class DevelopmentEnvironmentBuilder implements EnvironmentBuilder {
   private readonly operations = new Map<string, EnvironmentBuildOperation>();
+  private readonly targetImage: { imageRef: string; imageDigest: string } | null;
 
-  async start(input: { labId: string; spec: JsonObject }): Promise<EnvironmentBuildOperation> {
+  constructor(options: { targetImage?: string } = {}) {
+    this.targetImage = options.targetImage
+      ? parseDigestPinnedImage(options.targetImage, "RUNTIME_TARGET_IMAGE")
+      : null;
+  }
+
+  async start(input: {
+    labId: string;
+    labVersion: number;
+    requestedBy: string;
+    spec: JsonObject;
+    idempotencyKey: string;
+  }): Promise<EnvironmentBuildOperation> {
     const id = `dev-build-${input.labId}`;
     const target = object(input.spec.target);
     const outputRepository = typeof target.outputRepository === "string" ? target.outputRepository : "registry.local/codegate/dev-target";
-    const imageDigest = `sha256:${"d".repeat(64)}`;
-    const consumable = object(input.spec.consumable);
+    const imageRef = this.targetImage?.imageRef ?? `${outputRepository}:development`;
+    const imageDigest = this.targetImage?.imageDigest ?? `sha256:${"d".repeat(64)}`;
+    const consumable = developmentConsumable(input.spec, imageRef, imageDigest);
     const operation: EnvironmentBuildOperation = {
       id,
       status: "succeeded",
       createdAt: new Date().toISOString(),
-      imageRef: `${outputRepository}:development`,
+      imageRef,
       imageDigest,
-      buildProvenance: { mode: "development", reproducible: false },
+      buildProvenance: {
+        mode: "development",
+        reproducible: false,
+        canonicalImage: `${imageRef}@${imageDigest}`,
+      },
       consumable,
     };
     this.operations.set(id, operation);
@@ -127,6 +146,112 @@ export class DevelopmentEnvironmentBuilder implements EnvironmentBuilder {
     const operation = this.operations.get(buildId);
     if (operation) this.operations.set(buildId, { ...operation, status: "cancelled", updatedAt: new Date().toISOString() });
   }
+}
+
+function developmentConsumable(
+  spec: JsonObject,
+  imageRef: string,
+  imageDigest: string,
+): JsonObject {
+  const source = requiredObject(spec.source, "spec.source");
+  const target = requiredObject(spec.target, "spec.target");
+  const service = requiredObject(target.service, "spec.target.service");
+  const runtimeContract = parseTargetRuntimeContract(target.runtimeContract);
+  const functionalProbes = requiredArray(target.functionalProbes, "spec.target.functionalProbes");
+  const vulnerabilityProbes = requiredArray(target.vulnerabilityProbes, "spec.target.vulnerabilityProbes");
+  const expectedCves = requiredArray(source.cveIds, "spec.source.cveIds");
+  if (
+    service.port !== runtimeContract?.port
+    || service.protocol !== runtimeContract?.protocol
+    || !expectedCves.every((value) => typeof value === "string" && /^CVE-\d{4}-\d{4,7}$/.test(value))
+  ) {
+    throw new ApiError(
+      422,
+      "DEVELOPMENT_BUILD_SPEC_INVALID",
+      "The development environment build specification has an invalid target contract.",
+    );
+  }
+
+  const validation: JsonObject = {
+    service: cloneJson(service, "spec.target.service") as JsonObject,
+    functionalProbes: cloneJson(functionalProbes, "spec.target.functionalProbes"),
+    vulnerabilityProbes: cloneJson(vulnerabilityProbes, "spec.target.vulnerabilityProbes"),
+    ...(spec.telemetry === undefined
+      ? {}
+      : { telemetry: cloneJson(requiredObject(spec.telemetry, "spec.telemetry"), "spec.telemetry") }),
+  };
+  const safeTarget: JsonObject = {
+    ...copyDefined(target, [
+      "name",
+      "baseImage",
+      "outputRepository",
+      "packages",
+      "artifacts",
+    ]),
+    service: validation.service,
+    runtimeContract,
+    functionalProbes: validation.functionalProbes,
+    vulnerabilityProbes: validation.vulnerabilityProbes,
+    imageRef,
+    imageDigest,
+    canonicalImage: `${imageRef}@${imageDigest}`,
+    expectedCves: cloneJson(expectedCves, "spec.source.cveIds"),
+    validation,
+  };
+  return {
+    target: safeTarget,
+    validation,
+    scenario: cloneJson(requiredObject(spec.scenario, "spec.scenario"), "spec.scenario"),
+    ...(spec.telemetry === undefined ? {} : { telemetry: validation.telemetry }),
+    ...(spec.topology === undefined
+      ? {}
+      : { topology: cloneJson(requiredObject(spec.topology, "spec.topology"), "spec.topology") }),
+    learning: cloneJson(requiredObject(spec.learning, "spec.learning"), "spec.learning"),
+    questions: cloneJson(requiredArray(spec.questions, "spec.questions"), "spec.questions"),
+    grading: cloneJson(requiredObject(spec.grading, "spec.grading"), "spec.grading"),
+  };
+}
+
+function parseDigestPinnedImage(value: string, name: string): { imageRef: string; imageDigest: string } {
+  const normalized = value.trim().toLowerCase();
+  const match = normalized.match(/^([a-z0-9.-]+(?::\d+)?\/[a-z0-9._/-]+(?::[a-z0-9._-]+)?)@(sha256:[a-f0-9]{64})$/);
+  if (!match) throw new Error(`${name} must be a digest-pinned OCI image reference`);
+  return { imageRef: match[1]!, imageDigest: match[2]! };
+}
+
+function requiredObject(value: unknown, name: string): JsonObject {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ApiError(422, "DEVELOPMENT_BUILD_SPEC_INVALID", `${name} must be an object.`);
+  }
+  return value as JsonObject;
+}
+
+function requiredArray(value: unknown, name: string): unknown[] {
+  if (!Array.isArray(value)) {
+    throw new ApiError(422, "DEVELOPMENT_BUILD_SPEC_INVALID", `${name} must be an array.`);
+  }
+  return value;
+}
+
+function copyDefined(source: JsonObject, keys: string[]): JsonObject {
+  return Object.fromEntries(
+    keys
+      .filter((key) => source[key] !== undefined)
+      .map((key) => [key, cloneJson(source[key], `spec.target.${key}`)]),
+  );
+}
+
+function cloneJson(value: unknown, name: string): unknown {
+  let encoded: string | undefined;
+  try {
+    encoded = JSON.stringify(value);
+  } catch {
+    encoded = undefined;
+  }
+  if (!encoded || Buffer.byteLength(encoded, "utf8") > 1_000_000) {
+    throw new ApiError(422, "DEVELOPMENT_BUILD_SPEC_INVALID", `${name} is not bounded JSON.`);
+  }
+  return JSON.parse(encoded) as unknown;
 }
 
 export function parseBuildOperation(value: unknown): EnvironmentBuildOperation {

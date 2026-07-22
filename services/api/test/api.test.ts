@@ -230,8 +230,16 @@ test("blue-team generation enforces ELK plus MITRE and is idempotent", async () 
   const learning = (firstLab.config as Record<string, unknown>)
     .learning as Record<string, unknown>;
   assert.equal(learning.title, request.title);
-  assert.equal((learning.sections as unknown[]).length, 2);
-  assert.equal((learning.objectives as unknown[]).length, 3);
+  assert.equal((learning.sections as unknown[]).length, 6);
+  assert.equal((learning.objectives as unknown[]).length, 4);
+  const topology = (firstLab.config as Record<string, unknown>)
+    .topology as Record<string, unknown>;
+  assert.equal(topology.team, "blue");
+  assert.equal((topology.workstation as Record<string, unknown>).entrypoint, "kibana");
+  assert.equal((topology.target as Record<string, unknown>).role, "monitored_target");
+  const runtimeTelemetry = topology.telemetry as Record<string, unknown>;
+  assert.equal(runtimeTelemetry.collector, "elastic_agent");
+  assert.equal(runtimeTelemetry.generator, "scenario_log_generator");
 
   const replay = await api("/v1/labs/generate", {
     method: "POST",
@@ -312,10 +320,9 @@ test("blue-team generation enforces ELK plus MITRE and is idempotent", async () 
   assert.equal(elkSearch.response.status, 200);
   const elkResult = data(elkSearch.payload).result as Record<string, unknown>;
   assert.equal(typeof elkResult.took, "number");
-  assert.equal(elkResult.total, 1);
+  assert.equal(elkResult.total, 1_200);
   const elkHits = elkResult.hits as Array<Record<string, unknown>>;
-  assert.equal(elkHits.length, 1);
-  assert.equal(elkHits[0]?.id, "blue-q1-elk-evidence");
+  assert.equal(elkHits.length, 25);
 });
 
 test("unsafe labs are quarantined and cannot be deployed", async () => {
@@ -434,6 +441,65 @@ test("red-team labs support the four allowed question types and OpenVPN", async 
   );
 });
 
+test("personal accounts can create, validate and deploy owner-scoped Blue and Red Labs", async () => {
+  const cases = [
+    {
+      userId: "user_personal_blue",
+      team: "blue",
+      desktopImage: "ubuntu",
+      questionTypes: ["elk_search", "mitre_attack"],
+    },
+    {
+      userId: "user_personal_red",
+      team: "red",
+      desktopImage: "kali",
+      questionTypes: ["single_choice", "multiple_choice", "free_text", "mitre_attack"],
+    },
+  ] as const;
+
+  for (const item of cases) {
+    const generated = await api("/v1/labs/generate", {
+      method: "POST",
+      userId: item.userId,
+      idempotencyKey: `personal-${item.team}-generate-001`,
+      body: {
+        title: `Personal ${item.team} deployment`,
+        prompt: "개인 사용자가 소유한 격리 실습 환경의 전체 배포 흐름을 확인합니다.",
+        team: item.team,
+        desktopImage: item.desktopImage,
+        accessMethod: "browser_desktop",
+        questionTypes: [...item.questionTypes],
+      },
+    });
+    assert.equal(generated.response.status, 201);
+    const lab = data(generated.payload).lab as Record<string, unknown>;
+    assert.equal((lab.organization as unknown) ?? null, null);
+
+    const hiddenFromOtherPersonalUser = await api(`/v1/labs/${lab.id}`, {
+      userId: item.userId === "user_personal_blue" ? "user_personal_red" : "user_personal_blue",
+    });
+    assert.equal(hiddenFromOtherPersonalUser.response.status, 404);
+
+    const validation = await api(`/v1/labs/${lab.id}/validate`, {
+      method: "POST",
+      userId: item.userId,
+    });
+    assert.equal(validation.response.status, 200);
+    assert.equal(data(validation.payload).decision, "pass");
+
+    const deployment = await api(`/v1/labs/${lab.id}/deploy`, {
+      method: "POST",
+      userId: item.userId,
+      idempotencyKey: `personal-${item.team}-deploy-001`,
+      body: { accessMethod: "browser_desktop" },
+    });
+    assert.equal(deployment.response.status, 201);
+    const run = data(deployment.payload).run as Record<string, unknown>;
+    assert.equal(run.userId, item.userId);
+    assert.equal(run.desktopImage, item.desktopImage);
+  }
+});
+
 test("organization members see shared labs and audit logs capture mutations once", async () => {
   const analyst = database
     .prepare("SELECT id FROM users WHERE email = 'analyst@example.test'")
@@ -444,13 +510,15 @@ test("organization members see shared labs and audit logs capture mutations once
   assert.equal(labs.length, 3);
 
   const actions = database
-    .prepare("SELECT action FROM audit_logs ORDER BY created_at, id")
-    .all() as { action: string }[];
+    .prepare("SELECT actor_user_id, action FROM audit_logs ORDER BY created_at, id")
+    .all() as { actor_user_id: string; action: string }[];
   assert.ok(actions.some((item) => item.action === "auth.user_registered"));
   assert.ok(actions.some((item) => item.action === "lab.validation_completed"));
   assert.ok(actions.some((item) => item.action === "runtime.deployed"));
   assert.equal(
-    actions.filter((item) => item.action === "lab.generated").length,
+    actions.filter(
+      (item) => item.actor_user_id === "user_dev" && item.action === "lab.generated",
+    ).length,
     3,
     "idempotent replay must not create a second lab or audit event",
   );
@@ -591,10 +659,10 @@ test("run submission keeps answer keys private and uses only trusted server evid
     );
 
   const answers = [
-    { questionId: "red-q1", response: "option-a" },
-    { questionId: "red-q2", response: ["artifact-b", "artifact-a"] },
+    { questionId: "red-q1", response: "bounded-enumeration" },
+    { questionId: "red-q2", response: ["process-lineage", "auth-context", "network-flow"] },
     { questionId: "red-q3", response: "A concise evidence-backed explanation." },
-    { questionId: "red-q4", response: "T1190" },
+    { questionId: "red-q4", response: "T1059.004" },
   ];
   const forbiddenEvidence = await api(`/v1/runs/${run.id}/submit`, {
     method: "POST",
@@ -678,14 +746,14 @@ test("run submission keeps answer keys private and uses only trusted server evid
   );
 });
 
-test("desktop access uses a hashed 60-second one-time exchange ticket", async () => {
+test("desktop access exchanges a hashed short-lived ticket for run-lived access", async () => {
   const browserRun = database
     .prepare(
-      `SELECT id FROM runtime_runs
+      `SELECT id, expires_at FROM runtime_runs
         WHERE user_id = 'user_dev' AND access_method = 'browser_desktop'
         ORDER BY created_at ASC LIMIT 1`,
     )
-    .get() as { id: string };
+    .get() as { id: string; expires_at: string };
   const issued = await api(`/v1/runs/${browserRun.id}/desktop-ticket`, {
     method: "POST",
   });
@@ -699,11 +767,18 @@ test("desktop access uses a hashed 60-second one-time exchange ticket", async ()
   );
 
   const stored = database
-    .prepare("SELECT ticket_hash, consumed_at FROM access_tickets WHERE run_id = ?")
-    .get(browserRun.id) as { ticket_hash: string; consumed_at: string | null };
+    .prepare("SELECT ticket_hash, expires_at, consumed_at, created_at FROM access_tickets WHERE run_id = ?")
+    .get(browserRun.id) as {
+      ticket_hash: string;
+      expires_at: string;
+      consumed_at: string | null;
+      created_at: string;
+    };
   assert.notEqual(stored.ticket_hash, ticket);
   assert.equal(stored.ticket_hash.length, 64);
   assert.equal(stored.consumed_at, null);
+  assert.equal(Date.parse(stored.expires_at) - Date.parse(stored.created_at), 5 * 60_000);
+  assert.equal(ticketData.expiresAt, stored.expires_at);
 
   const exchanged = await api("/v1/internal/desktop-tickets/exchange", {
     method: "POST",
@@ -714,6 +789,9 @@ test("desktop access uses a hashed 60-second one-time exchange ticket", async ()
   const access = data(exchanged.payload).access as Record<string, unknown>;
   assert.equal(access.runId, browserRun.id);
   assert.equal(typeof access.namespace, "string");
+  assert.equal(access.expiresAt, browserRun.expires_at);
+  assert.equal(access.ticketExpiresAt, ticketData.expiresAt);
+  assert.notEqual(access.expiresAt, access.ticketExpiresAt);
 
   const replay = await api("/v1/internal/desktop-tickets/exchange", {
     method: "POST",

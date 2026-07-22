@@ -71,13 +71,39 @@ export class DevelopmentTelemetryGateway implements TelemetryGateway {
   private readonly events = new Map<string, TelemetryEventInput[]>();
   async provision(input: { runId: string; events: TelemetryEventInput[] }): Promise<void> { this.events.set(input.runId, input.events); }
   async search(runId: string, query: string, size = 50): Promise<TelemetrySearchResult> {
-    const normalized = query.toLowerCase();
-    const hits = (this.events.get(runId) ?? [])
-      .filter((event) => normalized.trim() === "*" || JSON.stringify(event.document).toLowerCase().includes(normalized))
-      .slice(0, size);
-    return { took: 0, total: hits.length, hits: hits.map((event) => ({ id: event.id, score: 1, source: event.document })) };
+    const matched = (this.events.get(runId) ?? [])
+      .filter((event) => matchesDevelopmentQuery(event.document, query));
+    const hits = matched.slice(0, size);
+    return { took: 0, total: matched.length, hits: hits.map((event) => ({ id: event.id, score: 1, source: event.document })) };
   }
   async destroy(runId: string): Promise<void> { this.events.delete(runId); }
+}
+
+function matchesDevelopmentQuery(document: JsonObject, query: string): boolean {
+  const normalized = query.trim();
+  if (!normalized || normalized === "*") return true;
+  const clauses = normalized.split(/\s+AND\s+/i).map((item) => item.trim()).filter(Boolean);
+  return clauses.every((clause) => {
+    const match = clause.match(/^([A-Za-z0-9_.@-]+)\s*:\s*(.+)$/);
+    if (!match) return JSON.stringify(document).toLowerCase().includes(clause.toLowerCase());
+    const [, path, rawExpected] = match;
+    const expected = rawExpected.replace(/^(["'])(.*)\1$/, "$2").replace(/\\\*/g, "\u0000").toLowerCase();
+    const values = fieldValues(document, path.split("."));
+    const pattern = new RegExp(`^${escapeRegExp(expected).replace(/\*/g, ".*").replace(/\u0000/g, "\\*")}$`, "i");
+    return values.some((value) => pattern.test(String(value)));
+  });
+}
+
+function fieldValues(value: unknown, path: string[]): unknown[] {
+  if (path.length === 0) return Array.isArray(value) ? value.flatMap((item) => fieldValues(item, [])) : [value];
+  if (Array.isArray(value)) return value.flatMap((item) => fieldValues(item, path));
+  if (typeof value !== "object" || value === null) return [];
+  const [head, ...tail] = path;
+  return fieldValues((value as Record<string, unknown>)[head], tail);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function parseSearchResult(value: unknown): TelemetrySearchResult {

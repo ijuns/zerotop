@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import datetime
 from typing import Any
 
 from app.domain import BLUE_QUESTIONS, RED_QUESTIONS
@@ -15,17 +16,26 @@ class ContentContractError(ValueError):
 def validate_generated_content(
     payload: dict[str, Any], request: dict[str, Any]
 ) -> dict[str, Any]:
+    team = str(request.get("team"))
     learning = _object(payload.get("learning"), "learning")
-    sections = _list(learning.get("sections"), "learning.sections", 2, 12)
+    sections = _list(
+        learning.get("sections"), "learning.sections", 6 if team == "blue" else 5, 12
+    )
     for index, section_value in enumerate(sections):
         section = _object(section_value, f"learning.sections[{index}]")
         _identifier(section.get("id"), f"learning.sections[{index}].id")
-        _text(section.get("title"), f"learning.sections[{index}].title", 3, 120)
-        _text(section.get("bodyMarkdown"), f"learning.sections[{index}].bodyMarkdown", 20, 20_000)
+        title = _text(section.get("title"), f"learning.sections[{index}].title", 3, 120)
+        body = _text(section.get("bodyMarkdown"), f"learning.sections[{index}].bodyMarkdown", 20, 20_000)
+        if not re.search(r"[가-힣]", f"{title} {body}"):
+            raise ContentContractError("learner-facing lecture sections must be written in Korean")
 
-    team = str(request.get("team"))
     requested_types = list(dict.fromkeys(request.get("questionTypes") or []))
-    questions = _list(payload.get("questions"), "questions", len(requested_types), 20)
+    questions = _list(
+        payload.get("questions"),
+        "questions",
+        6 if team == "blue" else max(4, len(requested_types)),
+        20,
+    )
     grading = _list(payload.get("gradingQuestions"), "gradingQuestions", len(questions), len(questions))
     public_by_id: dict[str, dict[str, Any]] = {}
     types_seen: set[str] = set()
@@ -39,7 +49,9 @@ def validate_generated_content(
             raise ContentContractError("a generated question changed the requested type scope")
         if _contains_answer_key(question):
             raise ContentContractError("a public question contains answer material")
-        _text(question.get("prompt"), f"questions[{index}].prompt", 10, 2_000)
+        prompt = _text(question.get("prompt"), f"questions[{index}].prompt", 10, 2_000)
+        if not re.search(r"[가-힣]", prompt):
+            raise ContentContractError("learner-facing question prompts must be written in Korean")
         points = question.get("points")
         if isinstance(points, bool) or not isinstance(points, int) or points < 1 or points > 1_000:
             raise ContentContractError(f"questions[{index}].points is invalid")
@@ -60,6 +72,15 @@ def validate_generated_content(
         raise ContentContractError("every requested question type must be generated")
     if team == "blue" and types_seen != BLUE_QUESTIONS:
         raise ContentContractError("blue-team questions must be ELK plus MITRE ATT&CK")
+    if team == "blue":
+        counts = {
+            question_type: sum(
+                1 for question in public_by_id.values() if question.get("type") == question_type
+            )
+            for question_type in BLUE_QUESTIONS
+        }
+        if counts["elk_search"] < 3 or counts["mitre_attack"] < 3:
+            raise ContentContractError("blue-team content requires at least three ELK and three MITRE questions")
     if team == "red" and not types_seen.issubset(RED_QUESTIONS):
         raise ContentContractError("red-team questions contain an unsupported type")
 
@@ -92,6 +113,7 @@ def _validate_build_spec(
 ) -> None:
     if spec.get("schemaVersion") != 1 or spec.get("team") != request.get("team"):
         raise ContentContractError("environmentBuildSpec version or team is invalid")
+    _validate_runtime_topology(spec, payload, str(request.get("team")))
     source = _object(spec.get("source"), "environmentBuildSpec.source")
     if source.get("promptDigest") != prompt_digest(str(request.get("prompt", ""))):
         raise ContentContractError("environmentBuildSpec prompt digest is invalid")
@@ -189,6 +211,99 @@ def _validate_build_spec(
         referenced_ids.add(question_id)
     if referenced_ids != question_ids:
         raise ContentContractError("build hidden grading references are incomplete")
+
+
+def _validate_runtime_topology(
+    spec: dict[str, Any], payload: dict[str, Any], team: str
+) -> None:
+    topology = _object(spec.get("topology"), "environmentBuildSpec.topology")
+    if payload.get("topology") != topology:
+        raise ContentContractError("public and build runtime topologies must match")
+    if set(topology) - {
+        "schemaVersion",
+        "team",
+        "isolation",
+        "workstation",
+        "target",
+        "telemetry",
+    }:
+        raise ContentContractError("runtime topology contains unsupported fields")
+    if (
+        topology.get("schemaVersion") != 1
+        or topology.get("team") != team
+        or topology.get("isolation") != "per_run"
+    ):
+        raise ContentContractError("runtime topology version, team or isolation is invalid")
+    blue = team == "blue"
+    workstation = _object(topology.get("workstation"), "topology.workstation")
+    target = _object(topology.get("target"), "topology.target")
+    if set(workstation) != {"role", "desktopImage", "entrypoint"} or set(target) != {
+        "role",
+        "hostname",
+    }:
+        raise ContentContractError("runtime topology role contract is invalid")
+    if (
+        workstation.get("role") != ("soc_analyst" if blue else "attack_operator")
+        or workstation.get("desktopImage") != ("ubuntu" if blue else "kali")
+        or workstation.get("entrypoint") != ("kibana" if blue else "target")
+        or target.get("role") != ("monitored_target" if blue else "vulnerable_target")
+        or target.get("hostname") != "target"
+    ):
+        raise ContentContractError("runtime topology roles do not match the team")
+    if not blue:
+        if "telemetry" in topology:
+            raise ContentContractError("red-team topology must not contain telemetry")
+        return
+    telemetry = _object(topology.get("telemetry"), "topology.telemetry")
+    if set(telemetry) != {"stack", "collector", "generator", "index", "events", "generation"}:
+        raise ContentContractError("blue-team telemetry topology is invalid")
+    if (
+        telemetry.get("stack") != "elastic"
+        or telemetry.get("collector") != "elastic_agent"
+        or telemetry.get("generator") != "scenario_log_generator"
+        or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,126}-\*", str(telemetry.get("index", "")))
+    ):
+        raise ContentContractError("blue-team topology requires the approved Elastic pipeline")
+    spec_telemetry = _object(spec.get("telemetry"), "environmentBuildSpec.telemetry")
+    if telemetry.get("events") != spec_telemetry.get("events"):
+        raise ContentContractError("topology events must match environment telemetry events")
+    generation = _object(telemetry.get("generation"), "topology.telemetry.generation")
+    if set(generation) != {
+        "schemaVersion",
+        "profile",
+        "totalEvents",
+        "timeRangeMinutes",
+        "seed",
+        "timelineAnchor",
+    }:
+        raise ContentContractError("blue-team telemetry generation plan is invalid")
+    if generation.get("schemaVersion") != 1 or generation.get("profile") not in {
+        "powershell_rce_exfiltration",
+        "credential_abuse",
+        "ransomware",
+        "webshell",
+        "generic_intrusion",
+        "generic_endpoint_activity",
+    }:
+        raise ContentContractError("blue-team telemetry generation profile is invalid")
+    total_events = generation.get("totalEvents")
+    time_range = generation.get("timeRangeMinutes")
+    seed = generation.get("seed")
+    if (
+        isinstance(total_events, bool)
+        or not isinstance(total_events, int)
+        or not 100 <= total_events <= 5000
+        or total_events < len(telemetry.get("events") or [])
+        or isinstance(time_range, bool)
+        or not isinstance(time_range, int)
+        or not 15 <= time_range <= 240
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", str(seed or ""))
+    ):
+        raise ContentContractError("blue-team telemetry generation bounds are invalid")
+    try:
+        datetime.fromisoformat(str(generation.get("timelineAnchor", "")).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ContentContractError("blue-team telemetry generation anchor is invalid") from exc
 
 
 def _validate_probe(probe: dict[str, Any], protocol: str) -> None:

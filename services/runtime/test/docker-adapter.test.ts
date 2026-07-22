@@ -13,8 +13,9 @@ const expiresAt = "2026-07-22T02:00:00.000Z";
 
 test("provisions isolated desktop and target containers with bounded resources", async () => {
   const runner = new RecordingRunner((args) => {
-    if (matches(args, "network", "inspect")) return json({ Name: "codegate-local-desktops", Internal: true });
     if (matches(args, "container", "ls")) return output("");
+    if (matches(args, "network", "create")) return output("codegate-local-desktops-run-123\n");
+    if (matches(args, "network", "connect")) return output("");
     if (matches(args, "container", "create")) return output(args.includes("desktop") ? "desktop-id\n" : "target-id\n");
     if (matches(args, "container", "start")) return output(`${args.at(-1)}\n`);
     throw new Error(`Unexpected docker command: ${args.join(" ")}`);
@@ -37,7 +38,7 @@ test("provisions isolated desktop and target containers with bounded resources",
   assert.ok(target);
   assert.ok(desktop);
   assertOption(target, "--pull", "never");
-  assertOption(target, "--network", "codegate-local-desktops");
+  assertOption(target, "--network", "codegate-local-desktops-run-123");
   assertOption(target, "--network-alias", "target.range-run-123.svc.cluster.local");
   assertOption(target, "--read-only");
   assertOption(target, "--cap-drop", "ALL");
@@ -50,6 +51,14 @@ test("provisions isolated desktop and target containers with bounded resources",
   assertOption(desktop, "--shm-size", "1g");
   assertOption(desktop, "--env", "CUSTOM_PORT=6080");
   assertOption(desktop, "--env", "SUBFOLDER=/sessions/run-123/desktop/");
+  const networkCreate = runner.calls.find((args) => matches(args, "network", "create"));
+  assert.ok(networkCreate);
+  assertOption(networkCreate, "--internal");
+  assertOption(networkCreate, "--label", "codegate.ai.run-id=run-123");
+  assert.deepEqual(
+    runner.calls.find((args) => matches(args, "network", "connect")),
+    ["network", "connect", "--alias", "desktop-gateway", "codegate-local-desktops-run-123", "codegate-local-desktop-gateway"],
+  );
   for (const command of creates) {
     assert.equal(command.includes("--privileged"), false);
     assert.equal(command.includes("--volume"), false);
@@ -62,14 +71,15 @@ test("provisions isolated desktop and target containers with bounded resources",
   adapter.close();
 });
 
-test("requires the shared desktop network to be internal", async () => {
+test("fails before containers when the per-run internal network cannot be created", async () => {
   const runner = new RecordingRunner((args) => {
     if (matches(args, "container", "ls")) return output("");
-    if (matches(args, "network", "inspect")) return json({ Name: "codegate-local-desktops", Internal: false });
+    if (matches(args, "network", "create")) throw new Error("network create denied");
+    if (matches(args, "network", "disconnect") || matches(args, "network", "rm") || matches(args, "volume", "rm")) return output("");
     throw new Error(`Unexpected docker command: ${args.join(" ")}`);
   });
   const adapter = dockerRuntime(runner);
-  await assert.rejects(() => adapter.provision(request()), /must be internal/);
+  await assert.rejects(() => adapter.provision(request()), /network create denied/);
   assert.equal(runner.calls.some((args) => matches(args, "container", "create")), false);
   adapter.close();
 });
@@ -106,6 +116,65 @@ test("surfaces an unhealthy desktop as a failed run", async () => {
   adapter.close();
 });
 
+test("blue-team topology provisions analyst desktop, ELK, monitored target, agent and scenario logs", async () => {
+  const runner = new RecordingRunner((args) => {
+    if (matches(args, "container", "ls")) return output("");
+    if (matches(args, "network", "create") || matches(args, "network", "connect") || matches(args, "volume", "create")) return output("");
+    if (matches(args, "container", "create") || matches(args, "container", "start")) return output("");
+    throw new Error(`Unexpected docker command: ${args.join(" ")}`);
+  });
+  const adapter = dockerRuntime(runner);
+
+  await adapter.provision(blueRequest());
+
+  const creates = runner.calls.filter((args) => matches(args, "container", "create"));
+  assert.equal(creates.length, 6);
+  for (const role of ["desktop", "target", "elasticsearch", "kibana", "elastic-agent", "scenario-log-generator"]) {
+    const command = creates.find((args) => args.includes(`codegate.ai.role=${role}`));
+    assert.ok(command, `missing ${role} container`);
+    assertOption(command, "--network", "codegate-local-desktops-run-123");
+    assertOption(command, "--label", "codegate.ai.team=blue");
+  }
+  const target = creates.find((args) => args.includes("codegate.ai.role=target"));
+  const agent = creates.find((args) => args.includes("codegate.ai.role=elastic-agent"));
+  const generator = creates.find((args) => args.includes("codegate.ai.role=scenario-log-generator"));
+  assert.ok(target && agent && generator);
+  assert.ok(target.some((item) => item.includes("target=/var/log/zerotop")));
+  assertOption(agent, "--env", "ELASTICSEARCH_HOST=http://elasticsearch:9200");
+  assertOption(agent, "--env", "KIBANA_HOST=http://kibana:5601");
+  assert.ok(agent.some((item) => item.includes("target=/var/log/zerotop,readonly")));
+  const encodedEvents = optionValue(generator, "--env", "SCENARIO_EVENTS_BASE64=")?.split("=", 2)[1];
+  assert.ok(encodedEvents);
+  assert.match(Buffer.from(encodedEvents, "base64").toString("utf8"), /blue-q1-evidence/);
+  adapter.close();
+});
+
+test("blue-team readiness requires every ELK pipeline role", async () => {
+  const records = [
+    inspectRecord("desktop-id", "desktop", { running: true, status: "running", health: "healthy" }, expiresAt, "blue"),
+    inspectRecord("target-id", "target", { running: true, status: "running" }, expiresAt, "blue"),
+    inspectRecord("es-id", "elasticsearch", { running: true, status: "running", health: "healthy" }, expiresAt, "blue"),
+    inspectRecord("kibana-id", "kibana", { running: true, status: "running", health: "healthy" }, expiresAt, "blue"),
+    inspectRecord("agent-id", "elastic-agent", { running: true, status: "running", health: "healthy" }, expiresAt, "blue"),
+    inspectRecord("logs-id", "scenario-log-generator", { running: true, status: "running", health: "healthy" }, expiresAt, "blue"),
+  ];
+  const adapter = dockerRuntime(inspectionRunner(records));
+
+  const result = await adapter.get("run-123");
+
+  assert.equal(result.status, "ready");
+  assert.deepEqual(result.checks, {
+    workstationVmi: true,
+    targetWorkload: true,
+    desktopEndpoints: true,
+    elasticsearch: true,
+    kibana: true,
+    telemetryAgent: true,
+    scenarioLogs: true,
+  });
+  adapter.close();
+});
+
 test("destroy removes every container carrying the run label", async () => {
   const runner = new RecordingRunner((args) => {
     if (matches(args, "container", "ls")) {
@@ -113,6 +182,7 @@ test("destroy removes every container carrying the run label", async () => {
       return output("desktop-id\ntarget-id\nextra-id\n");
     }
     if (matches(args, "container", "rm")) return output("desktop-id\ntarget-id\nextra-id\n");
+    if (matches(args, "network", "disconnect") || matches(args, "network", "rm") || matches(args, "volume", "rm")) return output("");
     throw new Error(`Unexpected docker command: ${args.join(" ")}`);
   });
   const adapter = dockerRuntime(runner);
@@ -131,11 +201,13 @@ test("TTL cleanup removes all containers belonging to an expired managed run", a
   ];
   const runner = new RecordingRunner((args) => {
     if (matches(args, "container", "ls")) {
-      assertOption(args, "--filter", "label=codegate.ai.managed-by=codegate-runtime");
+      if (args.includes("label=codegate.ai.managed-by=codegate-runtime")) return output("desktop-id\ntarget-id\n");
+      assertOption(args, "--filter", "label=codegate.ai.run-id=run-123");
       return output("desktop-id\ntarget-id\n");
     }
     if (matches(args, "container", "inspect")) return json(records);
     if (matches(args, "container", "rm")) return output("desktop-id\ntarget-id\n");
+    if (matches(args, "network", "disconnect") || matches(args, "network", "rm") || matches(args, "volume", "rm")) return output("");
     throw new Error(`Unexpected docker command: ${args.join(" ")}`);
   });
   const adapter = dockerRuntime(runner);
@@ -189,9 +261,10 @@ function inspectionRunner(records: unknown[]): RecordingRunner {
 
 function inspectRecord(
   id: string,
-  role: "desktop" | "target",
+  role: "desktop" | "target" | "elasticsearch" | "kibana" | "elastic-agent" | "scenario-log-generator",
   state: { running: boolean; status: string; health?: string },
   expiration = expiresAt,
+  team?: "blue" | "red",
 ): unknown {
   return {
     Id: id,
@@ -204,6 +277,7 @@ function inspectRecord(
         "codegate.ai.expires-at": expiration,
         "codegate.ai.access-method": "browser_desktop",
         "codegate.ai.role": role,
+        ...(team ? { "codegate.ai.team": team } : {}),
       },
     },
     State: {
@@ -211,6 +285,41 @@ function inspectRecord(
       Status: state.status,
       ExitCode: 0,
       ...(state.health ? { Health: { Status: state.health } } : {}),
+    },
+  };
+}
+
+function blueRequest(): ProvisionRunRequest {
+  return {
+    ...request(),
+    topology: {
+      schemaVersion: 1,
+      team: "blue",
+      isolation: "per_run",
+      workstation: { role: "soc_analyst", desktopImage: "ubuntu", entrypoint: "kibana" },
+      target: { role: "monitored_target", hostname: "target" },
+      telemetry: {
+        stack: "elastic",
+        collector: "elastic_agent",
+        generator: "scenario_log_generator",
+        index: "zerotop-logs-*",
+        generation: {
+          schemaVersion: 1,
+          profile: "powershell_rce_exfiltration",
+          totalEvents: 1_200,
+          timeRangeMinutes: 60,
+          seed: "docker-test-seed",
+          timelineAnchor: "2026-07-22T00:00:00.000Z",
+        },
+        events: [{
+          id: "blue-q1-evidence",
+          document: {
+            "@timestamp": "2026-07-22T00:00:00.000Z",
+            event: { dataset: "zerotop.endpoint" },
+            threat: { technique: { id: ["T1059.001"] } },
+          },
+        }],
+      },
     },
   };
 }
@@ -223,7 +332,7 @@ function request(): ProvisionRunRequest {
     desktopImage: "ubuntu",
     accessMethod: "browser_desktop",
     ttlMinutes: 120,
-    targetImage: `registry.example/target@sha256:${"a".repeat(64)}`,
+    targetImage: "codegate/local-target:development",
     targetService: { port: 8080, protocol: "http" },
     targetRuntimeContract: {
       kind: "http-v1",
@@ -258,4 +367,9 @@ function assertOption(args: readonly string[], option: string, value?: string): 
   if (value !== undefined) {
     assert.ok(indexes.some((index) => args[index + 1] === value), `Expected ${option} ${value} in ${args.join(" ")}`);
   }
+}
+
+function optionValue(args: readonly string[], option: string, prefix: string): string | undefined {
+  const indexes = args.flatMap((item, index) => item === option ? [index] : []);
+  return indexes.map((index) => args[index + 1]).find((value) => value?.startsWith(prefix));
 }

@@ -8,18 +8,21 @@ data:
   API_PORT: "8080"
   AI_SERVICE_URL: http://codegate-ai:8001
   AI_ADAPTER: service
-  AI_GENERATION_TIMEOUT_MS: "90000"
+  AI_GENERATION_TIMEOUT_MS: "1260000"
   AI_GENERATION_MODE: external
   GENERATION_PROVIDER_URL: http://model-gateway:9010/v1/generate
+  GENERATION_PROVIDER_TIMEOUT_SECONDS: "1230"
   AI_REVIEW_MODE: external
   REVIEW_PROVIDER_URL: http://model-gateway:9010/v1/review
   AI_RUBRIC_MODE: external
   RUBRIC_PROVIDER_URL: http://model-gateway:9010/v1/rubric
-  OPENAI_BASE_URL: https://api.openai.com/v1
-  OPENAI_MODEL: gpt-5.6-sol
-  OPENAI_GENERATION_TIMEOUT_MS: "40000"
-  OPENAI_REVIEW_TIMEOUT_MS: "25000"
-  OPENAI_RUBRIC_TIMEOUT_MS: "9000"
+  MODEL_PROVIDER: anthropic
+  ANTHROPIC_BASE_URL: https://api.anthropic.com/v1
+  ANTHROPIC_MODEL: replace-with-structured-outputs-compatible-claude-model
+  ANTHROPIC_VERSION: "2023-06-01"
+  MODEL_GATEWAY_GENERATION_TIMEOUT_MS: "1200000"
+  MODEL_GATEWAY_REVIEW_TIMEOUT_MS: "25000"
+  MODEL_GATEWAY_RUBRIC_TIMEOUT_MS: "9000"
   MODEL_GATEWAY_MAX_CONCURRENCY: "8"
   RUBRIC_CATALOG_JSON: '{"incident-analysis-v1":{"policyVersion":"incident-analysis-2026.07","passThreshold":0.7,"criteria":[{"id":"evidence","description":"Uses concrete evidence from the isolated exercise data.","weight":0.6},{"id":"mitigation","description":"Explains a proportionate detection or mitigation action.","weight":0.4}]}}'
   AI_TARGET_BASE_IMAGE: registry.example.invalid/codegate/targets/http-v1-base@sha256:0000000000000000000000000000000000000000000000000000000000000000
@@ -50,6 +53,7 @@ data:
   COSIGN_PUBLIC_KEY_PATH: /etc/codegate-validator/trust/cosign.pub
   VALIDATOR_CACHE_DIR: /var/cache/codegate-validator
   DESKTOP_GATEWAY_PUBLIC_URL: https://desktop.example.invalid
+  DESKTOP_TICKET_TTL_SECONDS: "300"
   OPENVPN_DOWNLOAD_PUBLIC_URL: https://vpn.example.invalid
   RUNTIME_SERVICE_URL: http://codegate-runtime.codegate-runtime-system.svc.cluster.local:9000
   ALLOWED_ORIGINS: https://range.example.invalid

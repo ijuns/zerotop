@@ -64,6 +64,15 @@ if ($null -ne $docker) {
         }
     }
 
+    $managedVolumes = @(& $docker.Source volume ls -q --filter 'label=codegate.ai.managed-by=codegate-runtime')
+    $managedVolumes = @($managedVolumes | Where-Object { $_ -match '^zerotop-logs-range-[a-z0-9-]{1,80}$' })
+    foreach ($volumeName in $managedVolumes) {
+        & $docker.Source volume rm $volumeName *> $null
+        if ($LASTEXITCODE -eq 0) {
+            $stoppedAny = $true
+        }
+    }
+
     $gatewayExists = try {
         & $docker.Source container inspect codegate-local-desktop-gateway *> $null
         $LASTEXITCODE -eq 0
@@ -75,6 +84,15 @@ if ($null -ne $docker) {
         & $docker.Source rm -f codegate-local-desktop-gateway *> $null
         if ($LASTEXITCODE -eq 0) {
             Write-Host 'Removed the local desktop gateway container.'
+            $stoppedAny = $true
+        }
+    }
+
+    $managedNetworks = @(& $docker.Source network ls -q --filter 'label=codegate.ai.managed-by=codegate-runtime')
+    $managedNetworks = @($managedNetworks | Where-Object { $_ -match '^[a-f0-9]{12,64}$' })
+    foreach ($networkId in $managedNetworks) {
+        & $docker.Source network rm $networkId *> $null
+        if ($LASTEXITCODE -eq 0) {
             $stoppedAny = $true
         }
     }

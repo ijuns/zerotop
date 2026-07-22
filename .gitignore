@@ -9,11 +9,16 @@ out/
 .pnpm-store/
 .data/
 scripts/.runtime/
+.local-debug/
 .env
 .env.local
 .env.*
 !.env.example
 !**/.env.example
+# Claude credentials are stored only in this local operator file.  The
+# corresponding example is deliberately tracked.
+.env.claude.local
+!.env.claude.example
 .venv/
 __pycache__/
 *.pyc

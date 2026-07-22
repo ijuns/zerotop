@@ -257,6 +257,19 @@ function labFromRow(row: Row | undefined): JsonValue | null {
     typeof config.scenario === "object" && config.scenario !== null
       ? (config.scenario as Record<string, unknown>)
       : {};
+  const learning =
+    typeof config.learning === "object" && config.learning !== null
+      ? config.learning
+      : undefined;
+  const target =
+    typeof config.target === "object" && config.target !== null
+      ? config.target
+      : undefined;
+  const topology =
+    typeof config.topology === "object" && config.topology !== null
+      ? config.topology
+      : undefined;
+  const questions = Array.isArray(config.questions) ? config.questions : undefined;
   const accessMethod =
     accessModes.includes("browser_desktop") && accessModes.includes("openvpn")
       ? "both"
@@ -280,12 +293,20 @@ function labFromRow(row: Row | undefined): JsonValue | null {
     status: canonicalStatus,
     network: { egress: "deny", isolation: "per_run" },
     scenario: {
-      summary: scenario.objective ?? row.description,
-      logSources: row.team_type === "blue" ? ["elasticsearch", "endpoint"] : [],
-      attackChain: Array.isArray(scenario.mitreTechniques)
-        ? scenario.mitreTechniques.map((id) => ({ id, name: id, tactic: "unknown" }))
-        : [],
+      summary: scenario.summary ?? scenario.objective ?? row.description,
+      logSources: Array.isArray(scenario.logSources)
+        ? scenario.logSources
+        : row.team_type === "blue" ? ["elasticsearch", "endpoint"] : [],
+      attackChain: Array.isArray(scenario.attackChain)
+        ? scenario.attackChain
+        : Array.isArray(scenario.mitreTechniques)
+          ? scenario.mitreTechniques.map((id) => ({ id, name: id, tactic: "unknown" }))
+          : [],
     },
+    ...(learning ? { learning } : {}),
+    ...(target ? { target } : {}),
+    ...(topology ? { topology } : {}),
+    ...(questions ? { questions } : {}),
     // Compatibility aliases for the pre-contract web client.
     name: row.name,
     description: row.description,
@@ -888,7 +909,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       `INSERT INTO trusted_grade_evidence
         (id, run_id, question_id, source, passed, score_ratio, policy_version,
          evidence_reference, created_at)
-       VALUES (?, ?, 'fixture-q1', ?, 1, ?, 'development-seed-v1', ?, ?)
+       VALUES (?, ?, ?, ?, 1, ?, 'development-seed-v1', ?, ?)
        ON CONFLICT(run_id, question_id) DO UPDATE SET
          source = excluded.source,
          passed = excluded.passed,
@@ -901,7 +922,6 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       for (const lab of fixtures.labs) {
-        const primaryQuestionType = lab.questionTypes[0] ?? "free_text";
         labInsert.run(
           lab.id,
           lab.ownerUserId,
@@ -912,21 +932,8 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
           JSON.stringify(lab.questionTypes),
           lab.environment,
           JSON.stringify(["browser_desktop"]),
-          JSON.stringify({
-            fixture: true,
-            generatedBy: "ZeroTOP development seed",
-            validationMode: "ai-autonomous",
-          }),
-          JSON.stringify({
-            questions: [
-              {
-                id: "fixture-q1",
-                type: primaryQuestionType,
-                prompt: "실습 환경에서 핵심 공격 또는 탐지 근거를 식별하세요.",
-                maxPoints: 100,
-              },
-            ],
-          }),
+          JSON.stringify(lab.config),
+          JSON.stringify({ questions: lab.gradingQuestions }),
           lab.difficulty,
           DEVELOPMENT_FIXTURE_CREATED_AT,
           seedTime.toISOString(),
@@ -946,6 +953,11 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
       for (const attempt of fixtures.attempts) {
         const lab = labById.get(attempt.labId);
         if (!lab) throw new Error(`Development capability lab ${attempt.labId} is missing.`);
+        const generatedQuestionId = lab.gradingQuestions[0]?.id;
+        const questionId =
+          typeof generatedQuestionId === "string" && generatedQuestionId.length > 0
+            ? generatedQuestionId
+            : "fixture-q1";
         runInsert.run(
           attempt.runId,
           attempt.labId,
@@ -966,7 +978,7 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
           attempt.runId,
           attempt.score,
           attempt.maxScore,
-          JSON.stringify([{ questionId: "fixture-q1", response: "verified-fixture" }]),
+          JSON.stringify([{ questionId, response: "verified-fixture" }]),
           JSON.stringify({
             verified: true,
             source: lab.teamType === "blue" ? "elk" : "ai_rubric",
@@ -978,9 +990,10 @@ export class SqliteDevelopmentRepository implements PlatformRepository {
         trustedEvidenceInsert.run(
           `trusted_seed_${attempt.runId}`,
           attempt.runId,
+          questionId,
           lab.teamType === "blue" ? "elk" : "ai_rubric",
           attempt.score / attempt.maxScore,
-          `development-fixture/${attempt.runId}/fixture-q1`,
+          `development-fixture/${attempt.runId}/${questionId}`,
           attempt.completedAt,
         );
       }

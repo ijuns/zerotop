@@ -54,6 +54,11 @@ import {
 import { useAuth } from "../components/auth-provider";
 import { AdminConsole } from "../components/admin-console";
 import { ElkSearchPanel } from "../components/elk-search-panel";
+import { LabTopology } from "../components/lab-topology";
+import {
+  MitreTechniqueSelector,
+  type MitreTechniqueOption,
+} from "../components/mitre-technique-selector";
 import { CourseOverview, ProductHome, ScenarioStudio } from "../components/product-pages";
 
 type ViewKey =
@@ -72,6 +77,7 @@ type AsyncAction = "idle" | "generating" | "building" | "validating" | "deployin
 type LoadState = "loading" | "ready" | "error";
 type HealthState = "checking" | "online" | "offline";
 type DataState = "idle" | "loading" | "ready" | "error";
+type BuilderPanelMode = "draft" | "review";
 type ElkDraft = { query: string; evidenceIds: string[] };
 type DraftAnswer = string | string[] | ElkDraft;
 
@@ -358,20 +364,37 @@ function publicQuestions(lab: Lab | null): LabQuestion[] {
   );
 }
 
-function mitreCandidates(lab: Lab | null, question: LabQuestion): string[] {
-  const values = [
-    ...(Array.isArray(question.mitreTechniqueIds) ? question.mitreTechniqueIds : []),
-    ...(Array.isArray(lab?.scenario?.attackChain)
-      ? lab.scenario.attackChain.flatMap((technique) =>
-          typeof technique.id === "string" ? [technique.id] : [],
-        )
-      : []),
-  ];
-  return [...new Set(values.filter((value) => /^T\d{4}(?:\.\d{3})?$/.test(value)))];
+function mitreCandidates(lab: Lab | null, question: LabQuestion): MitreTechniqueOption[] {
+  const byId = new Map<string, MitreTechniqueOption>();
+  for (const id of question.mitreTechniqueIds || []) {
+    const normalized = id.trim().toUpperCase();
+    if (/^T\d{4}(?:\.\d{3})?$/.test(normalized)) byId.set(normalized, { id: normalized });
+  }
+  for (const technique of lab?.scenario?.attackChain || []) {
+    const id = technique.id?.trim().toUpperCase() || "";
+    if (!/^T\d{4}(?:\.\d{3})?$/.test(id)) continue;
+    byId.set(id, {
+      id,
+      ...(technique.name ? { name: technique.name } : {}),
+      ...(technique.tactic ? { tactic: technique.tactic } : {}),
+    });
+  }
+  return [...byId.values()];
 }
 
 function answerIsComplete(question: LabQuestion, answer: DraftAnswer | undefined) {
   if (question.type === "multiple_choice") return Array.isArray(answer) && answer.length > 0;
+  if (question.type === "mitre_attack") {
+    const techniqueIds = Array.isArray(answer)
+      ? answer
+      : typeof answer === "string" && answer.trim()
+        ? [answer]
+        : [];
+    return (
+      techniqueIds.length > 0 &&
+      techniqueIds.every((value) => /^T\d{4}(?:\.\d{3})?$/.test(value.trim().toUpperCase()))
+    );
+  }
   if (question.type === "elk_search") {
     return (
       typeof answer === "object" &&
@@ -382,7 +405,7 @@ function answerIsComplete(question: LabQuestion, answer: DraftAnswer | undefined
     );
   }
   if (typeof answer !== "string" || !answer.trim()) return false;
-  return question.type !== "mitre_attack" || /^T\d{4}(?:\.\d{3})?$/.test(answer.trim().toUpperCase());
+  return true;
 }
 
 function outcomeLabel(outcome: string) {
@@ -537,6 +560,7 @@ export default function HomePage() {
   const [labsState, setLabsState] = useState<LoadState>("loading");
   const [labsError, setLabsError] = useState<string | null>(null);
   const [selectedLab, setSelectedLab] = useState<Lab | null>(null);
+  const [builderPanelMode, setBuilderPanelMode] = useState<BuilderPanelMode>("draft");
   const selectedLabIdRef = useRef<string | null>(null);
   const validationInFlightRef = useRef(new Set<string>());
   const automaticValidationRef = useRef(new Set<string>());
@@ -556,11 +580,13 @@ export default function HomePage() {
   const [reportState, setReportState] = useState<DataState>("idle");
   const [reportData, setReportData] = useState<CapabilityReport | null>(null);
   const [reportError, setReportError] = useState<string | null>(null);
-  const [rankingScope, setRankingScope] = useState<RankingScope>("global");
+  // The two visible boards are both platform-wide; the active season replaces
+  // the rolling weekly window server-side when one is configured.
+  const rankingScope: RankingScope = "global";
   const [rankingBoard, setRankingBoard] = useState<"individual" | "organization">("individual");
   const [rankingDomain, setRankingDomain] = useState<RankingDomain | null>(null);
   const [rankingPolicyOpen, setRankingPolicyOpen] = useState(false);
-  const [rankingPeriod, setRankingPeriod] = useState<RankingPeriod>("weekly");
+  const rankingPeriod: RankingPeriod = "weekly";
   const [rankingState, setRankingState] = useState<DataState>("idle");
   const [rankingData, setRankingData] = useState<RankingResponse | null>(null);
   const [rankingError, setRankingError] = useState<string | null>(null);
@@ -596,6 +622,7 @@ export default function HomePage() {
     useState<AccessMethod>("browser_desktop");
   const [redQuestions, setRedQuestions] = useState<QuestionType[]>([
     "single_choice",
+    "multiple_choice",
     "free_text",
     "mitre_attack",
   ]);
@@ -611,9 +638,21 @@ export default function HomePage() {
     try {
       const items = await api.listLabs();
       setLabs(items);
-      if (!selectedLabIdRef.current && items[0]) {
-        setActiveLab(items[0]);
-        setValidation(items[0].validation);
+      const current = selectedLabIdRef.current
+        ? items.find((item) => item.id === selectedLabIdRef.current)
+        : undefined;
+      if (current) {
+        setActiveLab(current);
+        setValidation(current.validation);
+      } else {
+        const next = items[0] ?? null;
+        setActiveLab(next);
+        setValidation(next?.validation);
+        setRun(null);
+        setDesktopLaunchState("idle");
+        setDesktopLaunchError(null);
+        setVpnDownloadState("idle");
+        setVpnDownloadError(null);
       }
       setLabsState("ready");
     } catch (error) {
@@ -773,16 +812,9 @@ export default function HomePage() {
   useEffect(() => {
     if (activeView !== "ranking") return;
     if (!user && !userError) return;
-    if (rankingScope === "organization" && user && !hasOrganization) {
-      setRankingData(null);
-      setRankingState("ready");
-      setRankingError(null);
-      return;
-    }
     void loadRankings(rankingScope, rankingPeriod, rankingDomain);
   }, [
     activeView,
-    hasOrganization,
     loadRankings,
     rankingDomain,
     rankingPeriod,
@@ -796,6 +828,18 @@ export default function HomePage() {
     [redQuestions, team],
   );
   const parsedCves = useMemo(() => normalizedCveInput(cveInput), [cveInput]);
+  const draftPreviewLab = useMemo<Lab>(() => ({
+    id: "builder-preview",
+    title: title.trim() || "새 AI Lab",
+    prompt: prompt.trim(),
+    team,
+    teamType: team,
+    desktopImage,
+    accessMethod,
+    questionTypes: questions,
+    scenario: prompt.trim() ? { summary: prompt.trim() } : undefined,
+    target: parsedCves.ids.length > 0 ? { cveIds: parsedCves.ids } : undefined,
+  }), [accessMethod, desktopImage, parsedCves.ids, prompt, questions, team, title]);
   const labQuestions = useMemo(() => publicQuestions(selectedLab), [selectedLab]);
   const appliedElkEvidenceIds = useMemo(
     () => [...new Set(Object.values(questionAnswers).flatMap((answer) =>
@@ -810,9 +854,13 @@ export default function HomePage() {
     labQuestions.every((question) => answerIsComplete(question, questionAnswers[question.id]));
 
   const isBusy = action !== "idle";
+  const promptLength = prompt.trim().length;
+  const hasPrompt = promptLength > 0;
+  const hasValidCve = !parsedCves.error && parsedCves.ids.length > 0;
+  const promptIsValid = hasPrompt ? promptLength >= 10 : hasValidCve;
   const isValid =
     title.trim().length >= 3 &&
-    prompt.trim().length >= 10 &&
+    promptIsValid &&
     questions.length > 0 &&
     !parsedCves.error;
   const selectedBuild = labBuildState(selectedLab);
@@ -821,6 +869,9 @@ export default function HomePage() {
     selectedBuild && ["not_started", "failed", "cancelled"].includes(selectedBuild.status),
   );
   const selectedValidationPassed = validationPassed(validation, selectedLab);
+  const builderLab = builderPanelMode === "review" ? selectedLab : null;
+  const builderValidation = builderLab ? validation : undefined;
+  const builderValidationPassed = builderLab ? selectedValidationPassed : false;
   const checks = validationChecks(validation);
   const connection = connectionOf(run);
   const authMode: "dev" | "oidc" | "local" =
@@ -851,7 +902,34 @@ export default function HomePage() {
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
+  const activateDraft = () => {
+    if (builderPanelMode === "draft") return;
+    setBuilderPanelMode("draft");
+    setActionError(null);
+    setNotice(null);
+  };
+
+  const startNewLabDraft = () => {
+    setBuilderPanelMode("draft");
+    setTitle("");
+    setPrompt("");
+    setCveInput("");
+    setTeam("blue");
+    setDesktopImage("ubuntu");
+    setAccessMethod("browser_desktop");
+    setRedQuestions(RED_QUESTIONS.map((question) => question.value));
+    setActionError(null);
+    setNotice(null);
+    chooseView("builder");
+  };
+
+  const openSelectedLabReview = () => {
+    setBuilderPanelMode(selectedLab ? "review" : "draft");
+    chooseView("builder");
+  };
+
   const toggleRedQuestion = (question: QuestionType) => {
+    activateDraft();
     setRedQuestions((current) =>
       current.includes(question)
         ? current.filter((item) => item !== question)
@@ -892,6 +970,7 @@ export default function HomePage() {
       }
       return;
     }
+    setBuilderPanelMode("review");
     setActiveLab(lab);
     setValidation(lab.validation);
     setRun(null);
@@ -934,8 +1013,7 @@ export default function HomePage() {
 
     setActionError(null);
     setNotice(null);
-    setValidation(undefined);
-    setRun(null);
+    setBuilderPanelMode("draft");
     setAction("generating");
 
     try {
@@ -949,6 +1027,13 @@ export default function HomePage() {
         ...(parsedCves.ids.length > 0 ? { cveIds: parsedCves.ids } : {}),
       });
       setActiveLab(lab);
+      setBuilderPanelMode("review");
+      setValidation(lab.validation);
+      setRun(null);
+      setDesktopLaunchState("idle");
+      setDesktopLaunchError(null);
+      setVpnDownloadState("idle");
+      setVpnDownloadError(null);
       await refreshLabs(false);
       const build = labBuildState(lab);
       if (labBuildIsPending(lab)) {
@@ -1107,20 +1192,24 @@ export default function HomePage() {
   const handleDesktopLaunch = async () => {
     if (!run || run.status.toLowerCase() !== "ready" || desktopLaunchState === "loading") return;
     const launchWindow = window.open("about:blank", "_blank");
-    if (!launchWindow) {
-      setDesktopLaunchError("브라우저에서 새 창을 허용한 뒤 다시 시도해 주세요.");
-      return;
+    if (launchWindow) {
+      launchWindow.opener = null;
+      launchWindow.document.title = "ZeroTOP Desktop 연결 중";
+      launchWindow.document.body.textContent = "새 데스크톱 입장 링크를 발급하고 있습니다…";
     }
-    launchWindow.opener = null;
-    launchWindow.document.title = "ZeroTOP Desktop 연결 중";
     setDesktopLaunchState("loading");
     setDesktopLaunchError(null);
     try {
       const ticket = await api.issueDesktopTicket(run.id);
-      launchWindow.location.replace(ticket.launchUrl);
+      if (launchWindow && !launchWindow.closed) {
+        launchWindow.location.replace(ticket.launchUrl);
+      } else {
+        // 팝업이 차단되었거나 사용자가 준비 창을 닫은 경우에도 접속을 막지 않는다.
+        window.location.assign(ticket.launchUrl);
+      }
       setDesktopLaunchState("ready");
     } catch (error) {
-      launchWindow.close();
+      launchWindow?.close();
       setDesktopLaunchError(errorMessage(error));
       setDesktopLaunchState("error");
     }
@@ -1177,8 +1266,16 @@ export default function HomePage() {
     }
     const answers: AnswerSubmission[] = labQuestions.map((question) => {
       const draft = questionAnswers[question.id];
-      if (question.type === "mitre_attack" && typeof draft === "string") {
-        return { questionId: question.id, response: draft.trim().toUpperCase() };
+      if (question.type === "mitre_attack") {
+        const techniqueIds = Array.isArray(draft)
+          ? draft
+          : typeof draft === "string" && draft.trim()
+            ? [draft]
+            : [];
+        return {
+          questionId: question.id,
+          response: [...new Set(techniqueIds.map((id) => id.trim().toUpperCase()))],
+        };
       }
       if (question.type === "elk_search" && typeof draft === "object" && !Array.isArray(draft)) {
         return {
@@ -1289,11 +1386,16 @@ export default function HomePage() {
 
   const prepareScenarioVariant = () => {
     if (!selectedLab) return;
+    setBuilderPanelMode("draft");
     setTitle(`${labTitle(selectedLab)} · AI 변형`);
     setPrompt(`${selectedLab.prompt || selectedLab.scenario?.summary || labTitle(selectedLab)}\n\n동일한 학습 목표를 유지하되 환경 변수, 공격 경로와 증거를 새롭게 구성해줘.`);
     setTeam(labTeam(selectedLab));
     setDesktopImage(labImage(selectedLab));
-    setAccessMethod(labAccess(selectedLab));
+    setAccessMethod(labAccess(selectedLab) === "openvpn" ? "openvpn" : "browser_desktop");
+    setCveInput([
+      ...(selectedLab.target?.cveIds || []),
+      ...(selectedLab.target?.expectedCves || []),
+    ].join(", "));
     setNotice("현재 시나리오를 기반으로 변형 생성 입력을 준비했습니다. 내용을 확인한 뒤 생성해 주세요.");
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
@@ -1302,7 +1404,7 @@ export default function HomePage() {
     <ProductHome
       labs={labs}
       loading={labsState === "loading"}
-      onCreate={() => chooseView("builder")}
+      onCreate={startNewLabDraft}
       onOpenCourse={openCourse}
     />
   );
@@ -1313,7 +1415,7 @@ export default function HomePage() {
       run={run}
       canDeploy={selectedValidationPassed}
       busy={isBusy}
-      onReview={() => chooseView("builder")}
+      onReview={openSelectedLabReview}
       onDeploy={() => void handleDeploy()}
       onOpenWorkspace={() => chooseView("workspace")}
     />
@@ -1338,19 +1440,19 @@ export default function HomePage() {
       </section>
 
       <ol className="workflow-steps" aria-label="Lab 배포 단계">
-        <li className={selectedLab ? "is-complete" : "is-current"}>
+        <li className={builderLab ? "is-complete" : "is-current"}>
           <span>1</span>
           <div><strong>설계 생성</strong><small>AI가 시나리오 구성</small></div>
         </li>
-        <li className={validation ? (selectedValidationPassed ? "is-complete" : "is-current") : ""}>
+        <li className={builderValidation ? (builderValidationPassed ? "is-complete" : "is-current") : ""}>
           <span>2</span>
           <div><strong>정책 검증</strong><small>안전성·정합성 확인</small></div>
         </li>
-        <li className={run ? "is-complete" : selectedValidationPassed ? "is-current" : ""}>
+        <li className={builderLab && run ? "is-complete" : builderValidationPassed ? "is-current" : ""}>
           <span>3</span>
           <div><strong>환경 배포</strong><small>격리 런타임 생성</small></div>
         </li>
-        <li className={run?.status.toLowerCase() === "ready" ? "is-complete" : run ? "is-current" : ""}>
+        <li className={builderLab && run?.status.toLowerCase() === "ready" ? "is-complete" : builderLab && run ? "is-current" : ""}>
           <span>4</span>
           <div><strong>실습 접속</strong><small>Desktop 또는 VPN</small></div>
         </li>
@@ -1372,7 +1474,10 @@ export default function HomePage() {
               <input
                 id="lab-title"
                 value={title}
-                onChange={(event) => setTitle(event.target.value)}
+                onChange={(event) => {
+                  activateDraft();
+                  setTitle(event.target.value);
+                }}
                 placeholder="예: 의심스러운 PowerShell 활동 조사"
                 minLength={3}
                 maxLength={80}
@@ -1382,43 +1487,55 @@ export default function HomePage() {
             </div>
 
             <div className="form-group">
-              <label htmlFor="lab-prompt">훈련 목표와 시나리오</label>
+              <label htmlFor="lab-prompt">
+                훈련 목표와 시나리오 <small>선택 · 입력 시 10자 이상</small>
+              </label>
               <textarea
                 id="lab-prompt"
                 value={prompt}
-                onChange={(event) => setPrompt(event.target.value)}
+                onChange={(event) => {
+                  activateDraft();
+                  setPrompt(event.target.value);
+                }}
                 placeholder="학습자가 분석할 사건, 달성해야 할 목표, 포함할 로그 또는 공격 단계를 구체적으로 입력해 주세요."
                 minLength={10}
                 maxLength={1200}
                 rows={5}
-                required
+                required={!hasValidCve}
                 disabled={isBusy}
+                aria-required={!hasValidCve}
+                aria-invalid={hasPrompt && promptLength < 10}
                 aria-describedby="prompt-hint"
               />
               <div className="input-meta" id="prompt-hint">
-                <span>실제 악성코드 대신 안전한 시뮬레이션으로 구성됩니다.</span>
+                <span>CVE ID 또는 훈련 목표와 시나리오 중 하나를 입력하세요. 시나리오를 입력한다면 10자 이상이어야 합니다.</span>
                 <span>{prompt.length}/1,200</span>
               </div>
             </div>
 
             <div className="form-group cve-input-group">
-              <label htmlFor="lab-cves">대상 CVE ID <small>선택 · 최대 20개</small></label>
+              <label htmlFor="lab-cves">대상 CVE ID <small>선택 · 시나리오와 둘 중 하나 필수 · 최대 20개</small></label>
               <textarea
                 id="lab-cves"
                 value={cveInput}
-                onChange={(event) => setCveInput(event.target.value)}
+                onChange={(event) => {
+                  activateDraft();
+                  setCveInput(event.target.value);
+                }}
                 onBlur={() => {
                   if (!parsedCves.error) setCveInput(parsedCves.ids.join(", "));
                 }}
                 placeholder="예: CVE-2025-12345, CVE-2024-3094"
                 rows={2}
                 maxLength={520}
+                required={!hasPrompt}
                 disabled={isBusy}
+                aria-required={!hasPrompt}
                 aria-invalid={Boolean(parsedCves.error)}
                 aria-describedby="cve-input-hint"
               />
               <div className="input-meta" id="cve-input-hint">
-                <span>쉼표 또는 공백으로 구분하며 대문자로 정규화합니다.</span>
+                <span>시나리오를 비우려면 유효한 CVE ID를 하나 이상 입력하세요. 쉼표 또는 공백으로 구분합니다.</span>
                 <span>{Math.min(parsedCves.ids.length, 20)}/20</span>
               </div>
               {parsedCves.error && <p className="field-error" role="alert">{parsedCves.error}</p>}
@@ -1439,6 +1556,7 @@ export default function HomePage() {
                     value="blue"
                     checked={team === "blue"}
                     onChange={() => {
+                      activateDraft();
                       setTeam("blue");
                       setDesktopImage("ubuntu");
                     }}
@@ -1454,6 +1572,7 @@ export default function HomePage() {
                     value="red"
                     checked={team === "red"}
                     onChange={() => {
+                      activateDraft();
                       setTeam("red");
                       setDesktopImage("kali");
                     }}
@@ -1464,6 +1583,13 @@ export default function HomePage() {
                 </label>
               </div>
             </fieldset>
+
+            <LabTopology
+              team={team}
+              mode="preview"
+              accessMethod={accessMethod}
+              lab={draftPreviewLab}
+            />
 
             <fieldset className="form-group">
               <legend>문제 구성</legend>
@@ -1516,7 +1642,10 @@ export default function HomePage() {
                         name="desktop-image"
                         value={image}
                         checked={desktopImage === image}
-                        onChange={() => setDesktopImage(image)}
+                        onChange={() => {
+                          activateDraft();
+                          setDesktopImage(image);
+                        }}
                         disabled={isBusy || (team === "blue" ? image !== "ubuntu" : image !== "kali")}
                       />
                       <span className={`os-mark os-mark--${image}`} aria-hidden="true">{image === "ubuntu" ? "U" : "K"}</span>
@@ -1531,9 +1660,8 @@ export default function HomePage() {
                 <legend>접속 방식</legend>
                 <div className="choice-stack">
                   {([
-                    ["browser_desktop", "브라우저 데스크톱", "설치 없이 바로 접속"],
-                    ["openvpn", "OpenVPN", "로컬 도구와 사설망 연결"],
-                    ["both", "두 방식 모두", "상황에 맞게 전환"],
+                    ["browser_desktop", "브라우저 데스크톱", "Ubuntu SOC 또는 Kali를 웹에서 실행"],
+                    ["openvpn", "OpenVPN", "내 PC의 도구를 격리 훈련망에 연결"],
                   ] as Array<[AccessMethod, string, string]>).map(([value, label, description]) => (
                     <label key={value} className={accessMethod === value ? "choice-row is-selected" : "choice-row"}>
                       <input
@@ -1541,7 +1669,10 @@ export default function HomePage() {
                         name="access-method"
                         value={value}
                         checked={accessMethod === value}
-                        onChange={() => setAccessMethod(value)}
+                        onChange={() => {
+                          activateDraft();
+                          setAccessMethod(value);
+                        }}
                         disabled={isBusy}
                       />
                       <span className="radio-mark" aria-hidden="true" />
@@ -1549,6 +1680,7 @@ export default function HomePage() {
                     </label>
                   ))}
                 </div>
+                <FieldHint>한 세션에는 한 가지 접속 방식만 활성화됩니다. 새 세션을 배포할 때 다시 선택할 수 있습니다.</FieldHint>
               </fieldset>
             </div>
 
@@ -1573,44 +1705,44 @@ export default function HomePage() {
               <span className="panel-kicker">배포 게이트</span>
               <h2 id="validation-title">검증 및 배포</h2>
             </div>
-            {selectedLab && (
-              <span className={`team-badge team-badge--${labTeam(selectedLab)}`}>
-                {labTeam(selectedLab) === "blue" ? "BLUE" : "RED"}
+            {builderLab && (
+              <span className={`team-badge team-badge--${labTeam(builderLab)}`}>
+                {labTeam(builderLab) === "blue" ? "BLUE" : "RED"}
               </span>
             )}
           </div>
 
-          {!selectedLab ? (
+          {!builderLab ? (
             <EmptyState
-              icon="◎"
-              title="검증할 Lab을 선택해 주세요"
-              description="새 Lab을 만들거나 아래 목록에서 기존 Lab을 선택하면 검증 근거와 배포 상태가 여기에 표시됩니다."
+              icon="✦"
+              title="새 Lab 설계 중"
+              description="왼쪽 미리보기는 현재 입력한 새 설계만 반영합니다. 생성이 완료되면 이곳에서 해당 Lab의 빌드·검증·배포 상태를 확인할 수 있습니다."
             />
           ) : (
             <div className="validation-content">
               <div className="selected-lab-summary">
                 <div>
-                  <span className="mono-label">LAB / {selectedLab.id.slice(0, 12)}</span>
-                  <h3>{labTitle(selectedLab)}</h3>
+                  <span className="mono-label">현재 LAB / {builderLab.id.slice(0, 12)}</span>
+                  <h3>{labTitle(builderLab)}</h3>
                 </div>
                 <span className="status-pill status-pill--neutral">
-                  {selectedLab.status || selectedLab.validationStatus || "생성됨"}
+                  {builderLab.status || builderLab.validationStatus || "생성됨"}
                 </span>
               </div>
               <div className="lab-properties">
-                <span><small>이미지</small><strong>{labImage(selectedLab) === "ubuntu" ? "Ubuntu SOC" : "Kali Linux"}</strong></span>
-                <span><small>접속</small><strong>{ACCESS_LABELS[labAccess(selectedLab)]}</strong></span>
+                <span><small>이미지</small><strong>{labImage(builderLab) === "ubuntu" ? "Ubuntu SOC" : "Kali Linux"}</strong></span>
+                <span><small>접속</small><strong>{ACCESS_LABELS[labAccess(builderLab)]}</strong></span>
               </div>
               <div className="tag-row">
-                {(selectedLab.questionTypes || []).map((type) => (
+                {(builderLab.questionTypes || []).map((type) => (
                   <span className="tag" key={type}>{QUESTION_LABELS[type] || type}</span>
                 ))}
               </div>
 
               {selectedBuild && (
-                <div className={`build-state build-state--${selectedBuild.status}`} role={labBuildIsPending(selectedLab) ? "status" : undefined}>
+                <div className={`build-state build-state--${selectedBuild.status}`} role={labBuildIsPending(builderLab) ? "status" : undefined}>
                   <span className="build-state__icon" aria-hidden="true">
-                    {labBuildIsPending(selectedLab) ? <span className="spinner" /> : selectedBuild.status === "succeeded" ? "✓" : "!"}
+                    {labBuildIsPending(builderLab) ? <span className="spinner" /> : selectedBuild.status === "succeeded" ? "✓" : "!"}
                   </span>
                   <div>
                     <strong>{buildStatusLabel(selectedBuild)}</strong>
@@ -1638,15 +1770,15 @@ export default function HomePage() {
                 </div>
               )}
 
-              {validation && action !== "validating" && (
-                <div className={selectedValidationPassed ? "decision-card decision-card--pass" : "decision-card decision-card--fail"}>
+              {builderValidation && action !== "validating" && (
+                <div className={builderValidationPassed ? "decision-card decision-card--pass" : "decision-card decision-card--fail"}>
                   <div className="decision-card__header">
-                    <span className="decision-icon" aria-hidden="true">{selectedValidationPassed ? "✓" : "!"}</span>
+                    <span className="decision-icon" aria-hidden="true">{builderValidationPassed ? "✓" : "!"}</span>
                     <div>
-                      <strong>{selectedValidationPassed ? "검증 통과" : "검토 필요"}</strong>
-                      <small>{selectedValidationPassed ? "필수 정책을 모두 충족했습니다." : "배포 전에 실패 항목을 수정해야 합니다."}</small>
+                      <strong>{builderValidationPassed ? "검증 통과" : "검토 필요"}</strong>
+                      <small>{builderValidationPassed ? "필수 정책을 모두 충족했습니다." : "배포 전에 실패 항목을 수정해야 합니다."}</small>
                     </div>
-                    {typeof validation.score === "number" && <b>{validation.score}점</b>}
+                    {typeof builderValidation.score === "number" && <b>{builderValidation.score}점</b>}
                   </div>
                   {checks.length > 0 && (
                     <ul className="evidence-list" aria-label="검증 근거">
@@ -1666,11 +1798,11 @@ export default function HomePage() {
                       })}
                     </ul>
                   )}
-                  {validation.policyVersion && <p className="policy-version">정책 버전 {validation.policyVersion}</p>}
+                  {builderValidation.policyVersion && <p className="policy-version">정책 버전 {builderValidation.policyVersion}</p>}
                 </div>
               )}
 
-              {!validation && action !== "validating" && selectedBuildReady && (
+              {!builderValidation && action !== "validating" && selectedBuildReady && (
                 <div className="pending-validation">
                   <span aria-hidden="true">◌</span>
                   <div><strong>검증 결과가 없습니다</strong><small>정책 검증을 실행해야 배포할 수 있습니다.</small></div>
@@ -1678,12 +1810,12 @@ export default function HomePage() {
               )}
 
               <div className="deployment-actions">
-                {!validation && selectedBuildReady && (
+                {!builderValidation && selectedBuildReady && (
                   <button className="secondary-button" type="button" onClick={handleValidate} disabled={isBusy || !selectedBuildReady}>
                     정책 검증 실행
                   </button>
                 )}
-                <button className="primary-button" type="button" onClick={handleDeploy} disabled={!selectedValidationPassed || isBusy}>
+                <button className="primary-button" type="button" onClick={handleDeploy} disabled={!builderValidationPassed || isBusy}>
                   {action === "deploying" ? <><span className="spinner" aria-hidden="true" /> 환경 배포 중</> : <>실습 환경 배포 <span aria-hidden="true">→</span></>}
                 </button>
               </div>
@@ -1697,8 +1829,8 @@ export default function HomePage() {
 
       <ScenarioStudio
         labs={labs}
-        lab={selectedLab}
-        validation={validation}
+        lab={builderLab}
+        validation={builderValidation}
         onSelect={(lab) => void selectLab(lab)}
         onPreview={() => chooseView("course")}
         onCreateVariant={prepareScenarioVariant}
@@ -1735,7 +1867,7 @@ export default function HomePage() {
         ) : (
           <div className="lab-list">
             {labs.map((lab) => {
-              const active = selectedLab?.id === lab.id;
+              const active = builderLab?.id === lab.id;
               const approved = validationPassed(lab.validation, lab);
               const build = labBuildState(lab);
               const buildFailed = build?.status === "failed" || build?.status === "cancelled";
@@ -1787,8 +1919,19 @@ export default function HomePage() {
       return <div className="form-group question-textarea"><label htmlFor={`${question.id}-answer`}>분석 답안</label><textarea id={`${question.id}-answer`} rows={5} value={typeof answer === "string" ? answer : ""} onChange={(event) => updateQuestionAnswer(question.id, event.target.value)} placeholder="공격 흐름과 이를 뒷받침하는 증거를 설명하세요." disabled={locked} /></div>;
     }
     const candidates = mitreCandidates(selectedLab, question);
+    const selectedTechniques = Array.isArray(answer)
+      ? answer
+      : typeof answer === "string" && answer.trim()
+        ? [answer]
+        : [];
     return (
-      <div className="form-group mitre-answer"><label htmlFor={`${question.id}-technique`}>MITRE ATT&CK 기술</label><input id={`${question.id}-technique`} type="text" list={`${question.id}-techniques`} value={typeof answer === "string" ? answer : ""} onChange={(event) => updateQuestionAnswer(question.id, event.target.value.toUpperCase())} placeholder="예: T1059.001" pattern="T[0-9]{4}(\.[0-9]{3})?" disabled={locked} /><datalist id={`${question.id}-techniques`}>{candidates.map((technique) => <option value={technique} key={technique} />)}</datalist><FieldHint>{candidates.length > 0 ? "공개된 공격 체인의 기술을 선택하거나 직접 입력할 수 있습니다." : "ATT&CK 기술 ID 형식으로 입력하세요."}</FieldHint></div>
+      <MitreTechniqueSelector
+        team={selectedLab ? labTeam(selectedLab) : "blue"}
+        techniques={candidates}
+        selected={selectedTechniques}
+        onChange={(techniqueIds) => updateQuestionAnswer(question.id, techniqueIds)}
+        disabled={locked}
+      />
     );
   };
 
@@ -1819,7 +1962,7 @@ export default function HomePage() {
         <section className="workspace-stage" aria-labelledby="learning-material-title">
           <div className="stage-heading"><span>01</span><div><small>LEARNING MATERIAL</small><h2 id="learning-material-title">강의 자료와 학습 목표</h2></div></div>
           {!selectedLab ? (
-            <section className="panel"><EmptyState icon="◫" title="선택된 Lab이 없습니다" description="설계·검증에서 Lab을 선택하거나 새 Lab을 배포해 주세요." action={<button className="secondary-button" type="button" onClick={() => chooseView("builder")}>Lab 선택하기</button>} /></section>
+            <section className="panel"><EmptyState icon="◫" title="선택된 Lab이 없습니다" description="설계·검증에서 Lab을 선택하거나 새 Lab을 배포해 주세요." action={<button className="secondary-button" type="button" onClick={openSelectedLabReview}>Lab 선택하기</button>} /></section>
           ) : (
             <div className="learning-grid">
               <section className="panel learning-materials">
@@ -1837,25 +1980,25 @@ export default function HomePage() {
         <section className="workspace-stage" aria-labelledby="practice-environment-title">
           <div className="stage-heading"><span>02</span><div><small>ISOLATED ENVIRONMENT</small><h2 id="practice-environment-title">실습 환경 접속</h2></div></div>
           {!run ? (
-            <section className="panel"><EmptyState icon="⌘" title="실행 중인 실습 환경이 없습니다" description="검증을 통과한 Lab을 배포하면 Ubuntu 또는 Kali 환경에 접속할 수 있습니다." action={<button className="primary-button" type="button" onClick={() => chooseView("builder")}>Lab 배포하기</button>} /></section>
+            <section className="panel"><EmptyState icon="⌘" title="실행 중인 실습 환경이 없습니다" description="검증을 통과한 Lab을 배포하면 Ubuntu 또는 Kali 환경에 접속할 수 있습니다." action={<button className="primary-button" type="button" onClick={openSelectedLabReview}>Lab 배포하기</button>} /></section>
           ) : (
             <div className="workspace-grid">
               <section className="panel session-card"><div className="panel-heading"><div><span className="panel-kicker">ACTIVE SESSION</span><h2>{selectedLab ? labTitle(selectedLab) : "실습 세션"}</h2></div><span className={`os-mark os-mark--${run.desktopImage || run.environment || "ubuntu"}`} aria-hidden="true">{(run.desktopImage || run.environment) === "kali" ? "K" : "U"}</span></div><dl className="session-details"><div><dt>Run ID</dt><dd>{run.id}</dd></div><div><dt>환경 상태</dt><dd><span className={`run-status run-status--${run.status.toLowerCase()}`}><i aria-hidden="true" />{run.status}</span></dd></div><div><dt>접속 방식</dt><dd>{ACCESS_LABELS[run.accessMethod || (selectedLab ? labAccess(selectedLab) : "browser_desktop")]}</dd></div><div><dt>만료 시각</dt><dd>{formatDate(run.expiresAt)}</dd></div></dl>{!runIsTerminal(run) && <div className="provisioning" role="status"><span className="spinner" aria-hidden="true" /><div><strong>실습 환경을 준비하고 있습니다</strong><small>상태는 자동으로 갱신됩니다.</small></div></div>}</section>
-              <section className="panel connection-card">
-                <div className="panel-heading"><div><span className="panel-kicker">CONNECTION</span><h2>접속 정보</h2></div></div>
-                {!environmentReady ? (
-                  <EmptyState icon="◌" title="환경이 준비되는 중입니다" description="격리 네트워크와 접속 자격 증명을 구성하고 있습니다." />
-                ) : (
-                  <div className="connection-options">
-                    {(run.accessMethod === "browser_desktop" || run.accessMethod === "both") && (
-                      <article className="connection-option"><div className="connection-option__icon" aria-hidden="true">▣</div><div><h3>브라우저 데스크톱</h3><p>1회용 접속 티켓으로 Ubuntu 또는 Kali 데스크톱을 엽니다.</p></div><button className="primary-button" type="button" onClick={() => void handleDesktopLaunch()} disabled={desktopLaunchState === "loading"}>{desktopLaunchState === "loading" ? <><span className="spinner" aria-hidden="true" /> 티켓 발급 중</> : <>데스크톱 열기 <span aria-hidden="true">↗</span></>}</button>{desktopLaunchError && <span className="launch-error" role="alert">{desktopLaunchError}</span>}</article>
-                    )}
-                    {(run.accessMethod === "openvpn" || run.accessMethod === "both" || connection?.endpoint) && (
-                      <article className="connection-option"><div className="connection-option__icon" aria-hidden="true">⌁</div><div><h3>OpenVPN</h3><p>1회용 다운로드 티켓으로 VPN 프로필을 안전하게 받습니다.</p></div>{connection?.endpoint && <dl className="vpn-details"><div><dt>Endpoint</dt><dd>{connection.endpoint}</dd></div>{connection.assignedIp && <div><dt>할당 IP</dt><dd>{connection.assignedIp}</dd></div>}{connection.allowedCidr && <div><dt>허용 CIDR</dt><dd>{connection.allowedCidr}</dd></div>}</dl>}<button className="secondary-button" type="button" onClick={() => void handleVpnDownload()} disabled={vpnDownloadState === "loading"}>{vpnDownloadState === "loading" ? <><span className="spinner" aria-hidden="true" /> 프로필 준비 중</> : "VPN 프로필 받기"}</button>{vpnDownloadError && <span className="launch-error" role="alert">{vpnDownloadError}</span>}</article>
-                    )}
-                  </div>
-                )}
-              </section>
+              <LabTopology
+                team={selectedLab ? labTeam(selectedLab) : (run.desktopImage || run.environment) === "kali" ? "red" : "blue"}
+                mode="runtime"
+                lab={selectedLab}
+                run={run}
+                ready={environmentReady}
+                accessMethod={run.accessMethod || (selectedLab ? labAccess(selectedLab) : "browser_desktop")}
+                connection={connection}
+                desktopBusy={desktopLaunchState === "loading"}
+                desktopError={desktopLaunchError}
+                vpnBusy={vpnDownloadState === "loading"}
+                vpnError={vpnDownloadError}
+                onOpenDesktop={() => void handleDesktopLaunch()}
+                onDownloadVpn={() => void handleVpnDownload()}
+              />
             </div>
           )}
           {selectedLab && labTeam(selectedLab) === "blue" && (
@@ -2193,7 +2336,7 @@ export default function HomePage() {
         <div className="panel-heading"><div><span className="panel-kicker">{authMode === "oidc" ? "AUTHENTICATED ONBOARDING" : "DEVELOPMENT REGISTRATION"}</span><h2 id="signup-form-title">{signupAccountType === "personal" ? "개인 회원가입" : "조직 회원가입"}</h2></div></div>
         {authMode === "oidc" && <div className="alert alert--info auth-notice"><strong>OIDC 인증 후 온보딩 단계입니다.</strong><span>이메일은 검증된 토큰에서 가져오며 비밀번호를 API에 전송하지 않습니다.</span></div>}
         {signupResult ? (
-          <div className="signup-success" role="status"><span aria-hidden="true">✓</span><div><strong>{signupResult.alreadyOnboarded ? "이미 온보딩된 계정입니다" : "계정 준비가 완료되었습니다"}</strong><p>{signupResult.user.displayName || signupResult.user.handle} 님의 사용자 컨텍스트가 적용되었습니다.</p><button className="primary-button" type="button" onClick={() => chooseView("builder")}>Lab 설계 시작</button></div></div>
+          <div className="signup-success" role="status"><span aria-hidden="true">✓</span><div><strong>{signupResult.alreadyOnboarded ? "이미 온보딩된 계정입니다" : "계정 준비가 완료되었습니다"}</strong><p>{signupResult.user.displayName || signupResult.user.handle} 님의 사용자 컨텍스트가 적용되었습니다.</p><button className="primary-button" type="button" onClick={startNewLabDraft}>Lab 설계 시작</button></div></div>
         ) : (
           <form className="signup-form" onSubmit={handleSignup}>
             {passwordSignup && <div className="form-group"><label htmlFor="signup-email">이메일</label><input id="signup-email" type="email" value={signupEmail} onChange={(event) => setSignupEmail(event.target.value)} autoComplete="email" placeholder="name@example.com" required /></div>}
@@ -2397,7 +2540,7 @@ export default function HomePage() {
                   ),
                 );
                 return (
-                  <button key={item.key} type="button" className={`${activeView === item.key ? "nav-item is-active" : "nav-item"}${locked ? " is-locked" : ""}`} onClick={() => chooseView(item.key)} title={locked ? (item.adminOnly ? "관리자 권한 안내 보기" : item.requiredRole ? `${ROLE_LABELS[item.requiredRole]} 권한 안내 보기` : undefined) : undefined}>
+                  <button key={item.key} type="button" className={`${activeView === item.key ? "nav-item is-active" : "nav-item"}${locked ? " is-locked" : ""}`} onClick={() => item.key === "builder" ? startNewLabDraft() : chooseView(item.key)} title={locked ? (item.adminOnly ? "관리자 권한 안내 보기" : item.requiredRole ? `${ROLE_LABELS[item.requiredRole]} 권한 안내 보기` : undefined) : undefined}>
                     <span className="nav-item__icon" aria-hidden="true">{item.icon}</span><span>{item.label}</span>{locked && <span className="nav-lock" aria-hidden="true">◇</span>}{item.key === "workspace" && run && <i className="nav-live" aria-label="실행 중" />}
                   </button>
                 );
@@ -2439,7 +2582,7 @@ export default function HomePage() {
             ) : (
               <button className="signup-button" type="button" onClick={() => void authentication.logout()}>로그아웃</button>
             )}
-            <button className="top-create-button" type="button" onClick={() => chooseView("builder")}>✦ AI Lab 만들기</button>
+            <button className="top-create-button" type="button" onClick={startNewLabDraft}>✦ AI Lab 만들기</button>
             <div className="user-context" title={userError || roleSummary}>
               <span className="avatar" aria-hidden="true">{displayName.slice(0, 1).toUpperCase()}</span>
               <span><strong>{displayName}</strong><small>{userError ? "컨텍스트 연결 실패" : displaySecondary}</small></span>
@@ -2456,7 +2599,7 @@ export default function HomePage() {
                 (item.adminOnly && !roles.includes("org_admin") && !roles.includes("platform_admin"))
               ),
             );
-            return <button key={item.key} type="button" className={`${activeView === item.key ? "is-active" : ""}${locked ? " is-locked" : ""}`} onClick={() => chooseView(item.key)}>{item.label}{locked ? " · 권한 안내" : ""}</button>;
+            return <button key={item.key} type="button" className={`${activeView === item.key ? "is-active" : ""}${locked ? " is-locked" : ""}`} onClick={() => item.key === "builder" ? startNewLabDraft() : chooseView(item.key)}>{item.label}{locked ? " · 권한 안내" : ""}</button>;
           })}
         </nav>
 

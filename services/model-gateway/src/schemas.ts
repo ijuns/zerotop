@@ -11,7 +11,7 @@ export function generationPlanSchema(questionTypes: string[], team: "blue" | "re
   const question = object({
     id: identifier,
     type: { type: "string", enum: questionTypes },
-    prompt: { type: "string", minLength: 10, maxLength: 2_000 },
+    prompt: { type: "string", minLength: 10, maxLength: 2_000, pattern: "[가-힣]" },
     points: { type: "integer", minimum: 1, maximum: 1_000 },
     options: nullable({ type: "array", minItems: 2, maxItems: 8, items: option }),
     answer: object({
@@ -38,9 +38,9 @@ export function generationPlanSchema(questionTypes: string[], team: "blue" | "re
       summary: { type: "string", minLength: 20, maxLength: 2_000 },
       prerequisites: { type: "array", minItems: 1, maxItems: 20, items: { type: "string", minLength: 1, maxLength: 500 } },
       objectives: { type: "array", minItems: 1, maxItems: 20, items: { type: "string", minLength: 1, maxLength: 500 } },
-      sections: { type: "array", minItems: 2, maxItems: 12, items: object({ id: identifier, title: { type: "string", minLength: 3, maxLength: 120 }, bodyMarkdown: { type: "string", minLength: 20, maxLength: 20_000 } }) },
+      sections: { type: "array", minItems: team === "blue" ? 6 : 5, maxItems: 12, items: object({ id: identifier, title: { type: "string", minLength: 3, maxLength: 120, pattern: "[가-힣]" }, bodyMarkdown: { type: "string", minLength: 20, maxLength: 20_000, pattern: "[가-힣]" } }) },
     }),
-    questions: { type: "array", minItems: questionTypes.length, maxItems: questionTypes.length, items: question },
+    questions: { type: "array", minItems: team === "blue" ? 6 : Math.max(4, questionTypes.length), maxItems: 20, items: question },
     target: object({
       name: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$" },
       packages: { type: "array", minItems: 0, maxItems: 20, items: object({ name: identifier, version: { type: "string", minLength: 1, maxLength: 100 } }) },
