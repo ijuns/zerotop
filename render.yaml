@@ -48,7 +48,7 @@ services:
       # Next.js image has already been built. The browser therefore connects
       # to the API's public endpoint directly and this origin must be allowed.
       - key: ALLOWED_ORIGINS
-        value: https://zerotop-web.onrender.com
+        value: https://zerotop-web.onrender.com,https://zerotop.onrender.com
       - key: SESSION_SIGNING_SECRET
         generateValue: true
       # Set this in the dashboard; it is the login password for the seed
@@ -71,5 +71,23 @@ services:
         value: "false"
       # Runtime-public API endpoint used by the browser. This avoids relying on
       # a Next.js rewrite that would need API_PROXY_TARGET at image build time.
+      - key: CODEGATE_WEB_API_URL
+        value: https://zerotop-api.onrender.com
+
+  # Canonical public web service. Keep zerotop-web during the cutover so the
+  # existing demo remains available until this service has deployed cleanly.
+  - type: web
+    name: zerotop
+    runtime: docker
+    dockerfilePath: ./apps/web/Dockerfile
+    dockerContext: .
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CODEGATE_WEB_AUTH_MODE
+        value: local
+      - key: CODEGATE_WEB_DEVELOPMENT_IDENTITY
+        value: "false"
       - key: CODEGATE_WEB_API_URL
         value: https://zerotop-api.onrender.com
