@@ -1,66 +1,86 @@
 # ZeroTOP
 
-**Zero-day Training Orchestration Platform**
+**Zero-day Training Orchestration Platform** — AI가 만드는 실전형 사이버 레인지
 
-AI가 최신 CVE와 훈련 목표를 바탕으로 강의 자료, 취약 환경, 공격·방어 시나리오와 문제를 생성하고, 격리된 실습 환경에서 자동 검증·채점·역량 분석까지 수행하는 실전형 사이버 레인지 플랫폼입니다.
+최신 CVE와 훈련 목표를 입력하면 AI가 강의 자료, 취약 환경, 공격·방어 시나리오와
+채점 문제까지 한 번에 생성합니다. 만들어진 환경은 실행마다 격리되고, 배포 전에
+공급망·기능·격리 검증을 자동으로 통과해야 하며, 학습자의 결과는 서버가 직접
+채점해 역량 리포트와 시즌 랭킹으로 이어집니다.
 
-이 저장소는 데모 화면만 제공하는 프로젝트가 아니라, 웹/API/AI/빌더/검증/채점/텔레메트리/가상화/VPN/관리 기능과 운영 인프라 코드를 함께 구성한 프로덕션 지향 코드베이스입니다.
+데모 화면만 있는 프로젝트가 아닙니다. 웹, API, AI 생성, 환경 빌드, 검증, 채점,
+텔레메트리, 가상화, VPN, 관리 기능에 운영 인프라 코드까지 함께 담은
+프로덕션 지향 코드베이스입니다.
 
-## 구현 범위
+## 무엇을 하는가
 
-- `Next.js 16 + React 19 + TypeScript` 웹: 설계·검증, 실습 워크스페이스, 리포트, 랭킹, 관리자 화면
-- OIDC/Keycloak 인증과 개인·조직 가입: 한 사용자는 조직에 속하지 않거나 정확히 한 조직에만 소속
-- 블루팀 Lab: 브라우저 분석 데스크톱, 실행 전용 ELK/Kibana, 분리된 피해 시스템과 Elastic Agent, 시나리오 행위·로그 생성, 증거 선택과 MITRE ATT&CK 매핑
-- 레드팀 Lab: 브라우저 Kali 또는 OpenVPN 진입점과 별도로 격리된 취약 대상, 단일 선택·복수 선택·주관식·MITRE ATT&CK 문제
-- AI Lab Builder: NVD로 확인한 CVE 정보와 운영자 승인 component catalog를 기반으로 학습 본문, 문제·채점 계약, 팀별 선언형 topology, 텔레메트리와 시나리오 행위 계획, 이미지 빌드 명세 생성
-- 운영 AI gateway: Anthropic 공식 SDK와 Claude Messages API의 JSON Schema 응답을 엄격한 Lab 계약으로 검증
-- 환경 빌더: 허용 목록으로 제한한 명세를 rootless BuildKit 작업으로 빌드하고 이미지 digest와 provenance 기록
-- 자동 검증: 서명, SBOM, 취약점 스캔, 기능·의도된 취약점 probe, 네트워크 격리, 블루팀 ELK 검색을 모두 통과해야 승인
-- 실습 런타임: 실행별 namespace, Blue 분석 desktop·ELK·피해 환경 또는 Red Kali·취약 target을 분리 배치하고 브라우저 데스크톱과 실행별 OpenVPN 중 하나의 접속 방식만 활성화
-- 신뢰된 서버 채점: 정답과 ELK/AI 채점 자격 증명을 브라우저에 노출하지 않음
-- 개인 역량 리포트, 조직 관리자용 구성원 리포트, 플랫폼 관리자용 전체·조직별 리포트
-- 주간·월간·전체 기간의 조직/전체 랭킹과 전체 랭킹 공개 동의
-- 별도 관리자 기능: 사용자·조직·Lab·실행 조회, 조직 생성 및 가입 코드 회전, Lab 격리, 실행 강제 종료
-- PostgreSQL 운영 저장소, SQLite 로컬 저장소, 감사 로그와 멱등 요청 처리
-- Ubuntu 24.04/RKE2/Cilium/Longhorn/KubeVirt 기반 3노드 서버 부트스트랩과 Kubernetes 배포 베이스
+- **AI Lab 생성** — CVE 정보(NVD 확인)와 운영자가 승인한 컴포넌트 목록을 근거로
+  학습 본문, 채점 계약, 팀별 환경 구성, 이미지 빌드 명세를 생성합니다. 모델이 짠
+  빌드 명세를 그대로 믿지 않고, 신뢰된 명세를 서버가 재구성합니다.
+- **블루팀 / 레드팀 훈련** — 블루팀은 브라우저 분석 데스크톱에서 실행 전용
+  ELK/Kibana로 공격 흔적을 추적하고 MITRE ATT&CK에 매핑합니다. 레드팀은
+  브라우저 Kali 또는 OpenVPN으로 격리된 취약 대상을 공격합니다.
+- **자동 검증** — 서명, SBOM, 취약점 스캔, 기능·격리 점검, 블루팀 ELK 검색을
+  모두 통과해야 배포됩니다. 하나라도 실패하면 자동 격리됩니다.
+- **서버 채점과 리포트** — 정답과 채점 근거는 브라우저에 절대 내려보내지 않습니다.
+  개인·조직·플랫폼 단위 역량 리포트를 제공합니다.
+- **시즌 랭킹** — 난이도·정확도·소요 시간·힌트를 보정한 점수로 개인과 조직을
+  순위 매깁니다. 공개는 개인·조직 각각의 동의를 받습니다.
+- **회원가입과 로그인** — 이메일·비밀번호 가입과 로그인, 개인정보 수집 동의,
+  조직 가입 코드까지. 운영에서는 OIDC(Keycloak)로 전환할 수 있습니다.
+- **관리자 기능** — 사용자 권한 변경과 계정 정지, 조직 구성원 관리, 감사 로그
+  조회, Lab 격리·해제, 실행 강제 종료, 시즌 관리.
 
-고위험 환경 검증은 사람의 승인 대기열에 의존하지 않습니다. 자동화된 필수 검증 중 하나라도 실패하면 Lab은 격리되며, 플랫폼 관리자의 격리·실행 종료 기능은 운영 안전 조치입니다.
+## 기술 스택
 
-## 핵심 흐름
+| 영역 | 스택 |
+|---|---|
+| 웹 | Next.js 16, React 19, TypeScript |
+| API | Node.js 24 (TypeScript 직접 실행), PostgreSQL / SQLite |
+| AI | Anthropic Claude (전용 게이트웨이 경유), 엄격한 JSON Schema 계약 |
+| 빌드·검증 | rootless BuildKit, Cosign / Syft / Trivy |
+| 런타임 | Kubernetes, KubeVirt, Cilium, Longhorn |
+| 인프라 | RKE2 3노드, Ansible, Keycloak, Elasticsearch / Kibana |
+
+## 동작 흐름
 
 ```mermaid
 flowchart LR
-    Prompt["CVE·훈련 목표 프롬프트"] --> AI["AI 콘텐츠·문제 생성"]
-    AI --> Topology["팀별 선언형 topology"]
-    Topology --> Build["허용 목록 기반 환경 빌드"]
-    Build --> Validate["공급망·기능·격리·AI 자동 검증"]
-    Validate -->|통과| Run["격리된 팀별 Lab 배포"]
+    Prompt["CVE·훈련 목표"] --> AI["AI 콘텐츠·문제 생성"]
+    AI --> Topology["팀별 환경 구성"]
+    Topology --> Build["허용 목록 기반 빌드"]
+    Build --> Validate["공급망·기능·격리 검증"]
+    Validate -->|통과| Run["격리 Lab 배포"]
     Validate -->|실패| Quarantine["자동 격리"]
-    Run --> Workspace["브라우저 데스크톱 또는 OpenVPN"]
-    Workspace --> Grade["ELK·정답·AI 루브릭 서버 채점"]
-    Grade --> Report["개인·조직·플랫폼 리포트와 랭킹"]
+    Run --> Workspace["브라우저 데스크톱 / OpenVPN"]
+    Workspace --> Grade["ELK·정답·AI 서버 채점"]
+    Grade --> Report["리포트와 시즌 랭킹"]
 ```
 
-상세 컴포넌트와 신뢰 경계는 [아키텍처 문서](docs/architecture.md)에 정리되어 있습니다.
+상세 구성과 신뢰 경계는 [아키텍처 문서](docs/architecture.md)에 있습니다.
 
-## 팀별 실습 topology
+## 팀별 실습 구성
 
-프롬프트는 임의의 셸 스크립트로 바로 실행되지 않습니다. AI는 운영자가 승인한 이미지·패키지·행위 catalog 안에서 선언형 topology와 검증 계약을 만들고, 자동 검증을 통과한 실행만 학습자에게 배포합니다.
+프롬프트가 셸 스크립트로 바로 실행되는 일은 없습니다. AI는 운영자가 승인한
+이미지·패키지·행위 목록 안에서만 환경 구성과 검증 계약을 만들고, 검증을 통과한
+실행만 학습자에게 배포됩니다.
 
-| 구분 | 학습자 진입점 | 분리된 실습 대상 | 관측·문제 풀이 |
+| 구분 | 학습자 진입점 | 격리된 대상 | 문제 풀이 |
 |---|---|---|---|
-| Blue Team | Ubuntu 기반 분석 데스크톱의 브라우저 | Elastic Agent가 설치된 피해 VM/컨테이너 | 실행 전용 Kibana space와 Elasticsearch 인덱스에서 시나리오 악성 행위 로그를 검색하고 MITRE ATT&CK을 매핑 |
-| Red Team | Kali 브라우저 데스크톱 또는 학습자 장비의 OpenVPN | AI가 선택한 취약 서비스와 데이터가 배치된 별도 target VM/컨테이너 | Kali 도구로 격리된 target을 분석·공격하고 문제와 증거를 제출 |
+| 블루팀 | Ubuntu 분석 데스크톱의 브라우저 | Elastic Agent가 설치된 피해 시스템 | 실행 전용 Kibana·Elasticsearch에서 악성 행위 로그를 찾아 ATT&CK 매핑 |
+| 레드팀 | Kali 브라우저 또는 OpenVPN | 취약 서비스가 배치된 별도 대상 | Kali 도구로 대상을 분석·공격하고 증거 제출 |
 
-Blue Team 시나리오의 악성 행위는 승인된 행위 catalog를 피해 환경에서 재생하며, Elastic Agent가 수집한 원본 이벤트가 실행 전용 ELK에 도착해야 합니다. 단순히 정답용 로그 파일을 미리 넣는 방식이 아니라 agent 등록, 이벤트 수집, Kibana 검색과 예상 ATT&CK 증거까지 자동 검증합니다. Red Team은 Kali와 target을 같은 VM에 넣지 않으며, 의도된 서비스와 취약점이 Kali 또는 해당 실행의 VPN 대역에서만 도달 가능한지 확인합니다.
+블루팀 시나리오는 정답용 로그를 미리 넣는 방식이 아닙니다. 승인된 행위를 피해
+환경에서 재생하고, Elastic Agent가 수집한 원본 이벤트가 실행 전용 ELK에 도착하는
+것까지 검증합니다. 레드팀은 Kali와 대상을 같은 VM에 두지 않고, 취약점이 해당
+실행의 Kali나 VPN 대역에서만 도달하는지 확인합니다.
 
-한 실행의 `accessMode`는 `browser_desktop` 또는 `openvpn` 중 하나입니다. 브라우저 세션과 VPN 프로필을 동시에 열지 않으며, 접속 방식을 바꾸면 기존 티켓·프로필을 폐기한 뒤 새 진입점을 준비합니다. 피해 시스템, 취약 target, ELK 내부 endpoint와 다른 실행은 인터넷에 직접 공개하지 않습니다.
+한 실행의 접속 방식은 브라우저 데스크톱 또는 OpenVPN 중 하나입니다. 둘을 동시에
+열지 않으며, 방식을 바꾸면 기존 티켓과 프로필을 폐기하고 새로 발급합니다. 피해
+시스템, 취약 대상, ELK 내부 주소는 인터넷에 직접 공개하지 않습니다.
 
-화면 경험은 Hack The Box 등 공개된 사이버 레인지의 **워크스페이스와 별도 target을 연결하는 사용자 흐름**을 참고합니다. 해당 서비스의 비공개 내부 구현을 복제하거나 동일하다고 가정하지 않으며, ZeroTOP의 차별점은 프롬프트에서 topology·콘텐츠·문제·검증 계약을 동적으로 생성한다는 점입니다.
+## 빠른 시작 (로컬)
 
-## 빠른 로컬 실행
-
-Docker가 없어도 Node.js 24와 pnpm 11로 웹/API 및 결정론적 시뮬레이터를 실행할 수 있습니다.
+Node.js 24와 pnpm 11이면 Docker 없이 웹·API와 시뮬레이터를 띄울 수 있습니다.
 
 ```powershell
 corepack enable
@@ -73,66 +93,94 @@ pnpm install --frozen-lockfile
 - API: `http://localhost:8080`
 - 상태 확인: `http://localhost:8080/health`
 
-Docker Desktop이 준비되어 있으면 PostgreSQL, Redis, Keycloak, Elasticsearch, Kibana, API, 웹, 로컬 런타임과 텔레메트리 서비스를 함께 실행할 수 있습니다.
+Docker Desktop이 있으면 PostgreSQL, Keycloak, Elasticsearch/Kibana까지 함께 띄우는
+`-Mode Docker`도 있습니다. 실제 취약 대상과 VM, VPN, 이미지 빌드가 포함된 전체
+구성은 Kubernetes 런타임 플레인이 필요합니다. 자세한 내용은
+[로컬 개발 문서](docs/local-development.md)를 참고하세요.
 
-```powershell
-.\scripts\local-dev.ps1 -Mode Docker
-```
+## 인증 모드
 
-로컬 기본 모드는 제품 흐름을 개발하기 위한 안전한 시뮬레이터입니다. 별도의 `Desktop` 모드는 Docker 컨테이너 기반 Ubuntu/Kali GUI, Blue의 개발용 실행별 ELK·agent·scenario log generator·별도 target과 Red의 별도 target을 실행합니다. KubeVirt VM, 실제 취약 target, victim에서의 승인 행위 재생, OpenVPN, BuildKit 이미지 빌드와 운영 격리 probe를 포함한 전체 topology는 Kubernetes 런타임 플레인이 필요합니다. 자세한 내용은 [로컬 개발 문서](docs/local-development.md)와 [로컬 데스크톱 런타임 문서](docs/local-desktop-runtime.md)를 참고하세요.
+같은 코드가 세 가지 인증 모드로 동작합니다. `AUTH_MODE` 환경 변수로 고릅니다.
 
-Blue ELK는 ZeroTOP의 **실습 워크스페이스 → 워크스페이스 열기**로 Ubuntu SOC 데스크톱에 들어간 뒤, 그 안의 브라우저에서 `http://kibana:5601`을 열어 사용합니다. 일회용 입장 티켓은 기본 5분이지만 첫 입장 후의 서명된 브라우저 세션과 ELK 사용은 run 만료 시각까지 유지됩니다.
+| 모드 | 용도 | 방식 |
+|---|---|---|
+| `dev` | 로컬 개발 | `X-User-Id` 헤더로 시드 계정 전환 |
+| `local` | 무료 데모 배포 | 이메일·비밀번호 로그인, 서명된 세션 토큰 |
+| `oidc` | 운영 | Keycloak OIDC 토큰 검증 |
+
+비밀번호는 솔트를 적용한 scrypt로 저장합니다. `local` 모드는 Keycloak 없이도
+가입·로그인이 되지만, 검증된 인증 인프라가 아니라 데모용입니다.
+
+## 무료 데모 배포 (Render)
+
+제출·시연용 라이브 링크는 Render 무료 티어에 블루프린트 하나로 올릴 수 있습니다.
+`render.yaml`이 웹과 API 두 서비스를 만들고, 웹이 `/api`를 API로 프록시하므로
+브라우저는 단일 도메인만 사용해 CORS 설정이 필요 없습니다. 부팅할 때 데모 데이터를
+다시 채워, 재시작으로 저장소가 비어도 랭킹은 항상 표시됩니다.
+
+절차와 배포 후 설정할 값은 [Render 데모 배포 문서](docs/render-demo-deployment.md)에
+정리했습니다.
 
 ## 품질 검사
 
-Python AI 테스트까지 포함한 저장소 검사는 다음 명령으로 실행합니다.
-
 ```powershell
 python -m pip install -r .\services\ai\requirements.txt
-pnpm check
-pnpm test
-pnpm build
+pnpm check   # 타입 검사
+pnpm test    # Node/Python 테스트
+pnpm build   # Next.js 빌드
 ```
 
-GitHub Actions 정의는 동일한 TypeScript 검사, Node/Python 테스트, Next.js 빌드와 YAML 파싱을 수행합니다.
+GitHub Actions도 같은 타입 검사, 테스트, 빌드, YAML 파싱을 수행합니다.
 
-## 실제 운영 배포 전 필요한 것
+## 운영 배포에 필요한 것
 
-저장소에는 서버 구성과 배포 코드가 포함되어 있지만 클라우드 계정, 서버 주소, 도메인, DNS/TLS 권한, 이미지 레지스트리와 모델 공급자 자격 증명은 포함되지 않습니다. 따라서 저장소를 checkout하는 것만으로 공개 인터넷의 운영 서버가 생성되지는 않습니다.
+저장소에는 서버 구성과 배포 코드가 있지만, 클라우드 계정·서버 주소·도메인·인증서·
+이미지 레지스트리·모델 API 키는 들어 있지 않습니다. 그래서 체크아웃만으로 공개
+운영 서버가 생기지는 않습니다. 운영자는 최소한 다음을 준비해야 합니다.
 
-운영자는 최소한 다음 외부 자원을 준비해야 합니다.
-
-- KVM을 사용할 수 있는 Ubuntu 24.04 서버 또는 동등한 전용 런타임 노드
-- 플랫폼·Identity·데스크톱·VPN용 DNS와 인증서, OpenVPN용 UDP LoadBalancer
-- 운영 PostgreSQL, Keycloak, Elasticsearch/Kibana, 백업 저장소와 비밀 관리 시스템
+- KVM을 쓸 수 있는 Ubuntu 24.04 서버 또는 동급 런타임 노드
+- 플랫폼·인증·데스크톱·VPN용 DNS와 인증서, OpenVPN용 UDP 로드밸런서
+- 운영 PostgreSQL, Keycloak, Elasticsearch/Kibana, 백업과 비밀 관리
 - 서명된 Ubuntu/Kali/검증/BuildKit 이미지와 사설 레지스트리
-- 생성·검토·주관식 채점에 사용할 모델 공급자 HTTPS endpoint와 토큰
-- 조직의 보존 기간, 허용 CVE/패키지/아티팩트 목록, 네트워크 egress 정책
+- 모델 API 키 (`ANTHROPIC_API_KEY`)
+- 조직의 보존 기간, 허용 CVE·패키지 목록, egress 정책
 
-서버 준비부터 검증까지의 순서는 [운영 배포 문서](docs/production-deployment.md), 모든 서비스 설정값은 [환경 변수 문서](docs/environment-variables.md)를 따릅니다. Kubernetes 베이스의 `example.invalid`, `replace-with-digest`, `REQUIRED_*` 값은 안전을 위한 배포 차단 값이며 운영 overlay에서 반드시 교체해야 합니다.
+순서는 [운영 배포 문서](docs/production-deployment.md), 전체 설정값은
+[환경 변수 문서](docs/environment-variables.md)를 따릅니다. Kubernetes 베이스의
+`example.invalid`, `replace-with-digest`, `REQUIRED_*` 값은 안전을 위한 배포 차단
+값이므로 운영 오버레이에서 반드시 교체해야 합니다.
 
-## 주요 경로
+## 저장소 구조
 
 | 경로 | 역할 |
 |---|---|
-| `apps/web` | Next.js/React 사용자·관리자 웹 |
-| `services/api` | 인증, 권한, Lab/실행, 보고서, 랭킹, 관리자 API |
-| `services/ai` | AI 생성, 검토, 자동 게시 판정, 주관식 루브릭 |
-| `services/builder` | 선언형 환경 명세를 BuildKit 작업으로 빌드 |
-| `services/validator` | Cosign/Syft/Trivy 및 런타임 검증 오케스트레이션 |
-| `services/runtime` | KubeVirt VM, 브라우저/OpenVPN 실행, 격리 probe |
+| `apps/web` | 사용자·관리자 웹 (Next.js) |
+| `services/api` | 인증, 권한, Lab/실행, 리포트, 랭킹, 관리자 API |
+| `services/ai` | AI 생성·검토·게시 판정·주관식 루브릭 |
+| `services/model-gateway` | 외부 모델(Claude)을 호출하는 유일한 컴포넌트 |
+| `services/builder` | 환경 명세를 BuildKit 작업으로 빌드 |
+| `services/validator` | Cosign/Syft/Trivy와 런타임 검증 |
+| `services/runtime` | KubeVirt VM, 브라우저/OpenVPN 실행, 격리 점검 |
 | `services/telemetry` | 실행별 Elasticsearch 인덱스와 제한된 검색 API |
-| `services/grader` | ELK 증거와 AI 루브릭을 이용한 신뢰된 채점 |
+| `services/grader` | ELK 근거와 AI 루브릭 기반 서버 채점 |
 | `services/desktop-gateway` | 일회용 티켓 기반 noVNC 프록시 |
-| `services/openvpn-issuer` | 실행별 인증서·프로필 발급 및 다운로드 |
+| `services/openvpn-issuer` | 실행별 인증서·프로필 발급 |
+| `packages/*` | 공유 계약, 인증, 채점, 리포트 로직 |
 | `infra/kubernetes` | 플랫폼·런타임 Kubernetes 배포 베이스 |
-| `infra/server` | 3노드 RKE2 운영 서버 Ansible 구성 |
+| `infra/server` | RKE2 3노드 서버 Ansible 구성 |
 
 ## 보안 원칙
 
-- 학습자 환경은 실행별 기본 차단 네트워크와 수명 제한을 적용합니다.
-- Kubernetes API, 클라우드 metadata, 플랫폼 데이터 계층과 다른 실행으로의 이동을 허용하지 않습니다.
-- 정답, 루브릭, ELK API key, VPN 개인키, 내부 서비스 토큰을 브라우저 응답에 포함하지 않습니다.
-- 빌더는 임의 Dockerfile이나 shell 명령을 받지 않고 digest 고정 이미지·패키지·아티팩트 허용 목록만 사용합니다.
-- 이미지 검증에는 서명, SBOM, 취약점 스캔, 격리 실행 증거와 정리 증거가 모두 필요합니다.
-- 개발용 고정 계정·토큰과 보안이 비활성화된 로컬 Elasticsearch는 외부 네트워크에 노출하지 않습니다.
+- 학습자 환경은 실행마다 네트워크를 기본 차단하고 수명을 제한합니다. TTL이 지난
+  실행은 주기적으로 회수하고, 계정을 정지하면 그 계정의 실행 환경도 함께 종료합니다.
+- Kubernetes API, 클라우드 메타데이터, 플랫폼 데이터 계층, 다른 실행으로의 이동을
+  막습니다.
+- 정답, 루브릭, ELK API 키, VPN 개인키, 내부 토큰은 브라우저 응답에 넣지 않습니다.
+- 빌더는 임의 Dockerfile이나 셸 명령을 받지 않고, digest로 고정한 이미지·패키지·
+  아티팩트 허용 목록만 씁니다.
+- 모델 게이트웨이는 사용자 ID·이메일·조직 ID 같은 식별자를 모델 공급자에 보내지
+  않습니다.
+- 감사 로그는 행위자·출처 IP·사유를 기록합니다. 관리자는 자기 자신을 강등하거나
+  정지할 수 없어, 마지막 관리자가 잠기지 않습니다.
+- 개발용 고정 계정·토큰과 보안이 꺼진 로컬 Elasticsearch는 외부에 노출하지
+  않습니다.
