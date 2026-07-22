@@ -8,7 +8,7 @@ export const DEVELOPMENT_FIXTURE_CREATED_AT = "2026-01-01T00:00:00.000Z";
 // password. A public deployment must override it via SEED_FIXTURE_PASSWORD so
 // the value committed here is not the live credential.
 export const DEVELOPMENT_FIXTURE_PASSWORD =
-  process.env.SEED_FIXTURE_PASSWORD?.trim() || "ZeroTOP!2026";
+  process.env.SEED_FIXTURE_PASSWORD?.trim() || "dev-password";
 
 /**
  * Every seed account shares one password, and scrypt is deliberately slow, so
