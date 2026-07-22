@@ -44,10 +44,11 @@ services:
         value: development
       - key: DEMO_SEED
         value: "true"
-      # The web proxies to the API, so same-origin requests need no CORS. This
-      # empty value keeps ALLOWED_ORIGINS from being required.
+      # Render injects service references at container runtime, after the
+      # Next.js image has already been built. The browser therefore connects
+      # to the API's public endpoint directly and this origin must be allowed.
       - key: ALLOWED_ORIGINS
-        value: ""
+        value: https://zerotop-web.onrender.com
       - key: SESSION_SIGNING_SECRET
         generateValue: true
       # Set this in the dashboard; it is the login password for the seed
@@ -68,14 +69,7 @@ services:
         value: local
       - key: CODEGATE_WEB_DEVELOPMENT_IDENTITY
         value: "false"
-      # The browser calls the web's own /api, which is proxied to the API.
+      # Runtime-public API endpoint used by the browser. This avoids relying on
+      # a Next.js rewrite that would need API_PROXY_TARGET at image build time.
       - key: CODEGATE_WEB_API_URL
-        value: /api
-      # Server-side proxy target: the API service's public host. next.config
-      # prepends https://, and the proxy runs on the Next server, not the
-      # browser, so no CORS is involved.
-      - key: API_PROXY_TARGET
-        fromService:
-          type: web
-          name: zerotop-api
-          property: host
+        value: https://zerotop-api.onrender.com
